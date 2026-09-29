@@ -34,8 +34,11 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an accepted socket may wait for its SYN: the SYN didn't
 /// take, or the handshake was reset.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Abort a connection whose peer stops acknowledging data for this long.
+/// Abort a connection whose peer stops answering for this long.
 const TCP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Probe an idle connection this often: smoltcp's timeout counts from
+/// the last segment received, so an idle peer would look like a dead one.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// The ephemeral port range for outbound flows.
 const EPHEMERAL: std::ops::RangeInclusive<u16> = 32768..=60999;
 
@@ -131,7 +134,7 @@ enum End {
     Reset,
     /// We aborted it, or the stack was closed.
     Aborted,
-    /// The peer stopped acknowledging data.
+    /// The peer stopped answering.
     TimedOut,
 }
 
@@ -506,6 +509,7 @@ fn new_tcp_socket() -> tcp::Socket<'static> {
     let mut s =
         tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUFFER]), tcp::SocketBuffer::new(vec![0; TCP_BUFFER]));
     s.set_timeout(Some(TCP_TIMEOUT.into()));
+    s.set_keep_alive(Some(TCP_KEEPALIVE.into()));
     s.set_nagle_enabled(false);
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(5)));
     s

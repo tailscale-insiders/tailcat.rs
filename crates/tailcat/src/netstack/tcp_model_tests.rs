@@ -933,7 +933,6 @@ fn syn_racing_close_opens_nothing() {
 /// from the last segment received, even with nothing waiting on an
 /// answer, so without keep-alives it was reset after TCP_TIMEOUT.
 #[test]
-#[ignore = "known bug: an idle connection times out"]
 fn idle_connection_stays_up() {
     let mut net = Net::new();
     let (dialed, accepted) = (net.dial(), net.open(SOURCE_PORTS[0]));
