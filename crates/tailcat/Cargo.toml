@@ -1,0 +1,48 @@
+[package]
+name = "tailcat"
+description = "netcat over Tailscale's data plane (WireGuard, DERP, NAT traversal), without Tailscale's control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["wireguard", "tailscale", "derp", "nat-traversal", "netcat"]
+categories = ["network-programming"]
+
+[features]
+default = ["ssh"]
+# The built-in SSH and SFTP servers (Server::ssh_conn_handler).
+ssh = ["dep:russh", "dep:russh-sftp"]
+
+[dependencies]
+base64.workspace = true
+boringtun.workspace = true
+bytes.workspace = true
+ciborium.workspace = true
+crypto_box.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+if-addrs.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

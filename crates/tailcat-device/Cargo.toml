@@ -1,0 +1,12 @@
+[package]
+name = "tailcat-device"
+description = "A WireGuard mesh overlay on a real TUN device, built on tailcat's DERP and NAT traversal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tailcat.workspace = true
+tokio.workspace = true
