@@ -1029,7 +1029,6 @@ fn tuple_reused_after_time_wait() {
 /// the poll loop after every poll, so the two ran back to back until
 /// the deadline.
 #[test]
-#[ignore = "known bug: drain_tcp keeps the poll loop spinning"]
 fn drain_tcp_waits_quietly() {
     let mut net = Net::new();
     let i = net.dial();

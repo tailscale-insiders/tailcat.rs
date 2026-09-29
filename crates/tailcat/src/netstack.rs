@@ -481,7 +481,8 @@ impl Stack {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 return true;
             }
-            self.shared.wake.notify_one();
+            // The poll loop runs at least every second; waking it here too
+            // would keep the two running back to back.
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return false;
             }
