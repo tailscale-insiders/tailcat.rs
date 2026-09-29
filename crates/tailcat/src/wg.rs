@@ -75,8 +75,9 @@ impl std::str::FromStr for IpNet {
 /// WireGuard configuration for one peer.
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
-    /// Source addresses the peer may send from, and (for routing)
-    /// destinations reached through it.
+    /// Destinations routed to the peer, and source addresses it may send
+    /// from, except where another peer's match more specifically (or as
+    /// specifically, with a lower key).
     pub allowed_ips: Vec<IpNet>,
     pub preshared_key: PresharedKey,
     pub persistent_keepalive: Option<u16>,
@@ -100,8 +101,9 @@ struct WgPeer {
 }
 
 impl WgPeer {
-    fn allows(&self, src: IpAddr) -> bool {
-        self.cfg.lock().unwrap().allowed_ips.iter().any(|n| n.contains(&src))
+    /// The length of the most specific of its allowed IPs containing `ip`.
+    fn matches(&self, ip: &IpAddr) -> Option<u8> {
+        self.cfg.lock().unwrap().allowed_ips.iter().filter(|n| n.contains(ip)).map(|n| n.prefix_len).max()
     }
 }
 
@@ -109,6 +111,16 @@ impl WgPeer {
 struct Peers {
     by_key: HashMap<NodePublic, Arc<WgPeer>>,
     by_index: HashMap<u32, Arc<WgPeer>>,
+}
+
+impl Peers {
+    /// The peer that owns `ip`: the one whose allowed IPs match it most
+    /// specifically, the lowest key breaking ties. Outbound packets go to
+    /// it, and inbound ones are only taken from it.
+    fn owner(&self, ip: &IpAddr) -> Option<&Arc<WgPeer>> {
+        let best = self.by_key.values().filter_map(|p| Some((p.matches(ip)?, p)));
+        best.max_by(|(la, a), (lb, b)| la.cmp(lb).then(b.key.cmp(&a.key))).map(|(_, p)| p)
+    }
 }
 
 /// A decrypted IP packet from a peer.
@@ -129,6 +141,9 @@ pub struct Engine {
     route: Option<RouteFn>,
     inbound: mpsc::Sender<InboundPacket>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Every packet sent, for tests to deliver by hand.
+    #[cfg(test)]
+    sent: Mutex<Vec<(NodePublic, Vec<u8>)>>,
 }
 
 impl Engine {
@@ -154,6 +169,8 @@ impl Engine {
             route,
             inbound: tx,
             tasks: Mutex::default(),
+            #[cfg(test)]
+            sent: Mutex::default(),
         });
         let w = Arc::downgrade(&e);
         *e.tasks.lock().unwrap() = vec![tokio::spawn(recv_loop(w.clone(), wg_rx)), tokio::spawn(timer_loop(w))];
@@ -211,18 +228,20 @@ impl Engine {
         Some((hs, tx, rx))
     }
 
-    /// The peer whose allowed IPs match `dst` most specifically, else the
-    /// one the route hook picks.
+    /// The peer that owns `dst`, else the one the route hook picks.
     fn peer_for_dst(&self, dst: &IpAddr) -> Option<Arc<WgPeer>> {
         let peers = self.peers.lock().unwrap();
-        let longest = |p: &Arc<WgPeer>| {
-            p.cfg.lock().unwrap().allowed_ips.iter().filter(|n| n.contains(dst)).map(|n| n.prefix_len).max()
-        };
-        let best = peers.by_key.values().filter_map(|p| Some((longest(p)?, p))).max_by_key(|(len, _)| *len);
-        match best {
-            Some((_, p)) => Some(p.clone()),
+        match peers.owner(dst) {
+            Some(p) => Some(p.clone()),
             None => peers.by_key.get(&self.route.as_ref()?(dst)?).cloned(),
         }
+    }
+
+    /// Reports whether `peer` owns `src`, so that a packet from it routes
+    /// back the same way: another peer's more specific prefix, or a newer
+    /// session for the same key, takes precedence.
+    fn owns(&self, peer: &Arc<WgPeer>, src: &IpAddr) -> bool {
+        self.peers.lock().unwrap().owner(src).is_some_and(|o| Arc::ptr_eq(o, peer))
     }
 
     /// Encrypts and sends an IP packet to the peer that routes its
@@ -247,11 +266,17 @@ impl Engine {
         let res = peer.tunn.lock().unwrap().encapsulate(pkt, &mut buf);
         match res {
             TunnResult::WriteToNetwork(b) => {
-                let _ = self.ms.send_wireguard(&peer.key, b);
+                self.send(&peer.key, b);
             }
             TunnResult::Err(e) => debug!(peer = %peer.key.short_string(), "wg: encapsulate: {e:?}"),
             _ => {}
         }
+    }
+
+    fn send(&self, k: &NodePublic, pkt: &[u8]) {
+        #[cfg(test)]
+        self.sent.lock().unwrap().push((*k, pkt.to_vec()));
+        let _ = self.ms.send_wireguard(k, pkt);
     }
 
     /// Finds the peer a packet is from, as wireguard-go does: a handshake
@@ -331,10 +356,10 @@ impl Engine {
             }
         };
         for b in out {
-            let _ = self.ms.send_wireguard(&key, &b);
+            self.send(&key, &b);
         }
         match inbound {
-            Some((_, src)) if !peer.allows(src) => {
+            Some((_, src)) if !self.owns(&peer, &src) => {
                 trace!(peer = %key.short_string(), "wg: dropping packet from disallowed source {src}");
             }
             Some((data, _)) if !data.is_empty() => {
@@ -349,7 +374,7 @@ impl Engine {
         let mut buf = vec![0u8; 256];
         for p in peers {
             if let TunnResult::WriteToNetwork(b) = p.tunn.lock().unwrap().update_timers(&mut buf) {
-                let _ = self.ms.send_wireguard(&p.key, b);
+                self.send(&p.key, b);
             }
         }
     }
@@ -384,6 +409,9 @@ async fn timer_loop(e: Weak<Engine>) {
         e.tick();
     }
 }
+
+#[cfg(test)]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +652,6 @@ mod tests {
         };
         let p = engine.identify(&pkt).expect("handshake from a peer the hook knows");
         assert!(Arc::ptr_eq(&p, &engine.peer(&client.public()).unwrap()), "identified a replaced peer");
-        assert!(p.allows(Ipv4Addr::new(10, 0, 0, 2).into()), "the owner's configuration was overwritten");
+        assert!(p.matches(&Ipv4Addr::new(10, 0, 0, 2).into()).is_some(), "the owner's configuration was overwritten");
     }
 }
