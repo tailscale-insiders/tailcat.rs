@@ -69,6 +69,7 @@ pub struct SshOptions {
 pub type PeerLookup = Arc<dyn Fn(SocketAddr) -> Option<NodePublic> + Send + Sync>;
 
 pub(crate) struct Shared {
+    /// With `exec` set, `shell` and `files` are cleared.
     pub opts: SshOptions,
     /// Allowed keys, as their SSH wire encoding; `None` means no auth.
     pub allowed: Option<HashSet<Vec<u8>>>,
@@ -82,26 +83,19 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
     use russh::keys::ssh_key::authorized_keys::Entry;
     let mut allowed = HashSet::new();
     for (ti, text) in texts.iter().enumerate() {
-        for (li, line) in text.split('\n').enumerate() {
-            let line = line.trim_end_matches('\r').trim();
+        for (li, line) in text.lines().enumerate() {
+            let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let entry: Entry = line
-                .parse()
-                .map_err(|e| Error::other(format!("authorized keys entry {}, line {}: {e}", ti + 1, li + 1)))?;
+            let bad = |msg: &dyn std::fmt::Display| {
+                Error::other(format!("authorized keys entry {}, line {}: {msg}", ti + 1, li + 1))
+            };
+            let entry: Entry = line.parse().map_err(|e| bad(&e))?;
             if !entry.config_opts().is_empty() {
-                return Err(Error::other(format!(
-                    "authorized keys entry {}, line {}: options are not supported",
-                    ti + 1,
-                    li + 1
-                )));
+                return Err(bad(&"options are not supported"));
             }
-            let wire = entry
-                .public_key()
-                .to_bytes()
-                .map_err(|e| Error::other(format!("authorized keys entry {}, line {}: {e}", ti + 1, li + 1)))?;
-            allowed.insert(wire);
+            allowed.insert(entry.public_key().to_bytes().map_err(|e| bad(&e))?);
         }
     }
     if allowed.is_empty() {
@@ -110,14 +104,8 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
     Ok(allowed)
 }
 
-/// Checks that authorized_keys texts are valid and non-empty.
-pub fn validate_authorized_keys(texts: &[String]) -> Result<()> {
-    parse_authorized_keys(texts).map(|_| ())
-}
-
 fn ssh_key_dir() -> Result<PathBuf> {
-    let base = config_dir().ok_or_else(|| Error::other("no user config directory"))?;
-    let dir = base.join("tailcat").join("ssh");
+    let dir = config_dir().ok_or_else(|| Error::other("no user config directory"))?.join("tailcat").join("ssh");
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -129,18 +117,15 @@ fn ssh_key_dir() -> Result<PathBuf> {
 
 /// Go's `os.UserConfigDir`, where the Go implementation keeps its host
 /// key too, so both share one.
-pub(crate) fn config_dir() -> Option<PathBuf> {
-    let home = || std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+fn config_dir() -> Option<PathBuf> {
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
-        return std::env::var_os("AppData").map(PathBuf::from);
+        std::env::var_os("AppData").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|h| h.join("Library/Application Support"))
+    } else {
+        var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|h| h.join(".config")))
     }
-    if cfg!(target_os = "macos") {
-        return home().map(|h| h.join("Library/Application Support"));
-    }
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
-        return Some(PathBuf::from(x));
-    }
-    home().map(|h| h.join(".config"))
 }
 
 static HOST_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -150,19 +135,18 @@ static HOST_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn host_key() -> Result<PrivateKey> {
     let _g = HOST_KEY_LOCK.lock().unwrap();
     let path = ssh_key_dir()?.join("ssh_host_ed25519_key");
-    match std::fs::read_to_string(&path) {
-        Ok(pem) => {
-            russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}")))
-        }
+    let pem = match std::fs::read_to_string(&path) {
+        Ok(pem) => pem,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
             let pem = pkcs8_ed25519_pem(&seed);
             write_private_file(&path, pem.as_bytes())?;
-            russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}")))
+            pem
         }
-        Err(e) => Err(e.into()),
-    }
+        Err(e) => return Err(e.into()),
+    };
+    russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}")))
 }
 
 /// Encodes an ed25519 seed as a PKCS#8 v1 PEM ("PRIVATE KEY").
@@ -173,62 +157,67 @@ fn pkcs8_ed25519_pem(seed: &[u8; 32]) -> String {
     format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n")
 }
 
+/// Creates `path`, which must not exist, readable only by its owner.
 fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
-        f.write_all(data)?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, data)?;
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)?.write_all(data)?;
     Ok(())
+}
+
+impl Shared {
+    fn new(peer_lookup: PeerLookup, mut opts: SshOptions, key: PrivateKey) -> Result<Self> {
+        let allowed =
+            (!opts.authorized_keys.is_empty()).then(|| parse_authorized_keys(&opts.authorized_keys)).transpose()?;
+        if !opts.exec.is_empty() {
+            opts.shell = false;
+            opts.files = None;
+        }
+        use russh::MethodKind::{None as NoAuth, PublicKey};
+        let methods: &[_] = if allowed.is_some() { &[PublicKey] } else { &[NoAuth, PublicKey] };
+        let config = Arc::new(russh::server::Config {
+            server_id: russh::SshId::Standard(format!("SSH-2.0-tailcat_{}", env!("CARGO_PKG_VERSION")).into()),
+            keys: vec![key],
+            auth_rejection_time: Duration::from_millis(250),
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            inactivity_timeout: None,
+            keepalive_interval: Some(Duration::from_secs(30)),
+            nodelay: true,
+            methods: methods.into(),
+            ..Default::default()
+        });
+        Ok(Shared { opts, allowed, config, peer_lookup })
+    }
+
+    /// Serves one SSH connection until it ends.
+    async fn serve<S>(self: Arc<Self>, stream: S, local: SocketAddr, remote: SocketAddr)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let h = session::ConnHandler::new(self.clone(), local, remote);
+        match russh::server::run_stream(self.config.clone(), stream, h).await {
+            Ok(running) => {
+                if let Err(e) = running.await {
+                    tracing::debug!("ssh session from {remote}: {e}");
+                }
+            }
+            Err(e) => warn!("ssh handshake from {remote}: {e}"),
+        }
+    }
 }
 
 /// Returns a handler serving each TCP connection as an SSH server with
 /// the capabilities in `opts`. `peer_lookup` maps a connection's remote
 /// address to the tunnel-authenticated node key, exported to served
 /// processes as `TAILCAT_PEER_KEY`.
-pub fn conn_handler_with_lookup(peer_lookup: PeerLookup, mut opts: SshOptions) -> Result<TcpHandler> {
-    let allowed =
-        if opts.authorized_keys.is_empty() { None } else { Some(parse_authorized_keys(&opts.authorized_keys)?) };
-    if !opts.exec.is_empty() {
-        opts.shell = false;
-        opts.files = None;
-    }
-    let key = host_key()?;
-    let config = Arc::new(russh::server::Config {
-        server_id: russh::SshId::Standard(format!("SSH-2.0-tailcat_{}", env!("CARGO_PKG_VERSION")).into()),
-        keys: vec![key],
-        auth_rejection_time: Duration::from_millis(250),
-        auth_rejection_time_initial: Some(Duration::ZERO),
-        inactivity_timeout: None,
-        keepalive_interval: Some(Duration::from_secs(30)),
-        nodelay: true,
-        methods: if allowed.is_some() {
-            russh::MethodSet::from(&[russh::MethodKind::PublicKey][..])
-        } else {
-            russh::MethodSet::from(&[russh::MethodKind::None, russh::MethodKind::PublicKey][..])
-        },
-        ..Default::default()
-    });
-    let shared = Arc::new(Shared { opts, allowed, config, peer_lookup });
+pub fn conn_handler_with_lookup(peer_lookup: PeerLookup, opts: SshOptions) -> Result<TcpHandler> {
+    let shared = Arc::new(Shared::new(peer_lookup, opts, host_key()?)?);
     Ok(handler(move |c: TcpStream| {
-        let shared = shared.clone();
-        async move {
-            let local = c.local_addr();
-            let remote = c.peer_addr();
-            let h = session::ConnHandler::new(shared.clone(), local, remote);
-            match russh::server::run_stream(shared.config.clone(), c, h).await {
-                Ok(running) => {
-                    if let Err(e) = running.await {
-                        tracing::debug!("ssh session from {remote}: {e}");
-                    }
-                }
-                Err(e) => warn!("ssh handshake from {remote}: {e}"),
-            }
-        }
+        let (local, remote) = (c.local_addr(), c.peer_addr());
+        shared.clone().serve(c, local, remote)
     }))
 }
 
@@ -249,9 +238,28 @@ impl Server {
     }
 }
 
-/// Reports whether this platform supports the built-in SSH server.
-pub fn supports_ssh_server() -> bool {
-    cfg!(any(unix, windows))
+/// Formats the permission bits of a Unix mode as `ls -l` does, like
+/// `rwxr-x---`. (Shared with the CLI's `ls`.)
+#[doc(hidden)]
+pub fn permission_string(mode: u32) -> String {
+    (0..9).map(|i| if mode >> (8 - i) & 1 != 0 { b"rwx"[i % 3] as char } else { '-' }).collect()
+}
+
+/// Splits a Unix time into its UTC `[year, month, day, hour, minute,
+/// second]`. (Shared with the CLI's `ls`.)
+#[doc(hidden)]
+pub fn utc_civil(secs: i64) -> [i64; 6] {
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    [yoe + era * 400 + i64::from(mo <= 2), mo, d, rem / 3600, rem % 3600 / 60, rem % 60]
 }
 
 #[cfg(test)]
@@ -262,9 +270,12 @@ mod tests {
 
     #[test]
     fn authorized_keys_parsing() {
-        assert_eq!(parse_authorized_keys(&[format!("# c\n\n{KEY}\n")]).unwrap().len(), 1);
+        assert_eq!(parse_authorized_keys(&[format!("# c\r\n\n  {KEY}\r\n")]).unwrap().len(), 1);
+        assert_eq!(parse_authorized_keys(&[KEY.into(), KEY.into()]).unwrap().len(), 1);
         assert!(parse_authorized_keys(&["".into()]).is_err());
-        assert!(parse_authorized_keys(&[format!("command=\"x\" {KEY}")]).is_err());
+        assert!(parse_authorized_keys(&[]).is_err());
+        let e = parse_authorized_keys(&[KEY.into(), format!("\ncommand=\"x\" {KEY}")]).unwrap_err();
+        assert_eq!(e.to_string(), "authorized keys entry 2, line 2: options are not supported");
         assert!(parse_authorized_keys(&["not a key".into()]).is_err());
     }
 
@@ -273,5 +284,20 @@ mod tests {
         let pem = pkcs8_ed25519_pem(&[7u8; 32]);
         let k = russh::keys::decode_secret_key(&pem, None).unwrap();
         assert_eq!(k.algorithm(), russh::keys::Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn permission_strings() {
+        assert_eq!(permission_string(0o100755), "rwxr-xr-x");
+        assert_eq!(permission_string(0o640), "rw-r-----");
+        assert_eq!(permission_string(0), "---------");
+    }
+
+    #[test]
+    fn civil_times() {
+        assert_eq!(utc_civil(0), [1970, 1, 1, 0, 0, 0]);
+        assert_eq!(utc_civil(951_782_400 + 3661), [2000, 2, 29, 1, 1, 1]);
+        assert_eq!(utc_civil(1_735_689_599), [2024, 12, 31, 23, 59, 59]);
+        assert_eq!(utc_civil(-1), [1969, 12, 31, 23, 59, 59]);
     }
 }
