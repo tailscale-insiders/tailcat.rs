@@ -495,15 +495,21 @@ impl MagicSock {
                 return Err(Error::other(format!("unknown peer {}", peer.short_string())));
             };
             let region = p.derp_region();
-            let cands: Vec<SocketAddr> = p.candidates.keys().copied().collect();
-            if region != 0 {
-                self.send_ping_locked(&mut inner, peer, PathAddr::Derp(region), now, Some(waiter.clone()));
-            }
-            if self.enable_udp {
-                for c in cands {
-                    self.send_ping_locked(&mut inner, peer, PathAddr::Udp(c), now, Some(waiter.clone()));
+            // Like Tailscale's CLI ping: with a trusted direct path, ping
+            // just that; otherwise ping over DERP and every candidate.
+            if let (true, Some((best, _))) = (p.trusted(now), p.best) {
+                self.send_ping_locked(&mut inner, peer, PathAddr::Udp(best), now, Some(waiter.clone()));
+            } else {
+                let cands: Vec<SocketAddr> = p.candidates.keys().copied().collect();
+                if region != 0 {
+                    self.send_ping_locked(&mut inner, peer, PathAddr::Derp(region), now, Some(waiter.clone()));
                 }
-                self.call_me_maybe_locked(&mut inner, peer, now);
+                if self.enable_udp {
+                    for c in cands {
+                        self.send_ping_locked(&mut inner, peer, PathAddr::Udp(c), now, Some(waiter.clone()));
+                    }
+                    self.call_me_maybe_locked(&mut inner, peer, now);
+                }
             }
         }
         match tokio::time::timeout(timeout, rx).await {

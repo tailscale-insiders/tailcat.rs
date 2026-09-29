@@ -74,7 +74,6 @@ pub struct ServeFlags {
     long_about = None,
     after_long_help = help::ROOT,
     override_usage = "tailcat [flags] [<subcommand> [flags]] [args...]",
-    args_conflicts_with_subcommands = true,
     disable_version_flag = true,
 )]
 struct Cli {
