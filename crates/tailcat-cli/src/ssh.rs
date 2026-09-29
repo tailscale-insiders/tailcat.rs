@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use russh_sftp::client::SftpSession;
 use sha2::{Digest, Sha256};
 use tailcat::ssh::parse_authorized_keys;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{Global, usagef};
 
@@ -246,7 +248,7 @@ fn local_username() -> String {
 /// Starts an SSH session over `conn` and tries logging in as `user`
 /// with no credentials, reporting whether the server let us in.
 async fn login_without_credentials(
-    conn: tailcat::TcpStream,
+    conn: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     user: String,
 ) -> Result<(russh::client::Handle<AcceptAny>, bool), russh::Error> {
     let mut h = russh::client::connect_stream(Arc::new(russh::client::Config::default()), conn, AcceptAny).await?;
@@ -300,6 +302,32 @@ Or, to connect anyway, re-run with --skip-dns-safety-check."#
     std::process::exit(1);
 }
 
+/// How long `tailcat ls` waits for the SSH handshake and the SFTP
+/// session to open. Each SFTP request after that has russh-sftp's own
+/// timeout.
+const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Logs in over `conn` with no credentials and opens an SFTP session,
+/// giving up after `timeout`. The session lasts as long as the handle.
+async fn open_sftp(
+    conn: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    user: String,
+    timeout: Duration,
+) -> Result<(russh::client::Handle<AcceptAny>, SftpSession)> {
+    let open = async {
+        let (h, ok) = login_without_credentials(conn, user).await.map_err(|e| anyhow!("SSH handshake: {e}"))?;
+        if !ok {
+            bail!("SSH handshake: the server requires authentication");
+        }
+        let sftp_err = |e: &dyn std::fmt::Display| anyhow!("opening SFTP session: {e}");
+        let ch = h.channel_open_session().await.map_err(|e| sftp_err(&e))?;
+        ch.request_subsystem(true, "sftp").await.map_err(|e| sftp_err(&e))?;
+        let sf = SftpSession::new(ch.into_stream()).await.map_err(|e| sftp_err(&e))?;
+        Ok((h, sf))
+    };
+    tokio::time::timeout(timeout, open).await.map_err(|_| anyhow!("opening SFTP session: timed out"))?
+}
+
 pub async fn ls_mode(g: &Global, long: bool, target: &str) -> Result<ExitCode> {
     let (host, path) = split_remote_arg(target).unwrap_or((target, ""));
     let path = if path.is_empty() { "." } else { path };
@@ -309,14 +337,7 @@ pub async fn ls_mode(g: &Global, long: bool, target: &str) -> Result<ExitCode> {
         .await
         .map_err(|_| anyhow!("dialing server: timed out"))?
         .map_err(|e| anyhow!("dialing server: {e}"))?;
-    let (h, ok) = login_without_credentials(conn, local_username()).await.map_err(|e| anyhow!("SSH handshake: {e}"))?;
-    if !ok {
-        bail!("SSH handshake: the server requires authentication");
-    }
-    let sftp_err = |e: &dyn std::fmt::Display| anyhow!("opening SFTP session: {e}");
-    let ch = h.channel_open_session().await.map_err(|e| sftp_err(&e))?;
-    ch.request_subsystem(true, "sftp").await.map_err(|e| sftp_err(&e))?;
-    let sf = russh_sftp::client::SftpSession::new(ch.into_stream()).await.map_err(|e| sftp_err(&e))?;
+    let (_h, sf) = open_sftp(conn, local_username(), SFTP_OPEN_TIMEOUT).await?;
     let md = sf.metadata(path).await.map_err(|e| anyhow!("{path}: {e}"))?;
     if !md.is_dir() {
         print_entry(long, &md, path.trim_start_matches("./"));
@@ -418,6 +439,16 @@ mod tests {
         assert_eq!(fmt_mtime(t, t + 60), "Nov 14 22:13");
         assert_eq!(fmt_mtime(t, t + 365 * 86400), "Nov 14  2023");
         assert_eq!(fmt_mtime(0, t), "Jan  1  1970");
+    }
+
+    /// `tailcat ls` gives up on a server that never answers, rather than
+    /// hanging.
+    #[tokio::test]
+    async fn sftp_open_times_out() {
+        let (conn, _server) = tokio::io::duplex(1 << 16);
+        let open = open_sftp(conn, "u".into(), Duration::from_millis(100));
+        let r = tokio::time::timeout(Duration::from_secs(5), open).await.expect("open_sftp outlived its timeout");
+        assert_eq!(r.err().expect("a silent server let us in").to_string(), "opening SFTP session: timed out");
     }
 
     #[tokio::test]
