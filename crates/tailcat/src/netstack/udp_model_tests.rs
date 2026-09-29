@@ -418,3 +418,15 @@ fn closing_again_leaves_a_new_flow_alone() {
     net.recv(1);
     assert_eq!(net.flows.len(), 2, "the flow was opened again");
 }
+
+/// Once the stack is closed, datagrams open no flows, even ones the
+/// policy was already deciding on, and dials fail.
+#[test]
+fn nothing_opens_after_the_stack_closes() {
+    let mut net = Net::new();
+    net.inbound(port_53(remotes()[0]), Some(Race::Close));
+    net.inbound(port_53(remotes()[1]), None);
+    net.dial(remotes()[0]);
+    assert!(net.flows.is_empty() && table(&net).is_empty(), "flows opened on a closed stack");
+}
+

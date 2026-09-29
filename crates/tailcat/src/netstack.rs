@@ -391,17 +391,27 @@ impl Stack {
         let Ok(udp) = UdpPacket::new_checked(body) else { return };
         let (s, d) = (SocketAddr::new(src, udp.src_port()), SocketAddr::new(dst, udp.dst_port()));
         let data = udp.payload().to_vec();
-        let existing = self.shared.lock().udp.get(&(d, s)).cloned();
-        if let Some(tx) = existing {
-            if tx.try_send(data).is_err() && tx.is_closed() {
-                self.shared.lock().udp.remove(&(d, s));
-            }
+        let st = self.shared.lock();
+        if st.closed {
             return;
         }
+        if let Some(tx) = st.udp.get(&(d, s)) {
+            // A full queue drops the datagram.
+            let _ = tx.try_send(data);
+            return;
+        }
+        // The policy may block briefly; don't hold the lock.
+        drop(st);
         let Some(handler) = self.shared.udp_policy.as_ref().and_then(|p| p(s, d)) else { return };
+        let mut st = self.shared.lock();
+        // The stack may have closed meanwhile.
+        if st.closed {
+            return;
+        }
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
         let _ = tx.try_send(data);
-        self.shared.lock().udp.insert((d, s), tx);
+        st.udp.insert((d, s), tx);
+        drop(st);
         handler(UdpConn::new(self.shared.clone(), d, s, rx));
     }
 
@@ -426,6 +436,9 @@ impl Stack {
     /// Opens a connected UDP flow from `local_ip` to `remote`.
     pub fn dial_udp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<UdpConn> {
         let mut st = self.shared.lock();
+        if st.closed {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "stack closed"));
+        }
         let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
         st.udp.insert((local, remote), tx);
