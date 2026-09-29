@@ -85,28 +85,32 @@ impl Overlay {
     /// the WireGuard engine. Peers are added with [`Overlay::add_peer`]
     /// and packets flow once [`Overlay::run`] is given a device.
     pub async fn start(cfg: OverlayConfig) -> Result<Arc<Overlay>> {
-        let me = cfg.key.record.clone();
+        let OverlayConfig {
+            key: DeviceKey { private, record: me },
+            mut derp_map,
+            listen_port,
+            overlay_prefix,
+            enable_udp,
+        } = cfg;
         let home = me
-            .home_region(&cfg.derp_map)
+            .home_region(&derp_map)
             .ok_or_else(|| anyhow!("home DERP region {} is not in the DERP map", me.derp_region))?;
-        let mut dm = cfg.derp_map.clone();
-        dm.regions.insert(home.region_id, home.clone());
-        let prefix = cfg.overlay_prefix;
-        let filter: magicsock::EndpointFilter = Arc::new(move |ip| !prefix.contains(&ip));
+        let home_region = home.region_id;
+        derp_map.regions.insert(home_region, home);
         let (ms, wg_rx) = MagicSock::start(magicsock::Config {
-            private_key: cfg.key.private.clone(),
-            derp_map: dm,
-            home_region: home.region_id,
+            private_key: private.clone(),
+            derp_map,
+            home_region,
             derp_app_name: "tailcat-device".into(),
-            listen_port: cfg.listen_port,
+            listen_port,
             on_derp_recv: None,
-            endpoint_filter: Some(filter),
-            enable_udp: cfg.enable_udp,
+            endpoint_filter: Some(Arc::new(move |ip| !overlay_prefix.contains(&ip))),
+            enable_udp,
         })
         .await
         .context("starting magicsock")?;
-        let (engine, inbound) = Engine::start(&cfg.key.private, ms.clone(), wg_rx, None, None);
-        info!(overlay_ip = %me.overlay_ip, region = home.region_id, "overlay: node {} up as {}", me.index, me.nodekey.short_string());
+        let (engine, inbound) = Engine::start(&private, ms.clone(), wg_rx, None, None);
+        info!(overlay_ip = %me.overlay_ip, region = home_region, "overlay: node {} up as {}", me.index, me.nodekey.short_string());
         Ok(Arc::new(Overlay { me, ms, engine, peers: Mutex::default(), inbound: Mutex::new(Some(inbound)) }))
     }
 
@@ -134,25 +138,23 @@ impl Overlay {
         let region = r
             .home_region(dm)
             .ok_or_else(|| anyhow!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region))?;
-        self.ms.add_region(region.clone());
+        let home_region = region.region_id;
+        self.ms.add_region(region);
         let new = {
             let mut peers = self.peers.lock().unwrap();
             if peers.get(&r.nodekey) == Some(r) {
                 return Ok(false);
             }
             // An address may only belong to one peer.
-            if let Some((k, _)) = peers.iter().find(|(k, p)| p.overlay_ip == r.overlay_ip && **k != r.nodekey) {
-                let k = *k;
-                peers.remove(&k);
-                self.engine.remove_peer(&k);
-                self.ms.remove_peer(&k);
+            for (k, _) in peers.extract_if(|k, p| p.overlay_ip == r.overlay_ip && *k != r.nodekey) {
+                self.forget(&k);
             }
             peers.insert(r.nodekey, r.clone()).is_none()
         };
         self.ms.upsert_peer(magicsock::PeerConfig {
             node_key: r.nodekey,
             disco_key: r.discokey,
-            home_region: region.region_id,
+            home_region,
             endpoints: r.endpoints.clone(),
         });
         self.engine.upsert_peer(
@@ -174,10 +176,14 @@ impl Overlay {
     pub fn remove_peer(&self, k: &NodePublic) -> bool {
         let removed = self.peers.lock().unwrap().remove(k).is_some();
         if removed {
-            self.engine.remove_peer(k);
-            self.ms.remove_peer(k);
+            self.forget(k);
         }
         removed
+    }
+
+    fn forget(&self, k: &NodePublic) {
+        self.engine.remove_peer(k);
+        self.ms.remove_peer(k);
     }
 
     /// The number of peers.
@@ -189,53 +195,48 @@ impl Overlay {
     /// It can be called once.
     pub async fn run<D: PacketDevice>(self: Arc<Self>, dev: Arc<D>) -> Result<()> {
         let mut inbound = self.inbound.lock().unwrap().take().ok_or_else(|| anyhow!("Overlay::run called twice"))?;
-        let up = {
-            let dev = dev.clone();
-            let engine = self.engine.clone();
-            async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    let n = dev.recv(&mut buf).await?;
-                    if n > 0 {
-                        engine.send_ip(&buf[..n]);
-                    }
+        let up = async {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match dev.recv(&mut buf).await {
+                    Ok(0) => {}
+                    Ok(n) => self.engine.send_ip(&buf[..n]),
+                    Err(e) => return e,
                 }
-                #[allow(unreachable_code)]
-                Ok::<(), io::Error>(())
             }
         };
-        let down = async move {
+        let down = async {
             while let Some(p) = inbound.recv().await {
                 if let Err(e) = dev.send(&p.data).await {
                     debug!("overlay: device write: {e}");
                 }
             }
-            Ok::<(), io::Error>(())
         };
         tokio::select! {
-            r = up => r.context("reading from the device"),
-            r = down => r.context("writing to the device"),
+            e = up => Err(anyhow::Error::new(e).context("reading from the device")),
+            () = down => Ok(()),
         }
     }
 
     /// Returns every peer's status, ordered by index.
     pub fn status(&self) -> Vec<PeerStatus> {
-        let peers: Vec<NodeRecord> = self.peers.lock().unwrap().values().cloned().collect();
-        let mut out: Vec<PeerStatus> = peers
-            .into_iter()
+        let mut out: Vec<PeerStatus> = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
             .map(|r| {
                 let path = self.ms.peer_path(&r.nodekey);
-                let (hs, tx, rx) = self.engine.peer_stats(&r.nodekey).unwrap_or((None, 0, 0));
-                let direct = path.as_ref().filter(|p| p.direct_trusted).and_then(|p| p.best.map(|b| b.0));
+                let (hs, tx_bytes, rx_bytes) = self.engine.peer_stats(&r.nodekey).unwrap_or((None, 0, 0));
                 PeerStatus {
                     index: r.index,
                     nodekey: r.nodekey,
                     overlay_ip: r.overlay_ip,
-                    direct,
-                    derp_region: path.map(|p| p.home_region).unwrap_or(0),
+                    direct: path.as_ref().filter(|p| p.direct_trusted).and_then(|p| p.best.map(|b| b.0)),
+                    derp_region: path.map_or(0, |p| p.home_region),
                     handshake_age_secs: hs.map(|d| d.as_secs()),
-                    tx_bytes: tx,
-                    rx_bytes: rx,
+                    tx_bytes,
+                    rx_bytes,
                 }
             })
             .collect();
@@ -281,18 +282,18 @@ impl ChannelDevice {
 
 impl PacketDevice for ChannelDevice {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.rx.lock().await.recv().await {
-            Some(p) => {
-                let n = p.len().min(buf.len());
-                buf[..n].copy_from_slice(&p[..n]);
-                Ok(n)
-            }
-            None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "device closed")),
-        }
+        let p = self.rx.lock().await.recv().await.ok_or_else(closed)?;
+        let n = p.len().min(buf.len());
+        buf[..n].copy_from_slice(&p[..n]);
+        Ok(n)
     }
 
     async fn send(&self, pkt: &[u8]) -> io::Result<usize> {
-        self.out.send(pkt.to_vec()).await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "device closed"))?;
+        self.out.send(pkt.to_vec()).await.map_err(|_| closed())?;
         Ok(pkt.len())
     }
+}
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "device closed")
 }

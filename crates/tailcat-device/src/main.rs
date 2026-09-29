@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use clap::{Args, Parser, Subcommand};
 use tailcat::wg::IpNet;
 use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, NodePrivate};
 use tailcat_device::github::{self, GithubEnv, Scope};
@@ -40,102 +40,108 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Generate this node's key and write its public node record.
-    Init {
-        /// This node's index in the mesh (for example the matrix index).
-        #[arg(long)]
-        index: u32,
-        /// The run attempt, part of the default overlay IP and record name.
-        #[arg(long, env = "GITHUB_RUN_ATTEMPT", default_value = "1")]
-        attempt: u32,
-        /// The overlay network. The default IP is <prefix> + attempt*256 + index.
-        #[arg(long, default_value = "100.64.0.0/16")]
-        overlay_prefix: IpNet,
-        /// An explicit overlay IP instead of the default.
-        #[arg(long)]
-        ip: Option<IpAddr>,
-        /// Extra prefixes to route to this node (repeatable).
-        #[arg(long = "route")]
-        routes: Vec<String>,
-        /// Home DERP region: 'auto' (lowest latency), an ID, a region code or name, or comma-separated
-        /// hostnames of your own DERP servers.
-        #[arg(long, default_value = "auto")]
-        region: String,
-        /// A JSON file holding a DERP region to embed (for example from `tailcat dev-derp --region-file`).
-        #[arg(long, conflicts_with = "region")]
-        region_file: Option<PathBuf>,
-        /// Where to write the private key file.
-        #[arg(long, default_value = "tailcat-device.key")]
-        key: PathBuf,
-        /// Where to write the public record [default: node-<attempt>-<index>.json].
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Embed a GitHub OIDC token binding the key to this repository, ref and run.
-        #[arg(long)]
-        oidc: bool,
-        /// The OIDC audience prefix; the audience is the prefix plus the hex SHA-256 of the node key.
-        #[arg(long, default_value = "tailcat-device:")]
-        oidc_audience_prefix: String,
-        /// Overwrite an existing key file.
-        #[arg(long)]
-        force: bool,
-    },
+    Init(InitArgs),
     /// Bring up the overlay: create the TUN interface and add peers as their records appear.
-    Up {
-        /// The key file from `init`.
-        #[arg(long, default_value = "tailcat-device.key")]
-        key: PathBuf,
-        /// Read peer records from every *.json file in this directory.
-        #[arg(long, conflicts_with_all = ["record", "github"])]
-        records: Option<PathBuf>,
-        /// Read peer records from these files (repeatable).
-        #[arg(long, conflicts_with = "github")]
-        record: Vec<PathBuf>,
-        /// Read peer records from this GitHub Actions run's artifacts (needs GITHUB_TOKEN with `actions: read`).
-        #[arg(long)]
-        github: bool,
-        /// Which GitHub runs' records to admit.
-        #[arg(long, value_enum, default_value = "run")]
-        scope: Scope,
-        /// Artifact name prefix [default: node-<attempt>- for run scope, node- otherwise].
-        #[arg(long)]
-        artifact_prefix: Option<String>,
-        #[arg(long, default_value = "tailcat-device:")]
-        oidc_audience_prefix: String,
-        /// The number of nodes in the mesh, including this one; `up` fails if they don't all appear in time.
-        #[arg(long)]
-        nodes: Option<usize>,
-        /// How long to wait for all --nodes records.
-        #[arg(long, default_value = "5m", value_parser = parse_duration)]
-        wait: Duration,
-        /// The TUN interface name (on macOS, utunN or omitted).
-        #[arg(long)]
-        tun: Option<String>,
-        #[arg(long, default_value_t = 1280)]
-        mtu: u16,
-        /// The overlay network, assigned to the interface.
-        #[arg(long, default_value = "100.64.0.0/16")]
-        overlay_prefix: IpNet,
-        /// The UDP port for direct paths (0 picks one).
-        #[arg(long, default_value_t = 0)]
-        listen_port: u16,
-        /// Relay everything through DERP; don't try direct paths.
-        #[arg(long)]
-        no_udp: bool,
-        /// Write peer status JSON here, periodically.
-        #[arg(long)]
-        status_file: Option<PathBuf>,
-        /// Create this file once every expected peer has answered a ping.
-        #[arg(long)]
-        ready_file: Option<PathBuf>,
-        /// How often to log peer status.
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
-        status_interval: Duration,
-    },
+    Up(UpArgs),
     /// Print this node's public record.
     Record {
         #[arg(long, default_value = "tailcat-device.key")]
         key: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct InitArgs {
+    /// This node's index in the mesh (for example the matrix index).
+    #[arg(long)]
+    index: u32,
+    /// The run attempt, part of the default overlay IP and record name.
+    #[arg(long, env = "GITHUB_RUN_ATTEMPT", default_value = "1")]
+    attempt: u32,
+    /// The overlay network. The default IP is <prefix> + attempt*256 + index.
+    #[arg(long, default_value = "100.64.0.0/16")]
+    overlay_prefix: IpNet,
+    /// An explicit overlay IP instead of the default.
+    #[arg(long)]
+    ip: Option<IpAddr>,
+    /// Extra prefixes to route to this node (repeatable).
+    #[arg(long = "route")]
+    routes: Vec<String>,
+    /// Home DERP region: 'auto' (lowest latency), an ID, a region code or name, or comma-separated
+    /// hostnames of your own DERP servers.
+    #[arg(long, default_value = "auto")]
+    region: String,
+    /// A JSON file holding a DERP region to embed (for example from `tailcat dev-derp --region-file`).
+    #[arg(long, conflicts_with = "region")]
+    region_file: Option<PathBuf>,
+    /// Where to write the private key file.
+    #[arg(long, default_value = "tailcat-device.key")]
+    key: PathBuf,
+    /// Where to write the public record [default: node-<attempt>-<index>.json].
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Embed a GitHub OIDC token binding the key to this repository, ref and run.
+    #[arg(long)]
+    oidc: bool,
+    /// The OIDC audience prefix; the audience is the prefix plus the hex SHA-256 of the node key.
+    #[arg(long, default_value = "tailcat-device:")]
+    oidc_audience_prefix: String,
+    /// Overwrite an existing key file.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct UpArgs {
+    /// The key file from `init`.
+    #[arg(long, default_value = "tailcat-device.key")]
+    key: PathBuf,
+    /// Read peer records from every *.json file in this directory.
+    #[arg(long, conflicts_with_all = ["record", "github"])]
+    records: Option<PathBuf>,
+    /// Read peer records from these files (repeatable).
+    #[arg(long, conflicts_with = "github")]
+    record: Vec<PathBuf>,
+    /// Read peer records from this GitHub Actions run's artifacts (needs GITHUB_TOKEN with `actions: read`).
+    #[arg(long)]
+    github: bool,
+    /// Which GitHub runs' records to admit.
+    #[arg(long, value_enum, default_value = "run")]
+    scope: Scope,
+    /// Artifact name prefix [default: node-<attempt>- for run scope, node- otherwise].
+    #[arg(long)]
+    artifact_prefix: Option<String>,
+    #[arg(long, default_value = "tailcat-device:")]
+    oidc_audience_prefix: String,
+    /// The number of nodes in the mesh, including this one; `up` fails if they don't all appear in time.
+    #[arg(long)]
+    nodes: Option<usize>,
+    /// How long to wait for all --nodes records.
+    #[arg(long, default_value = "5m", value_parser = parse_duration)]
+    wait: Duration,
+    /// The TUN interface name (on macOS, utunN or omitted).
+    #[arg(long)]
+    tun: Option<String>,
+    #[arg(long, default_value_t = 1280)]
+    mtu: u16,
+    /// The overlay network, assigned to the interface.
+    #[arg(long, default_value = "100.64.0.0/16")]
+    overlay_prefix: IpNet,
+    /// The UDP port for direct paths (0 picks one).
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    /// Relay everything through DERP; don't try direct paths.
+    #[arg(long)]
+    no_udp: bool,
+    /// Write peer status JSON here, periodically.
+    #[arg(long)]
+    status_file: Option<PathBuf>,
+    /// Create this file once every expected peer has answered a ping.
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
+    /// How often to log peer status.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    status_interval: Duration,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -148,7 +154,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         "h" => 3600.0,
         _ => return Err(format!("invalid duration unit in {s:?}")),
     };
-    Ok(Duration::from_secs_f64(n * mult))
+    Duration::try_from_secs_f64(n * mult).map_err(|_| format!("invalid duration {s:?}"))
 }
 
 fn main() -> ExitCode {
@@ -160,7 +166,17 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .try_init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    match rt.block_on(run(cli)) {
+    let res = rt.block_on(async {
+        match cli.cmd {
+            Cmd::Init(a) => init(&cli.derpmap_url, a).await,
+            Cmd::Up(a) => up(&cli.derpmap_url, a).await,
+            Cmd::Record { key } => {
+                println!("{}", serde_json::to_string_pretty(&DeviceKey::load(&key)?.record)?);
+                Ok(())
+            }
+        }
+    });
+    match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tailcat-device: {e:#}");
@@ -175,198 +191,149 @@ async fn fetch_map(url: &str) -> Result<DerpMap> {
         .map_err(|e| anyhow!("fetching the DERP map: {e}"))
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    match cli.cmd {
-        Cmd::Init {
-            index,
-            attempt,
-            overlay_prefix,
-            ip,
-            routes,
-            region,
-            region_file,
-            key,
-            out,
-            oidc,
-            oidc_audience_prefix,
-            force,
-        } => {
-            if key.exists() && !force {
-                bail!("{} already exists; use --force to overwrite", key.display());
-            }
-            let private = NodePrivate::generate();
-            let overlay_ip = match ip {
-                Some(ip) => ip,
-                None => record::overlay_ip(&overlay_prefix, attempt, index)?,
-            };
-            let (derp_region, derp) = match region_file {
-                Some(f) => {
-                    let r: DerpRegion = serde_json::from_slice(&std::fs::read(&f)?)
-                        .with_context(|| format!("parsing {}", f.display()))?;
-                    (0, Some(r))
-                }
-                None => pick_region(&cli.derpmap_url, &region).await?,
-            };
-            let mut rec = NodeRecord {
-                index,
-                nodekey: private.public(),
-                discokey: private.disco_private().public(),
-                overlay_ip,
-                derp_region,
-                derp,
-                routes,
-                endpoints: Vec::new(),
-                os: std::env::var("RUNNER_OS").unwrap_or_else(|_| std::env::consts::OS.into()),
-                arch: std::env::var("RUNNER_ARCH").unwrap_or_else(|_| std::env::consts::ARCH.into()),
-                run_id: std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
-                run_attempt: std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),
-                jwt: String::new(),
-            };
-            if oidc {
-                rec.jwt = github::mint_oidc(&record::audience_for(&oidc_audience_prefix, &rec.nodekey)).await?;
-            }
-            let k = DeviceKey { private, record: rec.clone() };
-            k.save(&key)?;
-            let out = out.unwrap_or_else(|| PathBuf::from(format!("node-{attempt}-{index}.json")));
-            rec.write(&out)?;
-            eprintln!("# wrote key to {} and record to {}", key.display(), out.display());
-            println!("{}", out.display());
-            Ok(())
+async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
+    ensure!(a.force || !a.key.exists(), "{} already exists; use --force to overwrite", a.key.display());
+    let private = NodePrivate::generate();
+    let overlay_ip = match a.ip {
+        Some(ip) => ip,
+        None => record::overlay_ip(&a.overlay_prefix, a.attempt, a.index)?,
+    };
+    let (derp_region, derp) = match &a.region_file {
+        Some(f) => {
+            let b = std::fs::read(f).with_context(|| format!("reading {}", f.display()))?;
+            (0, Some(serde_json::from_slice(&b).with_context(|| format!("parsing {}", f.display()))?))
         }
-        Cmd::Record { key } => {
-            let k = DeviceKey::load(&key)?;
-            println!("{}", serde_json::to_string_pretty(&k.record)?);
-            Ok(())
-        }
-        Cmd::Up {
-            key,
-            records,
-            record,
-            github,
-            scope,
-            artifact_prefix,
-            oidc_audience_prefix,
-            nodes,
-            wait,
-            tun,
-            mtu,
-            overlay_prefix,
-            listen_port,
-            no_udp,
-            status_file,
-            ready_file,
-            status_interval,
-        } => {
-            let k = DeviceKey::load(&key)?;
-            let mut source = if github {
-                let env = GithubEnv::from_env()?;
-                let prefix = artifact_prefix.unwrap_or_else(|| match scope {
-                    Scope::Run => format!("node-{}-", env.run_attempt),
-                    _ => "node-".into(),
-                });
-                Source::Github(Box::new(GithubSource::new(env, scope, prefix, oidc_audience_prefix)))
-            } else if let Some(d) = records {
-                Source::Dir(d)
-            } else if !record.is_empty() {
-                Source::Files(record)
-            } else {
-                bail!("say where peer records come from: --records DIR, --record FILE, or --github");
-            };
-            let mut dm = DerpMap::default();
-            let needs_map = k.record.derp.is_none();
-            if needs_map {
-                dm = fetch_map(&cli.derpmap_url).await?;
-            }
-            let overlay = Overlay::start(OverlayConfig {
-                key: k.clone(),
-                derp_map: dm.clone(),
-                listen_port,
-                overlay_prefix,
-                enable_udp: !no_udp,
-            })
-            .await?;
-            if !overlay.wait_derp(Duration::from_secs(15)).await {
-                warn!("not yet connected to the home DERP region; continuing");
-            }
-            let dev = open_tun(tun.as_deref(), &k.record, &overlay_prefix, mtu)?;
-            let mut runner = tokio::spawn(overlay.clone().run(dev));
-            info!("overlay: {} is node {} at {}", k.record.nodekey, k.record.index, k.record.overlay_ip);
+        None => pick_region(derpmap_url, &a.region).await?,
+    };
+    let env = |k, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
+    let mut record = NodeRecord {
+        derp_region,
+        derp,
+        routes: a.routes,
+        os: env("RUNNER_OS", std::env::consts::OS),
+        arch: env("RUNNER_ARCH", std::env::consts::ARCH),
+        run_id: env("GITHUB_RUN_ID", ""),
+        run_attempt: env("GITHUB_RUN_ATTEMPT", ""),
+        ..NodeRecord::new(a.index, &private, overlay_ip)
+    };
+    if a.oidc {
+        record.jwt = github::mint_oidc(&record::audience_for(&a.oidc_audience_prefix, &record.nodekey)).await?;
+    }
+    let out = a.out.unwrap_or_else(|| format!("node-{}-{}.json", a.attempt, a.index).into());
+    let k = DeviceKey { private, record };
+    k.save(&a.key)?;
+    k.record.write(&out)?;
+    eprintln!("# wrote key to {} and record to {}", a.key.display(), out.display());
+    println!("{}", out.display());
+    Ok(())
+}
 
-            let expected = nodes.map(|n| n.saturating_sub(1));
-            let deadline = Instant::now() + wait;
-            let mut last_status = Instant::now();
-            let mut last_poll: Option<Instant> = None;
-            let mut ready = false;
-            // Poll quickly while nodes are joining, then back off: the
-            // GitHub API is rate-limited per repository.
-            let settled_poll = if github { Duration::from_secs(30) } else { Duration::from_secs(5) };
-            let signal = shutdown_signal();
-            tokio::pin!(signal);
-            loop {
-                let joining = expected.is_some_and(|n| overlay.peer_count() < n) || !ready;
-                let poll_every = if joining { Duration::from_secs(2) } else { settled_poll };
-                let poll_due = last_poll.is_none_or(|t| t.elapsed() >= poll_every);
-                if poll_due {
-                    last_poll = Some(Instant::now());
-                }
-                match if poll_due { source.poll().await } else { Ok(Vec::new()) } {
-                    Ok(recs) => {
-                        for r in &recs {
-                            // Fetch the DERP map the first time a peer needs it.
-                            if r.derp.is_none() && dm.regions.is_empty() {
-                                dm = fetch_map(&cli.derpmap_url).await?;
-                            }
-                            if let Err(e) = overlay.add_peer(r, &dm) {
-                                warn!("{e:#}");
-                            }
+async fn up(derpmap_url: &str, a: UpArgs) -> Result<()> {
+    let k = DeviceKey::load(&a.key)?;
+    let mut source = if a.github {
+        let env = GithubEnv::from_env()?;
+        let prefix = a.artifact_prefix.unwrap_or_else(|| match a.scope {
+            Scope::Run => format!("node-{}-", env.run_attempt),
+            _ => "node-".into(),
+        });
+        Source::Github(Box::new(GithubSource::new(env, a.scope, prefix, a.oidc_audience_prefix)))
+    } else if let Some(d) = a.records {
+        Source::Dir(d)
+    } else if !a.record.is_empty() {
+        Source::Files(a.record)
+    } else {
+        bail!("say where peer records come from: --records DIR, --record FILE, or --github");
+    };
+    // The DERP map is fetched now if our home region is in it, else the
+    // first time a peer's is.
+    let mut dm = if k.record.derp.is_none() { fetch_map(derpmap_url).await? } else { DerpMap::default() };
+    let overlay = Overlay::start(OverlayConfig {
+        key: k,
+        derp_map: dm.clone(),
+        listen_port: a.listen_port,
+        overlay_prefix: a.overlay_prefix,
+        enable_udp: !a.no_udp,
+    })
+    .await?;
+    if !overlay.wait_derp(Duration::from_secs(15)).await {
+        warn!("not yet connected to the home DERP region; continuing");
+    }
+    let me = overlay.record();
+    let dev = open_tun(a.tun.as_deref(), me, &a.overlay_prefix, a.mtu)?;
+    let mut runner = tokio::spawn(overlay.clone().run(dev));
+    info!("overlay: {} is node {} at {}", me.nodekey, me.index, me.overlay_ip);
+
+    let expected = a.nodes.map(|n| n.saturating_sub(1));
+    let deadline = Instant::now() + a.wait;
+    let mut last_status = Instant::now();
+    let mut last_poll: Option<Instant> = None;
+    let mut ready = false;
+    // Poll quickly while nodes are joining, then back off: the GitHub API
+    // is rate-limited per repository.
+    let settled_poll = Duration::from_secs(if a.github { 30 } else { 5 });
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    loop {
+        let joining = !ready || expected.is_some_and(|n| overlay.peer_count() < n);
+        let poll_every = if joining { Duration::from_secs(2) } else { settled_poll };
+        if last_poll.is_none_or(|t| t.elapsed() >= poll_every) {
+            last_poll = Some(Instant::now());
+            match source.poll().await {
+                Ok(recs) => {
+                    for r in &recs {
+                        if r.derp.is_none() && dm.regions.is_empty() {
+                            dm = fetch_map(derpmap_url).await?;
+                        }
+                        if let Err(e) = overlay.add_peer(r, &dm) {
+                            warn!("{e:#}");
                         }
                     }
-                    Err(e) => warn!("polling records: {e:#}"),
                 }
-                let have = overlay.peer_count();
-                if let Some(n) = expected {
-                    if have < n && Instant::now() > deadline {
-                        bail!("only {have} of {n} peers appeared within {}s", wait.as_secs());
-                    }
-                    if have >= n && !ready {
-                        ready = all_reachable(&overlay).await;
-                        if ready {
-                            info!("overlay: all {n} peers reachable");
-                            if let Some(f) = &ready_file {
-                                std::fs::write(f, b"ready\n")?;
-                            }
-                        }
-                    }
+                Err(e) => warn!("polling records: {e:#}"),
+            }
+        }
+        if let Some(n) = expected {
+            let have = overlay.peer_count();
+            ensure!(
+                have >= n || Instant::now() <= deadline,
+                "only {have} of {n} peers appeared within {}s",
+                a.wait.as_secs()
+            );
+            if have >= n && !ready && all_reachable(&overlay).await {
+                ready = true;
+                info!("overlay: all {n} peers reachable");
+                if let Some(f) = &a.ready_file {
+                    std::fs::write(f, b"ready\n")?;
                 }
-                if last_status.elapsed() >= status_interval {
-                    last_status = Instant::now();
-                    log_status(&overlay);
-                }
-                if let Some(f) = &status_file {
-                    let _ = std::fs::write(f, serde_json::to_vec_pretty(&overlay.status())?);
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                    _ = &mut signal => {
-                        info!("overlay: shutting down");
-                        overlay.close();
-                        return Ok(());
-                    }
-                    r = &mut runner => {
-                        return match r {
-                            Ok(Ok(())) => Err(anyhow!("the packet loop stopped")),
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(anyhow!("the packet loop panicked: {e}")),
-                        };
-                    }
-                }
+            }
+        }
+        if last_status.elapsed() >= a.status_interval {
+            last_status = Instant::now();
+            log_status(&overlay);
+        }
+        if let Some(f) = &a.status_file {
+            let _ = std::fs::write(f, serde_json::to_vec_pretty(&overlay.status())?);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = &mut signal => {
+                info!("overlay: shutting down");
+                overlay.close();
+                return Ok(());
+            }
+            r = &mut runner => {
+                return Err(match r {
+                    Ok(Ok(())) => anyhow!("the packet loop stopped"),
+                    Ok(Err(e)) => e,
+                    Err(e) => anyhow!("the packet loop panicked: {e}"),
+                });
             }
         }
     }
 }
 
 /// Pings every peer once, driving path discovery; true if all answer.
-async fn all_reachable(o: &Arc<Overlay>) -> bool {
+async fn all_reachable(o: &Overlay) -> bool {
     let mut ok = true;
     for p in o.status() {
         match o.ping(&p.nodekey, Duration::from_secs(3)).await {
@@ -387,7 +354,7 @@ fn log_status(o: &Overlay) {
             "peer {} {} via {path}, handshake {}, tx {} rx {}",
             p.index,
             p.overlay_ip,
-            p.handshake_age_secs.map(|s| format!("{s}s ago")).unwrap_or_else(|| "never".into()),
+            p.handshake_age_secs.map_or("never".into(), |s| format!("{s}s ago")),
             p.tx_bytes,
             p.rx_bytes
         );
@@ -434,18 +401,56 @@ async fn pick_region(url: &str, region: &str) -> Result<(i32, Option<DerpRegion>
         return Ok((0, Some(DerpRegion { region_id: 900, region_code: "custom".into(), nodes, ..Default::default() })));
     }
     let dm = fetch_map(url).await?;
-    if region == "auto" {
-        let id = tailcat::netcheck::pick_best_region(&dm)
+    let id = if region == "auto" {
+        tailcat::netcheck::pick_best_region(&dm)
             .await?
-            .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?;
-        return Ok((id, None));
-    }
-    if let Ok(id) = region.parse::<i32>() {
-        if !dm.regions.contains_key(&id) {
-            bail!("no DERP region {id} in the DERP map");
-        }
-        return Ok((id, None));
-    }
-    let id = tailcat::derpmap::find_region(&dm, region).ok_or_else(|| anyhow!("no DERP region matching {region:?}"))?;
+            .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?
+    } else if let Ok(id) = region.parse() {
+        ensure!(dm.regions.contains_key(&id), "no DERP region {id} in the DERP map");
+        id
+    } else {
+        tailcat::derpmap::find_region(&dm, region).ok_or_else(|| anyhow!("no DERP region matching {region:?}"))?
+    };
     Ok((id, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        let d = |s| parse_duration(s);
+        assert_eq!(d("250ms"), Ok(Duration::from_millis(250)));
+        assert_eq!(d("30"), Ok(Duration::from_secs(30)));
+        assert_eq!(d("1.5s"), Ok(Duration::from_millis(1500)));
+        assert_eq!(d("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(d("2h"), Ok(Duration::from_secs(7200)));
+        for bad in ["", "s", "5d", "-1s", "1e999s"] {
+            assert!(d(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cli_parses() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let cli =
+            Cli::try_parse_from(["tailcat-device", "up", "--records", "d", "--nodes", "3", "--wait", "60s"]).unwrap();
+        let Cmd::Up(a) = cli.cmd else { panic!("not up") };
+        assert_eq!((a.records, a.nodes, a.wait), (Some("d".into()), Some(3), Duration::from_secs(60)));
+        assert!(Cli::try_parse_from(["tailcat-device", "up", "--records", "d", "--github"]).is_err());
+        assert!(
+            Cli::try_parse_from(["tailcat-device", "init", "--index", "0", "--region", "1", "--region-file", "f"])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_region_hostnames() {
+        let (id, r) = pick_region("http://unused.invalid", "a.example,b.example").await.unwrap();
+        let r = r.unwrap();
+        assert_eq!((id, r.region_id, r.nodes.len()), (0, 900, 2));
+        assert_eq!(r.nodes[1].host_name, "b.example");
+    }
 }

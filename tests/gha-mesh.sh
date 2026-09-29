@@ -8,8 +8,8 @@
 #   tests/gha-mesh.sh wait-done <nodes>                # after uploading done-<attempt>-<index>
 #   tests/gha-mesh.sh stop                             # print logs, stop the node
 #
-# Needs sudo (for the TUN device) and GH_TOKEN/GITHUB_TOKEN with
-# `actions: read`.
+# Needs sudo (for the TUN device) and GITHUB_TOKEN (read by both
+# tailcat-device and gh) with `actions: read`.
 
 set -euo pipefail
 

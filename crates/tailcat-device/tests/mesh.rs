@@ -17,24 +17,19 @@ struct Node {
     ip: IpAddr,
 }
 
+/// Node `i` is at 100.64.1.`i`, and also routes 10.42.`i`.0/24.
+fn record(i: u32, private: &NodePrivate, dev: &DevDerp) -> NodeRecord {
+    NodeRecord {
+        derp: Some(dev.region.clone()),
+        routes: vec![format!("10.42.{i}.0/24")],
+        ..NodeRecord::new(i, private, format!("100.64.1.{i}").parse().unwrap())
+    }
+}
+
 async fn node(i: u32, dev: &DevDerp) -> Node {
     let private = NodePrivate::generate();
-    let ip: IpAddr = format!("100.64.1.{i}").parse().unwrap();
-    let record = NodeRecord {
-        index: i,
-        nodekey: private.public(),
-        discokey: private.disco_private().public(),
-        overlay_ip: ip,
-        derp_region: 0,
-        derp: Some(dev.region.clone()),
-        routes: vec![],
-        endpoints: vec![],
-        os: String::new(),
-        arch: String::new(),
-        run_id: String::new(),
-        run_attempt: String::new(),
-        jwt: String::new(),
-    };
+    let record = record(i, &private, dev);
+    let ip = record.overlay_ip;
     let overlay = Overlay::start(OverlayConfig {
         key: DeviceKey { private, record },
         derp_map: DerpMap::default(),
@@ -68,11 +63,12 @@ async fn three_node_mesh_routes_ipv4() {
         }
         assert_eq!(n.overlay.peer_count(), 2);
     }
-    // Every node sends to every other; each packet must arrive intact at
-    // exactly its destination.
-    for (a, b) in [(0, 1), (1, 2), (2, 0), (0, 2)] {
+    // Every node sends to every other, at its overlay IP or inside its
+    // routed prefix; each packet must arrive intact at exactly its
+    // destination.
+    for (a, b, dst) in [(0, 1, nodes[1].ip), (1, 2, nodes[2].ip), (2, 0, nodes[0].ip), (0, 2, [10, 42, 2, 7].into())] {
         let msg = format!("hello {a}->{b}");
-        let pkt = udp(nodes[a].ip, nodes[b].ip, msg.as_bytes());
+        let pkt = udp(nodes[a].ip, dst, msg.as_bytes());
         let mut got = None;
         for _ in 0..20 {
             nodes[a].inject.send(pkt.clone()).await.unwrap();
@@ -95,4 +91,43 @@ async fn three_node_mesh_routes_ipv4() {
     let st = nodes[0].overlay.status();
     assert_eq!(st.len(), 2);
     assert!(st.iter().all(|p| p.handshake_age_secs.is_some()), "{st:?}");
+    assert_eq!(st.iter().map(|p| p.index).collect::<Vec<_>>(), [1, 2], "ordered by index");
+}
+
+#[tokio::test]
+async fn peer_updates() {
+    let dev = DevDerp::start_local().await.unwrap();
+    let o = node(0, &dev).await.overlay;
+    let dm = DerpMap::default();
+    assert!(!o.add_peer(o.record(), &dm).unwrap(), "our own record is ignored");
+    assert_eq!(o.peer_count(), 0);
+
+    let a = record(1, &NodePrivate::generate(), &dev);
+    assert!(o.add_peer(&a, &dm).unwrap(), "new");
+    assert!(!o.add_peer(&a, &dm).unwrap(), "unchanged");
+    let rerouted = NodeRecord { routes: vec![], ..a.clone() };
+    assert!(!o.add_peer(&rerouted, &dm).unwrap(), "updated");
+    assert_eq!(o.peer_count(), 1);
+
+    // A new key at a's address takes it over.
+    let b = NodeRecord { index: 2, ..record(1, &NodePrivate::generate(), &dev) };
+    assert!(o.add_peer(&b, &dm).unwrap());
+    assert_eq!(o.peer_count(), 1);
+    assert!(!o.magicsock().has_peer(&a.nodekey));
+    assert_eq!(o.status()[0].nodekey, b.nodekey);
+
+    // A peer whose home region isn't known is refused.
+    let lost = NodeRecord { derp: None, derp_region: 5, ..record(3, &NodePrivate::generate(), &dev) };
+    assert!(o.add_peer(&lost, &dm).is_err());
+
+    assert!(o.remove_peer(&b.nodekey));
+    assert!(!o.remove_peer(&b.nodekey));
+    assert_eq!(o.peer_count(), 0);
+    assert!(!o.magicsock().has_peer(&b.nodekey));
+
+    // The packet loop is already running.
+    tokio::task::yield_now().await;
+    let (d, _, _) = ChannelDevice::new();
+    let err = o.clone().run(d).await.unwrap_err();
+    assert!(err.to_string().contains("called twice"), "{err:#}");
 }

@@ -7,62 +7,38 @@
 
 set -euo pipefail
 
-RS=${1:?usage: live.sh <rust tailcat> <go tailcat>}
-GO=${2:?usage: live.sh <rust tailcat> <go tailcat>}
-work=$(mktemp -d)
-export HOME="$work/home"
-mkdir -p "$HOME"
-pids=()
-cleanup() {
-	for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-	wait 2>/dev/null || true
-	rm -rf "$work"
-}
-trap cleanup EXIT
-failures=0
+# Each implementation's binary is in the variable of its name, so "${!c}"
+# is client $c's.
+# shellcheck disable=SC2034
+rust=${1:?usage: live.sh <rust tailcat> <go tailcat>} go=${2:?usage: live.sh <rust tailcat> <go tailcat>}
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
+start_wait=300
 
-start() {
-	local name=$1
-	shift
-	rm -f "$work/addr"
-	TAILCAT_ADDR_FILE="$work/addr" "$@" >"$work/$name.out" 2>"$work/$name.log" &
-	pids+=($!)
-	server_pid=$!
-	for _ in $(seq 300); do
-		[ -s "$work/addr" ] && break
-		sleep 0.1
-	done
-	[ -s "$work/addr" ] || { echo "server $name did not start:"; cat "$work/$name.log"; exit 1; }
-	addr=$(cat "$work/addr")
-	head -2 "$work/$name.log"
+# serve <name> <server command...>: like start, showing the server's
+# first log lines (its region).
+serve() {
+	start "$@"
+	head -2 "$work/$1.log"
 }
 
-stop() {
-	kill "$server_pid" 2>/dev/null || true
-	wait "$server_pid" 2>/dev/null || true
-}
-
-for pair in "rust:$RS go:$GO" "go:$GO rust:$RS" "rust:$RS rust:$RS"; do
+for pair in "rust go" "go rust" "rust rust"; do
 	read -r s c <<<"$pair"
-	sn=${s%%:*} sb=${s#*:} cn=${c%%:*} cb=${c#*:}
-	start "pipe-$sn" "$sb"
-	msg="hello over the internet from $cn"
-	if echo "$msg" | timeout 60 "$cb" "$addr" 2>"$work/client.log" && sleep 0.5 && grep -qx "$msg" "$work/pipe-$sn.out"; then
-		echo "ok   pipe: $cn client -> $sn server"
+	serve "pipe-$s" "${!s}"
+	msg="hello over the internet from $c"
+	if echo "$msg" | timeout 60 "${!c}" "$addr" 2>"$work/client.log" && sleep 0.5 && grep -qx "$msg" "$work/pipe-$s.out"; then
+		pass "pipe: $c client -> $s server"
 	else
-		echo "FAIL pipe: $cn client -> $sn server: $(tail -3 "$work/client.log")"
-		failures=$((failures + 1))
+		fail "pipe: $c client -> $s server: $(tail -3 "$work/client.log")"
 	fi
 	stop
-	start "ping-$sn" "$sb" serve 80
-	if timeout 60 "$cb" ping --until-direct --timeout=30s "$addr"; then
-		echo "ok   direct path: $cn client -> $sn server"
+	serve "ping-$s" "${!s}" serve 80
+	if timeout 60 "${!c}" ping --until-direct --timeout=30s "$addr"; then
+		pass "direct path: $c client -> $s server"
 	else
-		echo "FAIL direct path: $cn client -> $sn server"
-		failures=$((failures + 1))
+		fail "direct path: $c client -> $s server"
 	fi
 	stop
 done
 
-[ "$failures" -eq 0 ] || { echo "$failures live test(s) failed"; exit 1; }
-echo "all live tests passed"
+finish live
