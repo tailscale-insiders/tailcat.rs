@@ -119,7 +119,7 @@ type FlowKey = (SocketAddr, SocketAddr); // (local, remote)
 struct PendingAccept {
     flow: FlowKey,
     handler: Box<dyn FnOnce(TcpStream) + Send>,
-    since: Instant,
+    since: tokio::time::Instant,
 }
 
 /// How a TCP connection ended.
@@ -165,9 +165,16 @@ struct State {
     udp: HashMap<FlowKey, mpsc::Sender<Vec<u8>>>,
     next_port: u16,
     closed: bool,
+    /// When the stack started: smoltcp's time zero.
+    epoch: tokio::time::Instant,
 }
 
 impl State {
+    /// smoltcp's clock. It runs on tokio's, so tests can pause it.
+    fn now(&self) -> smoltcp::time::Instant {
+        smoltcp::time::Instant::from_micros(self.epoch.elapsed().as_micros() as i64)
+    }
+
     /// Picks the next free ephemeral port on `local_ip`.
     fn alloc_port(&mut self, local_ip: IpAddr) -> u16 {
         loop {
@@ -282,17 +289,13 @@ pub struct Stack {
     shared: Arc<Shared>,
 }
 
-fn now() -> smoltcp::time::Instant {
-    smoltcp::time::Instant::now()
-}
-
 impl Stack {
     /// Creates a stack and starts its poll loop.
     pub fn new(cfg: StackConfig, out: Output, tcp_policy: Option<TcpPolicy>, udp_policy: Option<UdpPolicy>) -> Stack {
         let mut device = QueueDevice { mtu: cfg.mtu, ..Default::default() };
         let mut icfg = IfaceConfig::new(HardwareAddress::Ip);
         icfg.random_seed = rand::random();
-        let mut iface = Interface::new(icfg, &mut device, now());
+        let mut iface = Interface::new(icfg, &mut device, smoltcp::time::Instant::ZERO);
         iface.update_ip_addrs(|addrs| {
             for &a in &cfg.addrs {
                 let _ = addrs.push(IpCidr::new(a.into(), if a.is_ipv4() { 32 } else { 128 }));
@@ -318,6 +321,7 @@ impl Stack {
                 udp: HashMap::new(),
                 next_port: rand::Rng::gen_range(&mut rand::thread_rng(), EPHEMERAL),
                 closed: false,
+                epoch: tokio::time::Instant::now(),
             }),
             wake: Arc::new(Notify::new()),
             polled: Notify::new(),
@@ -374,7 +378,7 @@ impl Stack {
                             if !st.tuples.contains_key(&(d, s)) {
                                 let h = st.sockets.add(new_tcp_socket());
                                 st.tuples.insert((d, s), h);
-                                let pa = PendingAccept { flow: (d, s), handler, since: Instant::now() };
+                                let pa = PendingAccept { flow: (d, s), handler, since: tokio::time::Instant::now() };
                                 st.accepting.insert(h, pa);
                             }
                         }
@@ -516,7 +520,7 @@ async fn poll_loop(shared: Weak<Shared>) {
         let (out, delay, accepted, closed) = {
             let mut guard = sh.lock();
             let st = &mut *guard;
-            let t = now();
+            let t = st.now();
             st.iface.poll_maintenance(t);
             st.ingress(t);
             while st.iface.poll_egress(t, &mut st.device, &mut st.sockets) == PollResult::SocketStateChanged {}
@@ -556,7 +560,7 @@ async fn poll_loop(shared: Weak<Shared>) {
                 !done
             });
 
-            let delay = st.iface.poll_delay(now(), &st.sockets);
+            let delay = st.iface.poll_delay(st.now(), &st.sockets);
             (std::mem::take(&mut st.device.tx), delay, accepted, st.closed)
         };
         out.into_iter().for_each(|p| (sh.out)(p));
@@ -894,6 +898,8 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 #[cfg(test)]
 mod model_tests;
+#[cfg(test)]
+mod tcp_model_tests;
 
 #[cfg(test)]
 mod udp_model_tests;

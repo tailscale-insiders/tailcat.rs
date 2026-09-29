@@ -31,7 +31,7 @@ fn remotes() -> [SocketAddr; 3] {
 }
 
 /// A raw TCP segment.
-fn segment(
+pub(super) fn segment(
     src: SocketAddr,
     dst: SocketAddr,
     control: TcpControl,
