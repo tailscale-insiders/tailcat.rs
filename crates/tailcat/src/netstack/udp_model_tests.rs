@@ -430,3 +430,16 @@ fn nothing_opens_after_the_stack_closes() {
     assert!(net.flows.is_empty() && table(&net).is_empty(), "flows opened on a closed stack");
 }
 
+/// Two datagrams on a new flow, one arriving while the policy decides on
+/// the other, open one flow. Each used to open one, the later replacing
+/// the earlier in the table, whose handler got one datagram and then an
+/// error.
+#[test]
+fn racing_datagrams_open_one_flow() {
+    let mut net = Net::new();
+    let key = port_53(remotes()[0]);
+    net.inbound(key, Some(Race::Inbound(key)));
+    assert_eq!(net.flows.len(), 1);
+    net.recv(0);
+    net.recv(0);
+}

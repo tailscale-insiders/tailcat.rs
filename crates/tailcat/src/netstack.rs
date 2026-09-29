@@ -404,8 +404,13 @@ impl Stack {
         drop(st);
         let Some(handler) = self.shared.udp_policy.as_ref().and_then(|p| p(s, d)) else { return };
         let mut st = self.shared.lock();
-        // The stack may have closed meanwhile.
+        // The stack may have closed meanwhile, or another datagram opened
+        // the flow.
         if st.closed {
+            return;
+        }
+        if let Some(tx) = st.udp.get(&(d, s)) {
+            let _ = tx.try_send(data);
             return;
         }
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
