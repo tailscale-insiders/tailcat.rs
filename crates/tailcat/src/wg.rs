@@ -111,6 +111,8 @@ impl WgPeer {
 struct Peers {
     by_key: HashMap<NodePublic, Arc<WgPeer>>,
     by_index: HashMap<u32, Arc<WgPeer>>,
+    /// Counts calls to `remove_peer`, known peer or not.
+    removals: u64,
 }
 
 impl Peers {
@@ -212,6 +214,7 @@ impl Engine {
     /// Removes a peer, dropping its sessions.
     pub fn remove_peer(&self, key: &NodePublic) -> bool {
         let mut peers = self.peers.lock().unwrap();
+        peers.removals += 1;
         let Some(p) = peers.by_key.remove(key) else { return false };
         peers.by_index.remove(&p.index);
         true
@@ -308,15 +311,24 @@ impl Engine {
     /// The peer with key `k`, else a new one if the `peer_config` hook
     /// has a configuration for it.
     fn peer_or_add(&self, k: NodePublic) -> Option<Arc<WgPeer>> {
-        if let Some(p) = self.peer(&k) {
-            return Some(p);
-        }
+        let removals = {
+            let peers = self.peers.lock().unwrap();
+            if let Some(p) = peers.by_key.get(&k) {
+                return Some(p.clone());
+            }
+            peers.removals
+        };
         // The hook runs unlocked, since it may take a while. If the owner
-        // adds the peer meanwhile, its configuration wins.
+        // adds the peer meanwhile, its configuration wins; if it removes
+        // one, which may be this peer, the handshake is dropped (and
+        // retried) rather than bring it back.
         let cfg = self.peer_config.as_ref()?(&k)?;
         let mut peers = self.peers.lock().unwrap();
         if let Some(p) = peers.by_key.get(&k) {
             return Some(p.clone());
+        }
+        if peers.removals != removals {
+            return None;
         }
         debug!(peer = %k.short_string(), "wg: adding peer on handshake");
         Some(self.insert_locked(&mut peers, k, cfg))
@@ -653,5 +665,28 @@ mod tests {
         let p = engine.identify(&pkt).expect("handshake from a peer the hook knows");
         assert!(Arc::ptr_eq(&p, &engine.peer(&client.public()).unwrap()), "identified a replaced peer");
         assert!(p.matches(&Ipv4Addr::new(10, 0, 0, 2).into()).is_some(), "the owner's configuration was overwritten");
+    }
+
+    /// The owner removing a peer while its handshake is being looked up
+    /// wins too: the lookup mustn't bring back a peer the owner has let
+    /// go of, which the owner would never remove again.
+    #[tokio::test]
+    async fn owner_removal_wins_over_a_racing_lookup() {
+        let engine_slot: Arc<OnceLock<Weak<Engine>>> = Arc::default();
+        let slot = engine_slot.clone();
+        let lookup: PeerConfigFn = Arc::new(move |k| {
+            slot.get()?.upgrade()?.remove_peer(k);
+            Some(allow(Ipv4Addr::new(10, 0, 0, 2)))
+        });
+        let (engine, key) = offline(Some(lookup));
+        engine_slot.set(Arc::downgrade(&engine)).unwrap();
+        let client = NodePrivate::generate();
+        let pkt = WireguardPacket {
+            peer: None,
+            src: PathAddr::Udp("192.0.2.1:41641".parse().unwrap()),
+            data: handshake_init(&client, &key.public()),
+        };
+        assert!(engine.identify(&pkt).is_none(), "a peer removed during its lookup was taken");
+        assert!(engine.peer(&client.public()).is_none(), "a peer removed during its lookup came back");
     }
 }
