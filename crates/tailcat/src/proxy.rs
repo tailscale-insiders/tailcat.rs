@@ -64,8 +64,10 @@ where
 }
 
 /// Copies whole datagrams between a tunnel UDP flow and a connected OS
-/// UDP socket until either side fails or `idle` passes with no traffic.
+/// UDP socket until either side fails or `idle` passes with no traffic
+/// either way. It sets `a`'s idle timeout, which counts both.
 pub async fn proxy_packet_conns(a: &UdpConn, b: &tokio::net::UdpSocket, idle: Duration) {
+    a.set_idle_timeout(Some(idle));
     let a_to_b = async {
         let mut buf = vec![0u8; 65535];
         while let Ok(n) = a.recv(&mut buf).await {
@@ -76,7 +78,7 @@ pub async fn proxy_packet_conns(a: &UdpConn, b: &tokio::net::UdpSocket, idle: Du
     };
     let b_to_a = async {
         let mut buf = vec![0u8; 65535];
-        while let Ok(Ok(n)) = tokio::time::timeout(idle, b.recv(&mut buf)).await {
+        while let Ok(n) = b.recv(&mut buf).await {
             if a.send(&buf[..n]).await.is_err() {
                 break;
             }
@@ -164,5 +166,35 @@ mod tests {
         // `b` sees its connection closed, not just half-closed: writes fail.
         assert_eq!(b.read(&mut [0; 1]).await.unwrap(), 0);
         assert!(b.write_all(b"x").await.is_err());
+    }
+
+    /// Traffic into the tunnel flow alone keeps it open, as for a service
+    /// that never answers (syslog, say), and a quiet flow still ends.
+    #[tokio::test]
+    async fn one_way_packet_flows_stay_open() {
+        use std::net::{IpAddr, SocketAddr};
+        use std::sync::Arc;
+
+        use crate::netstack::{Stack, StackConfig, build_udp};
+
+        let (me, far): (IpAddr, SocketAddr) = ("fd7a::1".parse().unwrap(), "[fd7a::2]:514".parse().unwrap());
+        let stack = Stack::new(StackConfig { addrs: vec![me], any_ip: false, mtu: 1280 }, Arc::new(|_| {}), None, None);
+        let a = stack.dial_udp(me, far).unwrap();
+        let local = a.local_addr();
+        let service = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        b.connect(service.local_addr().unwrap()).await.unwrap();
+        let idle = Duration::from_millis(300);
+        let proxy = tokio::spawn(async move { proxy_packet_conns(&a, &b, idle).await });
+        let mut buf = [0u8; 16];
+        for i in 0..8u8 {
+            stack.inject(build_udp(far, local, &[i]).unwrap());
+            let got = tokio::time::timeout(Duration::from_secs(1), service.recv(&mut buf)).await;
+            assert_eq!(got.expect("the flow ended").unwrap(), 1);
+            assert_eq!(buf[0], i);
+            tokio::time::sleep(idle / 3).await;
+        }
+        assert!(!proxy.is_finished());
+        tokio::time::timeout(idle * 3, proxy).await.expect("the idle flow stayed open").unwrap();
     }
 }
