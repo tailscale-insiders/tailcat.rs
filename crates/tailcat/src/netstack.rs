@@ -12,16 +12,16 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::task::{Context, Poll, ready};
+use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
+use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv4Repr,
-    Ipv6Packet, Ipv6Repr, TcpPacket, UdpPacket, UdpRepr,
+    HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket, UdpRepr,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
@@ -31,8 +31,13 @@ const TCP_BUFFER: usize = 512 << 10;
 const UDP_QUEUE: usize = 512;
 /// How long an accepted connection may take to complete its handshake.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an accepted socket may sit in Listen: the SYN didn't take,
+/// or the handshake was reset.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Abort a connection whose peer stops acknowledging data for this long.
 const TCP_TIMEOUT: Duration = Duration::from_secs(120);
+/// The ephemeral port range for outbound flows.
+const EPHEMERAL: std::ops::RangeInclusive<u16> = 32768..=60999;
 
 /// What to do with a new inbound TCP connection.
 pub enum TcpDecision {
@@ -113,7 +118,7 @@ type FlowKey = (SocketAddr, SocketAddr); // (local, remote)
 
 struct PendingAccept {
     handler: Box<dyn FnOnce(TcpStream) + Send>,
-    since: std::time::Instant,
+    since: Instant,
 }
 
 struct State {
@@ -132,6 +137,24 @@ struct State {
     closed: bool,
 }
 
+impl State {
+    /// Picks the next free ephemeral port on `local_ip`.
+    fn alloc_port(&mut self, local_ip: IpAddr) -> u16 {
+        loop {
+            let p = self.next_port;
+            self.next_port = if p >= *EPHEMERAL.end() { *EPHEMERAL.start() } else { p + 1 };
+            let local = SocketAddr::new(local_ip, p);
+            if !self.tuples.keys().chain(self.udp.keys()).any(|(l, _)| *l == local) {
+                return p;
+            }
+        }
+    }
+
+    fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
+        self.sockets.iter().filter_map(|(_, s)| tcp::Socket::downcast(s))
+    }
+}
+
 struct Shared {
     state: Mutex<State>,
     /// Wakes the poll loop.
@@ -144,6 +167,12 @@ struct Shared {
     addrs: Vec<IpAddr>,
 }
 
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap()
+    }
+}
+
 /// A userspace TCP/IP stack.
 #[derive(Clone)]
 pub struct Stack {
@@ -154,24 +183,6 @@ fn now() -> smoltcp::time::Instant {
     smoltcp::time::Instant::now()
 }
 
-fn to_ip(a: IpAddress) -> IpAddr {
-    match a {
-        IpAddress::Ipv4(v4) => IpAddr::V4(v4),
-        IpAddress::Ipv6(v6) => IpAddr::V6(v6),
-    }
-}
-
-fn from_ip(a: IpAddr) -> IpAddress {
-    match a {
-        IpAddr::V4(v4) => IpAddress::Ipv4(v4),
-        IpAddr::V6(v6) => IpAddress::Ipv6(v6),
-    }
-}
-
-fn sock(ep: IpEndpoint) -> SocketAddr {
-    SocketAddr::new(to_ip(ep.addr), ep.port)
-}
-
 impl Stack {
     /// Creates a stack and starts its poll loop.
     pub fn new(cfg: StackConfig, out: Output, tcp_policy: Option<TcpPolicy>, udp_policy: Option<UdpPolicy>) -> Stack {
@@ -180,21 +191,16 @@ impl Stack {
         icfg.random_seed = rand::random();
         let mut iface = Interface::new(icfg, &mut device, now());
         iface.update_ip_addrs(|addrs| {
-            for a in &cfg.addrs {
-                let len = if a.is_ipv4() { 32 } else { 128 };
-                let _ = addrs.push(IpCidr::new(from_ip(*a), len));
+            for &a in &cfg.addrs {
+                let _ = addrs.push(IpCidr::new(a.into(), if a.is_ipv4() { 32 } else { 128 }));
             }
         });
         // With Medium::Ip, egress just needs some route to exist.
-        for a in &cfg.addrs {
-            match a {
-                IpAddr::V4(v4) => {
-                    let _ = iface.routes_mut().add_default_ipv4_route(*v4);
-                }
-                IpAddr::V6(v6) => {
-                    let _ = iface.routes_mut().add_default_ipv6_route(*v6);
-                }
-            }
+        for &a in &cfg.addrs {
+            let _ = match a {
+                IpAddr::V4(v4) => iface.routes_mut().add_default_ipv4_route(v4),
+                IpAddr::V6(v6) => iface.routes_mut().add_default_ipv6_route(v6),
+            };
         }
         iface.set_any_ip(cfg.any_ip);
         let shared = Arc::new(Shared {
@@ -206,7 +212,7 @@ impl Stack {
                 tuples: HashMap::new(),
                 orphans: Vec::new(),
                 udp: HashMap::new(),
-                next_port: 32768 + (rand::random::<u16>() % 28000),
+                next_port: rand::Rng::gen_range(&mut rand::thread_rng(), EPHEMERAL),
                 closed: false,
             }),
             wake: Arc::new(Notify::new()),
@@ -227,139 +233,93 @@ impl Stack {
 
     /// Feeds an IP packet from the tunnel into the stack.
     pub fn inject(&self, pkt: Vec<u8>) {
-        if pkt.is_empty() {
-            return;
-        }
-        match pkt[0] >> 4 {
-            6 => self.inject_v6(pkt),
-            4 => self.inject_v4(pkt),
-            _ => {}
-        }
-    }
-
-    fn inject_v6(&self, pkt: Vec<u8>) {
-        let Ok(ip) = Ipv6Packet::new_checked(&pkt[..]) else { return };
-        let src = IpAddr::V6(ip.src_addr());
-        let dst = IpAddr::V6(ip.dst_addr());
-        let proto = ip.next_header();
-        self.inject_transport(pkt, src, dst, proto, 40, IpVersion::Ipv6);
-    }
-
-    fn inject_v4(&self, pkt: Vec<u8>) {
-        let Ok(ip) = Ipv4Packet::new_checked(&pkt[..]) else { return };
-        let src = IpAddr::V4(ip.src_addr());
-        let dst = IpAddr::V4(ip.dst_addr());
-        let proto = ip.next_header();
-        let off = ip.header_len() as usize;
-        self.inject_transport(pkt, src, dst, proto, off, IpVersion::Ipv4);
-    }
-
-    fn inject_transport(&self, pkt: Vec<u8>, src: IpAddr, dst: IpAddr, proto: IpProtocol, off: usize, ver: IpVersion) {
+        let (src, dst, proto, off): (IpAddr, IpAddr, _, _) = match pkt.first().map(|b| b >> 4) {
+            Some(6) => {
+                let Ok(ip) = Ipv6Packet::new_checked(&pkt[..]) else { return };
+                (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), 40)
+            }
+            Some(4) => {
+                let Ok(ip) = Ipv4Packet::new_checked(&pkt[..]) else { return };
+                (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), ip.header_len() as usize)
+            }
+            _ => return,
+        };
         let body = &pkt[off.min(pkt.len())..];
         match proto {
-            IpProtocol::Tcp => {
-                let Ok(tcp) = TcpPacket::new_checked(body) else { return };
-                let s = SocketAddr::new(src, tcp.src_port());
-                let d = SocketAddr::new(dst, tcp.dst_port());
-                let is_syn = tcp.syn() && !tcp.ack();
-                let mut st = self.shared.state.lock().unwrap();
-                if st.closed {
-                    return;
-                }
-                if is_syn && !st.tuples.contains_key(&(d, s)) {
-                    let decision = match &self.shared.tcp_policy {
-                        Some(p) => {
-                            // The policy may block briefly; don't hold the lock.
-                            drop(st);
-                            let dec = p(s, d);
-                            st = self.shared.state.lock().unwrap();
-                            dec
-                        }
-                        None => TcpDecision::Reset,
-                    };
+            IpProtocol::Udp => return self.inject_udp(body, src, dst),
+            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {}
+            _ => return trace!("netstack: dropping protocol {proto}"),
+        }
+        let mut st = self.shared.lock();
+        if st.closed {
+            return;
+        }
+        if proto == IpProtocol::Tcp {
+            let Ok(tcp) = TcpPacket::new_checked(body) else { return };
+            let (s, d) = (SocketAddr::new(src, tcp.src_port()), SocketAddr::new(dst, tcp.dst_port()));
+            if !st.tuples.contains_key(&(d, s)) {
+                if !tcp.syn() || tcp.ack() {
+                    // Not part of any connection we know; let smoltcp RST it
+                    // unless it's itself a RST.
+                    if tcp.rst() {
+                        return;
+                    }
+                } else {
+                    // The policy may block briefly; don't hold the lock.
+                    drop(st);
+                    let decision = self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d));
+                    st = self.shared.lock();
                     match decision {
                         TcpDecision::Drop => return,
                         TcpDecision::Reset => {} // smoltcp answers unmatched SYNs with RST
                         TcpDecision::Accept(handler) => {
                             if !st.tuples.contains_key(&(d, s)) {
                                 let mut sock = new_tcp_socket();
-                                if sock.listen(IpListenEndpoint { addr: Some(from_ip(dst)), port: d.port() }).is_err() {
+                                if sock.listen(d).is_err() {
                                     return;
                                 }
                                 let h = st.sockets.add(sock);
                                 st.tuples.insert((d, s), h);
-                                st.accepting.insert(h, PendingAccept { handler, since: std::time::Instant::now() });
+                                st.accepting.insert(h, PendingAccept { handler, since: Instant::now() });
                             }
                         }
                     }
-                } else if !is_syn && !st.tuples.contains_key(&(d, s)) {
-                    // Not part of any connection we know; let smoltcp RST it
-                    // unless it's itself a RST.
-                    if tcp.rst() {
-                        return;
-                    }
                 }
-                st.device.rx.push_back(pkt);
-                drop(st);
-                self.shared.wake.notify_one();
             }
-            IpProtocol::Udp => {
-                let Ok(udp) = UdpPacket::new_checked(body) else { return };
-                let s = SocketAddr::new(src, udp.src_port());
-                let d = SocketAddr::new(dst, udp.dst_port());
-                let data = udp.payload().to_vec();
-                let existing = self.shared.state.lock().unwrap().udp.get(&(d, s)).cloned();
-                if let Some(tx) = existing {
-                    if tx.try_send(data).is_err() && tx.is_closed() {
-                        self.shared.state.lock().unwrap().udp.remove(&(d, s));
-                    }
-                    return;
-                }
-                let Some(policy) = &self.shared.udp_policy else { return };
-                let Some(handler) = policy(s, d) else { return };
-                let (tx, rx) = mpsc::channel(UDP_QUEUE);
-                let _ = tx.try_send(data);
-                self.shared.state.lock().unwrap().udp.insert((d, s), tx);
-                handler(UdpConn::new(self.shared.clone(), d, s, rx));
-            }
-            IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                let _ = ver;
-                let mut st = self.shared.state.lock().unwrap();
-                st.device.rx.push_back(pkt);
-                drop(st);
-                self.shared.wake.notify_one();
-            }
-            _ => trace!("netstack: dropping protocol {proto}"),
         }
+        st.device.rx.push_back(pkt);
+        drop(st);
+        self.shared.wake.notify_one();
     }
 
-    fn alloc_port(st: &mut State, local_ip: IpAddr) -> u16 {
-        loop {
-            let p = st.next_port;
-            st.next_port = if st.next_port >= 60999 { 32768 } else { st.next_port + 1 };
-            let in_use = st.tuples.keys().any(|(l, _)| l.ip() == local_ip && l.port() == p)
-                || st.udp.keys().any(|(l, _)| l.ip() == local_ip && l.port() == p);
-            if !in_use {
-                return p;
+    fn inject_udp(&self, body: &[u8], src: IpAddr, dst: IpAddr) {
+        let Ok(udp) = UdpPacket::new_checked(body) else { return };
+        let (s, d) = (SocketAddr::new(src, udp.src_port()), SocketAddr::new(dst, udp.dst_port()));
+        let data = udp.payload().to_vec();
+        let existing = self.shared.lock().udp.get(&(d, s)).cloned();
+        if let Some(tx) = existing {
+            if tx.try_send(data).is_err() && tx.is_closed() {
+                self.shared.lock().udp.remove(&(d, s));
             }
+            return;
         }
+        let Some(handler) = self.shared.udp_policy.as_ref().and_then(|p| p(s, d)) else { return };
+        let (tx, rx) = mpsc::channel(UDP_QUEUE);
+        let _ = tx.try_send(data);
+        self.shared.lock().udp.insert((d, s), tx);
+        handler(UdpConn::new(self.shared.clone(), d, s, rx));
     }
 
     /// Opens a TCP connection from `local_ip` to `remote`.
     pub async fn dial_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
         let h = {
-            let mut st = self.shared.state.lock().unwrap();
-            let port = Self::alloc_port(&mut st, local_ip);
+            let mut st = self.shared.lock();
+            let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
             let mut sock = new_tcp_socket();
-            let State { iface, .. } = &mut *st;
-            sock.connect(
-                iface.context(),
-                IpEndpoint::new(from_ip(remote.ip()), remote.port()),
-                IpListenEndpoint { addr: Some(from_ip(local_ip)), port },
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
+            sock.connect(st.iface.context(), remote, local)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
             let h = st.sockets.add(sock);
-            st.tuples.insert((SocketAddr::new(local_ip, port), remote), h);
+            st.tuples.insert((local, remote), h);
             h
         };
         self.shared.wake.notify_one();
@@ -370,9 +330,8 @@ impl Stack {
 
     /// Opens a connected UDP flow from `local_ip` to `remote`.
     pub fn dial_udp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<UdpConn> {
-        let mut st = self.shared.state.lock().unwrap();
-        let port = Self::alloc_port(&mut st, local_ip);
-        let local = SocketAddr::new(local_ip, port);
+        let mut st = self.shared.lock();
+        let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
         st.udp.insert((local, remote), tx);
         Ok(UdpConn::new(self.shared.clone(), local, remote, rx))
@@ -386,17 +345,10 @@ impl Stack {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.shared.polled.notified();
-            let busy = {
-                let st = self.shared.state.lock().unwrap();
-                st.sockets.iter().any(|(_, s)| match s {
-                    smoltcp::socket::Socket::Tcp(t) => {
-                        !matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen)
-                            || t.send_queue() > 0
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => false,
-                })
-            };
+            let busy = self.shared.lock().tcp_sockets().any(|t| {
+                !matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen)
+                    || t.send_queue() > 0
+            });
             if !busy {
                 // Let the final ACK make it out through the tunnel.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -411,12 +363,9 @@ impl Stack {
 
     /// Stops the stack, aborting every connection.
     pub fn close(&self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.lock();
         st.closed = true;
-        let handles: Vec<SocketHandle> = st.sockets.iter().map(|(h, _)| h).collect();
-        for h in handles {
-            st.sockets.get_mut::<tcp::Socket>(h).abort();
-        }
+        st.sockets.iter_mut().filter_map(|(_, s)| tcp::Socket::downcast_mut(s)).for_each(tcp::Socket::abort);
         st.udp.clear();
         drop(st);
         self.shared.wake.notify_one();
@@ -426,7 +375,7 @@ impl Stack {
 fn new_tcp_socket() -> tcp::Socket<'static> {
     let mut s =
         tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUFFER]), tcp::SocketBuffer::new(vec![0; TCP_BUFFER]));
-    s.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_TIMEOUT.as_secs())));
+    s.set_timeout(Some(TCP_TIMEOUT.into()));
     s.set_nagle_enabled(false);
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(5)));
     s
@@ -436,60 +385,43 @@ async fn poll_loop(shared: Weak<Shared>) {
     loop {
         let Some(sh) = shared.upgrade() else { return };
         let (out, delay, accepted, closed) = {
-            let mut guard = sh.state.lock().unwrap();
+            let mut guard = sh.lock();
             let st = &mut *guard;
             st.iface.poll(now(), &mut st.device, &mut st.sockets);
 
             // Hand off inbound connections that finished their handshake,
             // and give up on ones that never did.
-            let mut accepted = Vec::new();
-            let mut dead = Vec::new();
-            for (h, pa) in st.accepting.iter() {
-                let s = st.sockets.get::<tcp::Socket>(*h);
-                match s.state() {
-                    tcp::State::Established | tcp::State::CloseWait => accepted.push(*h),
-                    tcp::State::SynReceived => {
-                        if pa.since.elapsed() > ACCEPT_TIMEOUT {
-                            dead.push(*h);
-                        }
-                    }
-                    tcp::State::Listen => {
-                        // The SYN didn't take (or the handshake was reset).
-                        if pa.since.elapsed() > Duration::from_secs(2) {
-                            dead.push(*h);
-                        }
-                    }
-                    _ => dead.push(*h),
-                }
-            }
-            let accepted: Vec<(SocketHandle, PendingAccept)> =
-                accepted.into_iter().map(|h| (h, st.accepting.remove(&h).unwrap())).collect();
-            for h in dead {
-                st.accepting.remove(&h);
+            let sockets = &st.sockets;
+            let (accepted, dead): (Vec<_>, Vec<_>) = st
+                .accepting
+                .extract_if(|&h, pa| match sockets.get::<tcp::Socket>(h).state() {
+                    tcp::State::SynReceived => pa.since.elapsed() > ACCEPT_TIMEOUT,
+                    tcp::State::Listen => pa.since.elapsed() > LISTEN_TIMEOUT,
+                    _ => true,
+                })
+                .partition(|&(h, _)| {
+                    matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+                });
+            for (h, _) in dead {
                 st.sockets.get_mut::<tcp::Socket>(h).abort();
                 st.orphans.push(h);
             }
 
             // Reap closed sockets nobody holds any more.
-            let mut keep = Vec::new();
-            for h in std::mem::take(&mut st.orphans) {
-                let s = st.sockets.get::<tcp::Socket>(h);
-                if matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait) {
-                    st.sockets.remove(h);
-                    st.tuples.retain(|_, v| *v != h);
-                } else {
-                    keep.push(h);
+            let State { sockets, tuples, orphans, .. } = st;
+            orphans.retain(|&h| {
+                let done = matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Closed | tcp::State::TimeWait);
+                if done {
+                    sockets.remove(h);
+                    tuples.retain(|_, v| *v != h);
                 }
-            }
-            st.orphans = keep;
+                !done
+            });
 
-            let out: Vec<Vec<u8>> = st.device.tx.drain(..).collect();
             let delay = st.iface.poll_delay(now(), &st.sockets);
-            (out, delay, accepted, st.closed)
+            (std::mem::take(&mut st.device.tx), delay, accepted, st.closed)
         };
-        for p in out {
-            (sh.out)(p);
-        }
+        out.into_iter().for_each(|p| (sh.out)(p));
         for (h, pa) in accepted {
             (pa.handler)(TcpStream::new(sh.clone(), h));
         }
@@ -497,13 +429,13 @@ async fn poll_loop(shared: Weak<Shared>) {
         if closed {
             return;
         }
-        let delay = delay.map(|d| Duration::from_micros(d.total_micros())).unwrap_or(Duration::from_secs(1));
+        let delay = delay.map_or(Duration::from_secs(1), Duration::from);
         let wake = sh.wake.clone();
         drop(sh);
-        if !delay.is_zero() {
-            let _ = tokio::time::timeout(delay, wake.notified()).await;
-        } else {
+        if delay.is_zero() {
             tokio::task::yield_now().await;
+        } else {
+            let _ = tokio::time::timeout(delay, wake.notified()).await;
         }
     }
 }
@@ -520,17 +452,9 @@ pub struct TcpStream {
 
 impl TcpStream {
     fn new(shared: Arc<Shared>, handle: SocketHandle) -> Self {
-        let (local, remote) = {
-            let mut st = shared.state.lock().unwrap();
-            let s = st.sockets.get_mut::<tcp::Socket>(handle);
-            let local = s.local_endpoint().map(sock);
-            let remote = s.remote_endpoint().map(sock);
-            let tuple = st.tuples.iter().find(|(_, h)| **h == handle).map(|(k, _)| *k);
-            (
-                local.or(tuple.map(|t| t.0)).unwrap_or_else(|| SocketAddr::from(([0u8; 16], 0))),
-                remote.or(tuple.map(|t| t.1)).unwrap_or_else(|| SocketAddr::from(([0u8; 16], 0))),
-            )
-        };
+        let tuple = shared.lock().tuples.iter().find(|&(_, &h)| h == handle).map(|(&k, _)| k);
+        let unspecified = SocketAddr::from(([0u8; 16], 0));
+        let (local, remote) = tuple.unwrap_or((unspecified, unspecified));
         TcpStream { shared, handle, local, remote }
     }
 
@@ -545,8 +469,14 @@ impl TcpStream {
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut tcp::Socket<'static>) -> R) -> R {
-        let mut st = self.shared.state.lock().unwrap();
-        f(st.sockets.get_mut::<tcp::Socket>(self.handle))
+        f(self.shared.lock().sockets.get_mut::<tcp::Socket>(self.handle))
+    }
+
+    /// Runs `f` on the socket, then wakes the poll loop.
+    fn with_wake<R>(&self, f: impl FnOnce(&mut tcp::Socket<'static>) -> R) -> R {
+        let r = self.with(f);
+        self.shared.wake.notify_one();
+        r
     }
 
     fn poll_connected(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -565,14 +495,12 @@ impl TcpStream {
 
     /// Half-closes the connection: sends a FIN after any queued data.
     pub fn close_write(&self) {
-        self.with(|s| s.close());
-        self.shared.wake.notify_one();
+        self.with_wake(|s| s.close());
     }
 
     /// Aborts the connection with a RST.
     pub fn abort(&self) {
-        self.with(|s| s.abort());
-        self.shared.wake.notify_one();
+        self.with_wake(|s| s.abort());
     }
 
     /// Waits until everything sent has been acknowledged and, if the
@@ -585,10 +513,7 @@ impl TcpStream {
                 s.send_queue() == 0
                     && !matches!(s.state(), tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck)
             });
-            if done {
-                return;
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if done || tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return;
             }
         }
@@ -603,7 +528,7 @@ impl std::fmt::Debug for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.lock();
         let s = st.sockets.get_mut::<tcp::Socket>(self.handle);
         if s.is_open() {
             s.close();
@@ -616,54 +541,39 @@ impl Drop for TcpStream {
 
 impl AsyncRead for TcpStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let r = self.with(|s| {
+        let n = ready!(self.with(|s| {
             if s.can_recv() {
-                match s.recv_slice(buf.initialize_unfilled()) {
-                    Ok(n) => {
-                        buf.advance(n);
-                        Poll::Ready(Ok(true))
-                    }
-                    Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                }
+                Poll::Ready(s.recv_slice(buf.initialize_unfilled()).map_err(io::Error::other))
             } else if !s.may_recv() {
-                match s.state() {
-                    tcp::State::Closed if !s.is_open() => Poll::Ready(Ok(false)),
-                    _ => Poll::Ready(Ok(false)),
-                }
+                Poll::Ready(Ok(0)) // EOF
             } else {
                 s.register_recv_waker(cx.waker());
                 Poll::Pending
             }
-        });
-        match r {
-            Poll::Ready(Ok(true)) => {
-                // Reading opened the receive window; tell the peer.
-                self.shared.wake.notify_one();
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Ok(false)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        }))?;
+        if n > 0 {
+            buf.advance(n);
+            // Reading opened the receive window; tell the peer.
+            self.shared.wake.notify_one();
         }
+        Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncWrite for TcpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
-        let r = self.with(|s| {
+        let n = ready!(self.with(|s| {
             if s.can_send() {
-                Poll::Ready(s.send_slice(data).map_err(|e| io::Error::other(e.to_string())))
+                Poll::Ready(s.send_slice(data).map_err(io::Error::other))
             } else if !s.may_send() {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")))
             } else {
                 s.register_send_waker(cx.waker());
                 Poll::Pending
             }
-        });
-        if let Poll::Ready(Ok(_)) = r {
-            self.shared.wake.notify_one();
-        }
-        r
+        }))?;
+        self.shared.wake.notify_one();
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -684,8 +594,12 @@ pub struct UdpConn {
     remote: SocketAddr,
     rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     idle_timeout: Mutex<Option<Duration>>,
-    last_activity: Mutex<std::time::Instant>,
-    closed: std::sync::atomic::AtomicBool,
+    last_activity: Mutex<Instant>,
+    closed: AtomicBool,
+}
+
+fn flow_closed() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "UDP flow closed")
 }
 
 impl UdpConn {
@@ -696,8 +610,8 @@ impl UdpConn {
             remote,
             rx: tokio::sync::Mutex::new(rx),
             idle_timeout: Mutex::new(None),
-            last_activity: Mutex::new(std::time::Instant::now()),
-            closed: Default::default(),
+            last_activity: Mutex::new(Instant::now()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -707,7 +621,11 @@ impl UdpConn {
     }
 
     fn touch(&self) {
-        *self.last_activity.lock().unwrap() = std::time::Instant::now();
+        *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     /// The local address (the flow's destination, for inbound flows).
@@ -723,41 +641,33 @@ impl UdpConn {
     /// Receives one datagram into `buf`, truncating it if it's too big.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut rx = self.rx.lock().await;
-        loop {
-            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(io::Error::new(io::ErrorKind::NotConnected, "UDP flow closed"));
+        let msg = loop {
+            if self.is_closed() {
+                return Err(flow_closed());
             }
             let idle = *self.idle_timeout.lock().unwrap();
-            let msg = match idle {
-                None => rx.recv().await,
-                Some(d) => {
-                    let deadline = *self.last_activity.lock().unwrap() + d;
-                    match tokio::time::timeout_at(deadline.into(), rx.recv()).await {
-                        Ok(m) => m,
-                        Err(_) => {
-                            if self.last_activity.lock().unwrap().elapsed() >= d {
-                                self.close();
-                                return Err(io::Error::new(io::ErrorKind::TimedOut, "UDP flow idle"));
-                            }
-                            continue;
-                        }
-                    }
-                }
-            };
-            let Some(msg) = msg else {
-                return Err(io::Error::new(io::ErrorKind::NotConnected, "UDP flow closed"));
-            };
-            self.touch();
-            let n = msg.len().min(buf.len());
-            buf[..n].copy_from_slice(&msg[..n]);
-            return Ok(n);
-        }
+            let Some(idle) = idle else { break rx.recv().await };
+            let deadline = *self.last_activity.lock().unwrap() + idle;
+            if let Ok(m) = tokio::time::timeout_at(deadline.into(), rx.recv()).await {
+                break m;
+            }
+            // A send may have pushed the deadline back while we waited.
+            if self.last_activity.lock().unwrap().elapsed() >= idle {
+                self.close();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "UDP flow idle"));
+            }
+        };
+        let msg = msg.ok_or_else(flow_closed)?;
+        self.touch();
+        let n = msg.len().min(buf.len());
+        buf[..n].copy_from_slice(&msg[..n]);
+        Ok(n)
     }
 
     /// Sends one datagram.
     pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "UDP flow closed"));
+        if self.is_closed() {
+            return Err(flow_closed());
         }
         if data.len() > 65507 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "datagram too large"));
@@ -771,8 +681,8 @@ impl UdpConn {
 
     /// Closes the flow; later receives and sends fail.
     pub fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.shared.state.lock().unwrap().udp.remove(&(self.local, self.remote));
+        self.closed.store(true, Ordering::Relaxed);
+        self.shared.lock().udp.remove(&(self.local, self.remote));
     }
 }
 
@@ -788,58 +698,27 @@ impl std::fmt::Debug for UdpConn {
     }
 }
 
-/// Builds an IP/UDP packet with a valid checksum.
+/// Builds an IP/UDP packet with a valid checksum, or `None` if `src` and
+/// `dst` are of different address families.
 pub fn build_udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let udp = UdpRepr { src_port: src.port(), dst_port: dst.port() };
-    let udp_len = 8 + payload.len();
-    let caps = smoltcp::phy::ChecksumCapabilities::default();
-    match (src.ip(), dst.ip()) {
-        (IpAddr::V6(s), IpAddr::V6(d)) => {
-            let ip = Ipv6Repr {
-                src_addr: s,
-                dst_addr: d,
-                next_header: IpProtocol::Udp,
-                payload_len: udp_len,
-                hop_limit: 64,
-            };
-            let mut buf = vec![0u8; 40 + udp_len];
-            let mut pkt = Ipv6Packet::new_unchecked(&mut buf[..]);
-            ip.emit(&mut pkt);
-            let mut u = UdpPacket::new_unchecked(&mut buf[40..]);
-            udp.emit(
-                &mut u,
-                &IpAddress::Ipv6(s),
-                &IpAddress::Ipv6(d),
-                payload.len(),
-                |b| b.copy_from_slice(payload),
-                &caps,
-            );
-            Some(buf)
-        }
-        (IpAddr::V4(s), IpAddr::V4(d)) => {
-            let ip = Ipv4Repr {
-                src_addr: s,
-                dst_addr: d,
-                next_header: IpProtocol::Udp,
-                payload_len: udp_len,
-                hop_limit: 64,
-            };
-            let mut buf = vec![0u8; 20 + udp_len];
-            let mut pkt = Ipv4Packet::new_unchecked(&mut buf[..]);
-            ip.emit(&mut pkt, &caps);
-            let mut u = UdpPacket::new_unchecked(&mut buf[20..]);
-            udp.emit(
-                &mut u,
-                &IpAddress::Ipv4(s),
-                &IpAddress::Ipv4(d),
-                payload.len(),
-                |b| b.copy_from_slice(payload),
-                &caps,
-            );
-            Some(buf)
-        }
-        _ => None,
+    if src.is_ipv4() != dst.is_ipv4() {
+        return None;
     }
+    let (s, d) = (IpAddress::from(src.ip()), IpAddress::from(dst.ip()));
+    let ip = IpRepr::new(s, d, IpProtocol::Udp, 8 + payload.len(), 64);
+    let caps = ChecksumCapabilities::default();
+    let mut buf = vec![0u8; ip.buffer_len()];
+    ip.emit(&mut buf[..], &caps);
+    let mut udp = UdpPacket::new_unchecked(&mut buf[ip.header_len()..]);
+    UdpRepr { src_port: src.port(), dst_port: dst.port() }.emit(
+        &mut udp,
+        &s,
+        &d,
+        payload.len(),
+        |b| b.copy_from_slice(payload),
+        &caps,
+    );
+    Some(buf)
 }
 
 /// A boxed future, for handler signatures.
@@ -850,46 +729,21 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Two stacks wired back to back: a client dials a server.
-    #[tokio::test]
-    async fn tcp_and_udp_between_two_stacks() {
-        let a_ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
-        let b_ip: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
+    fn back_to_back(
+        a_ip: IpAddr,
+        b_ip: IpAddr,
+        tcp_policy: Option<TcpPolicy>,
+        udp_policy: Option<UdpPolicy>,
+    ) -> (Stack, Stack) {
         let (to_b_tx, mut to_b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (to_a_tx, mut to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        let tcp_policy: TcpPolicy = Arc::new(|_src, dst| {
-            if dst.port() != 80 {
-                return TcpDecision::Reset;
-            }
-            TcpDecision::Accept(Box::new(|mut s: TcpStream| {
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    s.read_to_end(&mut buf).await.unwrap();
-                    s.write_all(b"got: ").await.unwrap();
-                    s.write_all(&buf).await.unwrap();
-                    s.shutdown().await.unwrap();
-                    s.drain(Duration::from_secs(5)).await;
-                });
-            }))
-        });
-        let udp_policy: UdpPolicy = Arc::new(|_src, _dst| {
-            Some(Box::new(|c: UdpConn| {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 2048];
-                    while let Ok(n) = c.recv(&mut buf).await {
-                        c.send(&buf[..n]).await.unwrap();
-                    }
-                });
-            }))
-        });
         let b = Stack::new(
             StackConfig { addrs: vec![b_ip], any_ip: false, mtu: 1280 },
             Arc::new(move |p| {
                 let _ = to_a_tx.send(p);
             }),
-            Some(tcp_policy),
-            Some(udp_policy),
+            tcp_policy,
+            udp_policy,
         );
         let a = Stack::new(
             StackConfig { addrs: vec![a_ip], any_ip: false, mtu: 1280 },
@@ -910,8 +764,46 @@ mod tests {
                 a2.inject(p);
             }
         });
+        (a, b)
+    }
+
+    fn udp_echo() -> UdpPolicy {
+        Arc::new(|_src, _dst| {
+            Some(Box::new(|c: UdpConn| {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    while let Ok(n) = c.recv(&mut buf).await {
+                        c.send(&buf[..n]).await.unwrap();
+                    }
+                });
+            }))
+        })
+    }
+
+    /// Two stacks wired back to back: a client dials a server.
+    #[tokio::test]
+    async fn tcp_and_udp_between_two_stacks() {
+        let a_ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let b_ip: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
+        let tcp_policy: TcpPolicy = Arc::new(|_src, dst| match dst.port() {
+            80 => TcpDecision::Accept(Box::new(|mut s: TcpStream| {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).await.unwrap();
+                    s.write_all(b"got: ").await.unwrap();
+                    s.write_all(&buf).await.unwrap();
+                    s.shutdown().await.unwrap();
+                    s.drain(Duration::from_secs(5)).await;
+                });
+            })),
+            82 => TcpDecision::Drop,
+            _ => TcpDecision::Reset,
+        });
+        let (a, _b) = back_to_back(a_ip, b_ip, Some(tcp_policy), Some(udp_echo()));
 
         let mut c = a.dial_tcp(a_ip, SocketAddr::new(b_ip, 80)).await.unwrap();
+        assert_eq!(c.peer_addr(), SocketAddr::new(b_ip, 80));
+        assert_eq!(c.local_addr().ip(), a_ip);
         let big = vec![b'x'; 300_000];
         c.write_all(&big).await.unwrap();
         c.shutdown().await.unwrap();
@@ -923,6 +815,10 @@ mod tests {
         let refused = a.dial_tcp(a_ip, SocketAddr::new(b_ip, 81)).await;
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
 
+        // A dropped SYN gets no answer at all.
+        let dropped = tokio::time::timeout(Duration::from_millis(500), a.dial_tcp(a_ip, SocketAddr::new(b_ip, 82)));
+        assert!(dropped.await.is_err(), "dropped SYN was answered");
+
         let u = a.dial_udp(a_ip, SocketAddr::new(b_ip, 53)).unwrap();
         u.send(b"ping").await.unwrap();
         let mut buf = [0u8; 64];
@@ -930,5 +826,49 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
         drop(c);
         assert!(a.drain_tcp(Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn udp_over_ipv4_and_idle_timeout() {
+        let a_ip: IpAddr = "100.64.0.1".parse().unwrap();
+        let b_ip: IpAddr = "100.64.0.2".parse().unwrap();
+        let (a, _b) = back_to_back(a_ip, b_ip, None, Some(udp_echo()));
+        let u = a.dial_udp(a_ip, SocketAddr::new(b_ip, 7)).unwrap();
+        u.send(b"v4").await.unwrap();
+        let mut buf = [0u8; 1];
+        // Datagrams too big for the buffer are truncated.
+        let n = tokio::time::timeout(Duration::from_secs(5), u.recv(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"v");
+
+        u.set_idle_timeout(Some(Duration::from_millis(100)));
+        let err = tokio::time::timeout(Duration::from_secs(5), u.recv(&mut buf)).await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(u.send(b"late").await.unwrap_err().kind(), io::ErrorKind::NotConnected);
+
+        let mixed = a.dial_udp(a_ip, "[::1]:7".parse().unwrap()).unwrap();
+        assert_eq!(mixed.send(b"x").await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn build_udp_checksums() {
+        for (src, dst) in [("10.0.0.1:1000", "10.0.0.2:2000"), ("[fd00::1]:1000", "[fd00::2]:2000")] {
+            let (src, dst): (SocketAddr, SocketAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+            let pkt = build_udp(src, dst, b"payload").unwrap();
+            let caps = ChecksumCapabilities::default();
+            let (ip_len, s, d) = if src.is_ipv4() {
+                let ip = Ipv4Packet::new_checked(&pkt[..]).unwrap();
+                assert!(ip.verify_checksum());
+                (ip.header_len() as usize, ip.src_addr().into(), ip.dst_addr().into())
+            } else {
+                let ip = Ipv6Packet::new_checked(&pkt[..]).unwrap();
+                (40, ip.src_addr().into(), ip.dst_addr().into())
+            };
+            assert_eq!((IpAddr::from(s), IpAddr::from(d)), (src.ip(), dst.ip()));
+            let udp = UdpPacket::new_checked(&pkt[ip_len..]).unwrap();
+            let repr = UdpRepr::parse(&udp, &s, &d, &caps).unwrap();
+            assert_eq!((repr.src_port, repr.dst_port), (1000, 2000));
+            assert_eq!(udp.payload(), b"payload");
+        }
+        assert!(build_udp("10.0.0.1:1".parse().unwrap(), "[::1]:1".parse().unwrap(), b"").is_none());
     }
 }
