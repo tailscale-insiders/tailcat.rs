@@ -415,9 +415,10 @@ impl Stack {
         }
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
         let _ = tx.try_send(data);
+        let conn = UdpConn::new(self.shared.clone(), d, s, &tx, rx);
         st.udp.insert((d, s), tx);
         drop(st);
-        handler(UdpConn::new(self.shared.clone(), d, s, rx));
+        handler(conn);
     }
 
     /// Opens a TCP connection from `local_ip` to `remote`.
@@ -446,8 +447,9 @@ impl Stack {
         }
         let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
+        let conn = UdpConn::new(self.shared.clone(), local, remote, &tx, rx);
         st.udp.insert((local, remote), tx);
-        Ok(UdpConn::new(self.shared.clone(), local, remote, rx))
+        Ok(conn)
     }
 
     /// Waits until every TCP connection has finished closing, or until
@@ -738,6 +740,9 @@ pub struct UdpConn {
     shared: Arc<Shared>,
     local: SocketAddr,
     remote: SocketAddr,
+    /// The flow's sender. The flow table holds its only strong
+    /// reference, so it's gone once the flow is out of the table.
+    tx: mpsc::WeakSender<Vec<u8>>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     idle_timeout: Mutex<Option<Duration>>,
     last_activity: Mutex<Instant>,
@@ -749,11 +754,18 @@ fn flow_closed() -> io::Error {
 }
 
 impl UdpConn {
-    fn new(shared: Arc<Shared>, local: SocketAddr, remote: SocketAddr, rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        tx: &mpsc::Sender<Vec<u8>>,
+        rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Self {
         UdpConn {
             shared,
             local,
             remote,
+            tx: tx.downgrade(),
             rx: tokio::sync::Mutex::new(rx),
             idle_timeout: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
@@ -770,8 +782,9 @@ impl UdpConn {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
 
+    /// Whether the flow was closed, or the stack was.
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
+        self.closed.load(Ordering::Relaxed) || self.tx.strong_count() == 0
     }
 
     /// The local address (the flow's destination, for inbound flows).

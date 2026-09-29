@@ -388,6 +388,11 @@ impl Net {
     }
 }
 
+#[hegel::test(test_cases = 300)]
+fn udp_flow_table_state_machine(tc: TestCase) {
+    hegel::stateful::machine(Net::new()).steps(30).run(tc);
+}
+
 /// The flows in the stack's table.
 fn table(net: &Net) -> HashSet<FlowKey> {
     net.stack.shared.lock().udp.keys().copied().collect()
@@ -442,4 +447,18 @@ fn racing_datagrams_open_one_flow() {
     assert_eq!(net.flows.len(), 1);
     net.recv(0);
     net.recv(0);
+}
+
+/// Sends fail once the stack is closed, as receives do, rather than going
+/// out through a tunnel that's shutting down.
+#[test]
+fn flows_fail_once_the_stack_closes() {
+    let mut net = Net::new();
+    net.inbound(port_53(remotes()[0]), None);
+    net.dial(remotes()[1]);
+    net.close_stack();
+    for i in 0..2 {
+        net.send(i);
+        net.recv(i);
+    }
 }
