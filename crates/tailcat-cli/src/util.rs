@@ -1,5 +1,5 @@
 //! Small helpers: Go-style durations, platform directories, loopback
-//! dials, private files.
+//! dials, atomic private files, accept loops.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
             _ => return Err(format!("unknown unit {unit:?} in duration {s:?}")),
         };
     }
-    Ok(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).map_err(|_| format!("duration {s:?} is out of range"))
 }
 
 /// Formats a duration roughly the way Go prints it, rounded sensibly.
@@ -72,13 +72,82 @@ fn user_dir(windows_var: &str, macos: &str, xdg_var: &str, home_rel: &str) -> Op
     var(xdg_var).or_else(|| var("HOME").map(|h| h.join(home_rel)))
 }
 
-/// Writes a file readable only by its owner.
-pub fn write_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()> {
+/// Atomically replaces `path` with a file of `data` readable only by its
+/// owner. The data goes to a synced temporary file beside it, which is
+/// then renamed into place, so readers (like a script polling for the
+/// file) see the old contents or the new, never a partial file, and a
+/// crash leaves one or the other. The new file is owner-only even when
+/// it replaces one that wasn't.
+pub fn replace_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let tmp = write_temp_beside(path, data)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| _ = std::fs::remove_file(&tmp))
+}
+
+/// Like [`replace_private`], but fails with
+/// [`std::io::ErrorKind::AlreadyExists`] if `path` exists. The check is
+/// atomic: of concurrent calls, exactly one succeeds.
+pub fn create_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let tmp = write_temp_beside(path, data)?;
+    // Linking, unlike renaming, never replaces an existing file.
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            // A filesystem without hard links: still refuse to replace a
+            // file, though a crash can now leave a partial one.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            std::io::Write::write_all(&mut opts.open(path)?, data)
+        }
+        r => r,
+    }
+}
+
+/// Writes `data` to a new owner-only file in `path`'s directory, synced
+/// to disk, and returns its path.
+fn write_temp_beside(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a file path", path.display()))
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".tmp{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    let tmp = path.with_file_name(tmp_name);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    std::io::Write::write_all(&mut opts.open(path)?, data)
+    let mut f = opts.open(&tmp)?;
+    let written = std::io::Write::write_all(&mut f, data).and_then(|()| f.sync_all());
+    written.inspect_err(|_| _ = std::fs::remove_file(&tmp))?;
+    Ok(tmp)
+}
+
+/// Accepts the next connection from `accept` (a listener's accept),
+/// riding out errors: the likely ones (too many open files, a
+/// connection aborted before it was accepted) pass, and ending the
+/// accept loop instead would leave a process that looks alive but
+/// serves nothing. Like Go's http.Server, it reports each and backs off
+/// up to a second between retries.
+pub async fn accept<T, F>(mut accept: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut delay = Duration::from_millis(5);
+    loop {
+        match accept().await {
+            Ok(c) => return c,
+            Err(e) => {
+                eprintln!("# accept error: {e}; retrying in {}", fmt_duration(delay));
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 /// Dials a local target "host:port". "localhost" (and "*.localhost")
@@ -135,9 +204,33 @@ mod tests {
         assert_eq!(parse_duration("1h2m3.5s").unwrap(), Duration::from_millis(3_723_500));
         assert_eq!(parse_duration("5us").unwrap(), parse_duration("5µs").unwrap());
         assert_eq!(parse_duration("100ns").unwrap(), Duration::from_nanos(100));
-        for bad in ["10", "x", "", "s", ".s", "1.2.3s", "5d", "-1s", "1s 2s"] {
+        let huge = format!("{}h", "9".repeat(30));
+        for bad in ["10", "x", "", "s", ".s", "1.2.3s", "5d", "-1s", "1s 2s", &huge] {
             assert!(parse_duration(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[hegel::test]
+    fn parse_duration_never_panics(tc: hegel::TestCase) {
+        // Mostly digits, to reach huge values, among the units.
+        let s = tc.draw(hegel::generators::text().alphabet("0123456789.nuµmsh ").max_size(60));
+        let _ = parse_duration(&s);
+    }
+
+    #[hegel::test]
+    fn formatted_durations_parse_back(tc: hegel::TestCase) {
+        // Up to about 31 years.
+        let d =
+            Duration::from_nanos(tc.draw(hegel::generators::integers::<u64>().max_value(1_000_000_000_000_000_000)));
+        let s = fmt_duration(d);
+        let parsed = parse_duration(&s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        // fmt_duration rounds: to whole µs, 0.01ms, or 1ms.
+        let tolerance = match d {
+            _ if d < Duration::from_millis(1) => Duration::from_micros(1),
+            _ if d < Duration::from_secs(1) => Duration::from_micros(6),
+            _ => Duration::from_micros(501),
+        };
+        assert!(parsed.abs_diff(d) <= tolerance, "{d:?} formatted as {s} parsed as {parsed:?}");
     }
 
     #[test]
@@ -178,9 +271,59 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
-        write_private(&p, b"long contents").unwrap();
-        write_private(&p, b"short").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        replace_private(&p, b"long contents").unwrap();
+        replace_private(&p, b"short").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"short");
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(mode(&p), 0o600);
+        // Replacing a world-readable file leaves an owner-only one.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        replace_private(&p, b"secret").unwrap();
+        assert_eq!(mode(&p), 0o600);
+        let q = dir.path().join("g");
+        create_private(&q, b"new").unwrap();
+        assert_eq!((std::fs::read(&q).unwrap(), mode(&q)), (b"new".to_vec(), 0o600));
+        // No temporary files are left behind.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["f", "g"]);
+    }
+
+    #[test]
+    fn create_private_never_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("key");
+        // Of racing creators, exactly one wins, and its file is whole.
+        let wins: Vec<bool> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let p = &p;
+                    s.spawn(move || match create_private(p, &[i; 4096]) {
+                        Ok(()) => true,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                        Err(e) => panic!("{e}"),
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(wins.iter().filter(|w| **w).count(), 1, "{wins:?}");
+        let winner = wins.iter().position(|w| *w).unwrap() as u8;
+        assert_eq!(std::fs::read(&p).unwrap(), [winner; 4096]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn accept_rides_out_errors() {
+        let mut results = vec![
+            Err(std::io::Error::from_raw_os_error(24)), // EMFILE
+            Err(std::io::ErrorKind::ConnectionAborted.into()),
+            Ok(7),
+        ]
+        .into_iter();
+        let t0 = std::time::Instant::now();
+        assert_eq!(accept(|| std::future::ready(results.next().unwrap())).await, 7);
+        // It backed off (5ms, then 10ms) between tries.
+        assert!(t0.elapsed() >= Duration::from_millis(15));
     }
 }

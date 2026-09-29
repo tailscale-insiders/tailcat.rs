@@ -378,11 +378,12 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             let d = tailcat::derp::server::DevDerp::start(derp.parse()?, stun.parse()?, advertise).await?;
             let j = serde_json::to_string_pretty(&d.region)?;
             if let Some(f) = region_file {
-                std::fs::write(f, &j)?;
+                // Atomically: scripts poll for it.
+                util::replace_private(&f, j.as_bytes()).map_err(|e| anyhow::anyhow!("--region-file: {f}: {e}"))?;
             }
             println!("{j}");
             eprintln!("# dev DERP relay running; press Ctrl-C to stop");
-            tokio::signal::ctrl_c().await?;
+            forward::shutdown_signal().await;
         }
     }
     Ok(ExitCode::SUCCESS)

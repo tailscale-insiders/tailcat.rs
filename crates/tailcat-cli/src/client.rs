@@ -1,12 +1,14 @@
 //! Client modes: the stdin/stdout pipe and `tailcat ping`.
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use tailcat::{Addr, Client, ClientOptions, DiscoPingResult};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::cache::DiskDerpMapCache;
 use crate::{Global, usagef};
@@ -51,35 +53,62 @@ pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Resu
         .await
         .map_err(|_| anyhow!("Dial: timed out"))?
         .map_err(|e| anyhow!("Dial: {e}"))?;
-    let (mut rd, mut wr) = tokio::io::split(c);
-    let up = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = vec![0u8; 32 << 10];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if wr.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        // Half-close: tell the server we're done sending, netcat style.
-        let _ = wr.shutdown().await;
-    });
-    // Exit once the server finishes sending. Its close also confirms
-    // delivery of everything we sent, including our FIN.
+    let (mut rd, wr) = tokio::io::split(c);
+    // Exit once the server finishes sending (its close also confirms
+    // delivery of everything we sent, including our FIN), even if stdin
+    // is still open, or on a stdin error.
     let mut out = tokio::io::stdout();
-    tokio::io::copy(&mut rd, &mut out).await?;
-    out.flush().await?;
-    up.abort();
+    let res: Result<()> = tokio::select! {
+        r = tokio::io::copy(&mut rd, &mut out) => r.map(drop).map_err(Into::into),
+        Err(e) = upload(read_chunks(std::io::stdin()), wr) => Err(anyhow!("stdin: {e}")),
+    };
+    // Whatever arrived goes out, even on failure.
+    let flushed = out.flush().await;
+    res?;
+    flushed?;
     // Our ACK of the server's FIN starts in this process; let it drain.
     cl.drain_tcp(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+/// Reads `r` on a thread of its own, sending each chunk, or the error
+/// that ends it, until EOF. Unlike tokio's stdin, whose reads run on
+/// the runtime's blocking pool and hold up its shutdown until they
+/// return, a read blocked here doesn't keep the process from exiting.
+fn read_chunks(mut r: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel(1);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 32 << 10];
+        loop {
+            let chunk = match r.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => Ok(buf[..n].to_vec()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(e),
+            };
+            let last = chunk.is_err();
+            if tx.blocking_send(chunk).is_err() || last {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Writes the chunks from `rx` to `wr`, then half-closes it to tell the
+/// server we're done sending, netcat style. It fails only if reading
+/// does: a write error means the connection is going away, which the
+/// other direction reports.
+async fn upload(
+    mut rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    mut wr: impl AsyncWrite + Unpin,
+) -> std::io::Result<()> {
+    while let Some(chunk) = rx.recv().await {
+        if wr.write_all(&chunk?).await.is_err() {
+            return Ok(());
+        }
+    }
+    let _ = wr.shutdown().await;
     Ok(())
 }
 
@@ -113,5 +142,58 @@ pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_a
             return Err(no_direct());
         }
         tokio::time::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn uploads_then_half_closes() {
+        let (r, mut w) = std::io::pipe().unwrap();
+        let (mut server, client) = tokio::io::duplex(64);
+        let up = tokio::spawn(upload(read_chunks(r), client));
+        w.write_all(b"hello ").unwrap();
+        w.write_all(b"world").unwrap();
+        drop(w);
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"hello world");
+        up.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_fails_on_read_errors() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken"))
+            }
+        }
+        let e = upload(read_chunks(Broken), tokio::io::sink()).await.unwrap_err();
+        assert_eq!(e.to_string(), "broken");
+    }
+
+    /// A read blocked on a still-open stdin doesn't keep the runtime, and
+    /// so the process, from exiting.
+    #[test]
+    fn blocked_reads_dont_hold_up_exit() {
+        let (r, _w) = std::io::pipe().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut rx = read_chunks(r);
+            assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        });
+        let (tx, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(rt);
+            let _ = tx.send(());
+        });
+        dropped.recv_timeout(Duration::from_secs(10)).expect("runtime shutdown waited for the blocked read");
     }
 }
