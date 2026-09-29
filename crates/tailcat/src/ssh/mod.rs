@@ -128,25 +128,59 @@ fn config_dir() -> Option<PathBuf> {
     }
 }
 
-static HOST_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Returns the SSH host key, generating an ed25519 key on first use in
 /// `$CONFIG/tailcat/ssh/ssh_host_ed25519_key` (PKCS#8 PEM, like Go's).
 pub fn host_key() -> Result<PrivateKey> {
-    let _g = HOST_KEY_LOCK.lock().unwrap();
-    let path = ssh_key_dir()?.join("ssh_host_ed25519_key");
-    let pem = match std::fs::read_to_string(&path) {
-        Ok(pem) => pem,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut seed = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
-            let pem = pkcs8_ed25519_pem(&seed);
-            write_private_file(&path, pem.as_bytes())?;
-            pem
+    load_or_create_key(&ssh_key_dir()?.join("ssh_host_ed25519_key"))
+}
+
+/// Loads the private key at `path`, first generating one if the file is
+/// missing or empty (as a crash while writing it could once leave it).
+/// A new key is written in full to a temporary file and then linked into
+/// place, so processes starting together all end up with the one that
+/// got there first, and none reads a partial key.
+fn load_or_create_key(path: &std::path::Path) -> Result<PrivateKey> {
+    // Replacing an empty file can't be made safe by linking alone, so
+    // tailcat processes also take turns, by locking the directory.
+    #[cfg(unix)]
+    let _turn = {
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new(".")))?;
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
+        dir // Unlocked when closed.
+    };
+    let pem = match std::fs::read_to_string(path) {
+        Ok(pem) if !pem.trim().is_empty() => pem,
+        Ok(_) => install_new_key(path, true)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => install_new_key(path, false)?,
         Err(e) => return Err(e.into()),
     };
-    russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}")))
+    russh::keys::decode_secret_key(&pem, None)
+        .map_err(|e| Error::other(format!("parsing host key {}: {e}", path.display())))
+}
+
+/// Generates a key and puts it at `path`, replacing what's there only
+/// if `replace`, and returns the file's contents afterwards.
+fn install_new_key(path: &std::path::Path, replace: bool) -> Result<String> {
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", hex::encode(rand::random::<[u8; 8]>())));
+    let r = write_private_file(&tmp, pkcs8_ed25519_pem(&seed).as_bytes()).and_then(|()| {
+        if replace {
+            return Ok(std::fs::rename(&tmp, path)?);
+        }
+        match std::fs::hard_link(&tmp, path) {
+            // Someone else's key got there first.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            r => Ok(r?),
+        }
+    });
+    let _ = std::fs::remove_file(&tmp);
+    r?;
+    Ok(std::fs::read_to_string(path)?)
 }
 
 /// Encodes an ed25519 seed as a PKCS#8 v1 PEM ("PRIVATE KEY").
@@ -157,14 +191,17 @@ fn pkcs8_ed25519_pem(seed: &[u8; 32]) -> String {
     format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n")
 }
 
-/// Creates `path`, which must not exist, readable only by its owner.
+/// Creates `path`, which must not exist, readable only by its owner, and
+/// syncs its contents to disk.
 fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(path)?.write_all(data)?;
+    let mut f = o.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -284,6 +321,53 @@ mod tests {
         let pem = pkcs8_ed25519_pem(&[7u8; 32]);
         let k = russh::keys::decode_secret_key(&pem, None).unwrap();
         assert_eq!(k.algorithm(), russh::keys::Algorithm::Ed25519);
+    }
+
+    /// Processes starting at once (threads here, below any in-process
+    /// lock) all get the same host key, which is the one on disk; a
+    /// usable existing key is kept, and garbage is refused, not replaced.
+    #[cfg(unix)] // Elsewhere, replacing an empty file races.
+    #[hegel::test(test_cases = 50)]
+    fn concurrent_starts_share_one_host_key(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let dir = std::env::temp_dir().join(format!("tailcat-hostkey-{}", hex::encode(rand::random::<[u8; 8]>())));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("ssh_host_ed25519_key");
+        let existing = pkcs8_ed25519_pem(&[7; 32]);
+        let initial =
+            tc.draw(gs::sampled_from(vec![None, Some(""), Some("\n"), Some(existing.as_str()), Some("junk")]));
+        if let Some(text) = initial {
+            std::fs::write(&path, text).unwrap();
+        }
+        let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+        let barrier = std::sync::Barrier::new(n);
+        let keys: Vec<_> = std::thread::scope(|s| {
+            let starts: Vec<_> = (0..n)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        load_or_create_key(&path).map(|k| k.public_key().to_openssh().unwrap())
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let leftovers: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        if initial == Some("junk") {
+            assert!(keys.iter().all(|k| k.is_err()), "{keys:?}");
+            assert_eq!(on_disk, "junk");
+            return;
+        }
+        let keys: Vec<_> = keys.into_iter().map(|k| k.unwrap()).collect();
+        let disk_key = russh::keys::decode_secret_key(&on_disk, None).unwrap().public_key().to_openssh().unwrap();
+        assert!(keys.iter().all(|k| *k == disk_key), "{keys:?} vs {disk_key}");
+        if initial == Some(existing.as_str()) {
+            assert_eq!(on_disk, existing);
+        }
+        assert_eq!(leftovers, ["ssh_host_ed25519_key"]);
     }
 
     #[test]
