@@ -2,8 +2,8 @@
 //! [`Addr`], lazily on first use.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OnceCell, watch};
@@ -14,12 +14,23 @@ use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions}
 use crate::key::{NodePrivate, NodePublic};
 use crate::magicsock::{self, MagicSock, PathAddr};
 use crate::netstack::{Stack, StackConfig, TcpDecision, TcpStream, UdpConn};
-use crate::server::map_nat64;
+use crate::server::{close_tunnel, map_nat64};
 use crate::wg::{self, Engine, IpNet};
 use crate::{Error, Result, meow};
 
 /// How long [`Client::ping`] waits for the server's acknowledgment.
 const MEOW_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a TCP dial may go unanswered before the client suspects the
+/// server has lost track of it, joins again, and redials.
+const DIAL_REJOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long data sent to the server may go unanswered before the client
+/// joins again. A live WireGuard peer answers any data within its
+/// 10-second passive keepalive; this is WireGuard's own dead-peer rule
+/// (keepalive plus rekey timeout), after which it starts a handshake
+/// that goes nowhere if the server no longer knows us.
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The result of [`Client::ping`].
 #[derive(Debug, Clone)]
@@ -47,21 +58,93 @@ struct Running {
     ms: Arc<MagicSock>,
     engine: Arc<Engine>,
     stack: Stack,
-    meowed: watch::Receiver<bool>,
-    task: tokio::task::JoinHandle<()>,
+    /// Counts the server's "meowed" acknowledgments.
+    meowed: watch::Receiver<u64>,
+    /// Set once the server has acknowledged us.
+    joined: AtomicBool,
+    /// When the client last joined again, to share one rejoin between
+    /// everyone who wants it.
+    rejoined: tokio::sync::Mutex<Option<Instant>>,
+    /// The server's peer configuration, to reset its paths and session.
+    server_ms: magicsock::PeerConfig,
+    server_wg: wg::PeerConfig,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl Running {
+    /// Does the work of [`Client::ping`], returning the round-trip time.
+    async fn meow(&self) -> Result<Duration> {
+        let t0 = Instant::now();
+        let pkt = meow::encode_ping(&self.ms.public_key(), &self.ms.disco_public());
+        let server = self.ci.server_public;
+        let region = self.ms.home_region();
+        let mut meowed = self.meowed.clone();
+        // Only acks from here on answer this ping.
+        meowed.borrow_and_update();
+        let deadline = tokio::time::Instant::now() + MEOW_TIMEOUT;
+        // Give the relay connection a moment so the first meow isn't lost.
+        self.ms.wait_derp_connected(Duration::from_secs(5)).await;
+        let mut resend = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = resend.tick() => {
+                    if !self.ms.send_derp(&server, region, &pkt) {
+                        debug!("tailcat: meow not sent (relay not connected yet)");
+                    }
+                }
+                res = meowed.changed() => {
+                    res.map_err(|_| Error::other("tailcat client closed"))?;
+                    // The server just learned who we are; tell it our
+                    // endpoints so both sides can try a direct path.
+                    self.ms.send_call_me_maybe(&server);
+                    self.joined.store(true, Ordering::Relaxed);
+                    return Ok(t0.elapsed());
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::Timeout("no answer from the tailcat server".into()));
+                }
+            }
+        }
+    }
+
+    /// Announces the client again, for when the server seems to have lost
+    /// track of it: it restarted (with the same key, so the same address)
+    /// or disconnected us. A restarted server can't read our old
+    /// WireGuard session and may listen on a new port, so the server's
+    /// session and paths are reset too: the next packet starts a fresh
+    /// handshake, over DERP until a direct path is found again.
+    /// Concurrent callers share one rejoin.
+    async fn rejoin(&self) -> Result<()> {
+        let asked = Instant::now();
+        let mut rejoined = self.rejoined.lock().await;
+        if rejoined.is_some_and(|t| t >= asked) {
+            return Ok(());
+        }
+        debug!("tailcat: no answer from the server; announcing the client again");
+        self.meow().await?;
+        let server = self.ci.server_public;
+        self.ms.remove_peer(&server);
+        self.ms.upsert_peer(self.server_ms.clone());
+        self.engine.remove_peer(&server);
+        self.engine.upsert_peer(server, self.server_wg.clone());
+        self.ms.send_call_me_maybe(&server);
+        *rejoined = Some(Instant::now());
+        Ok(())
+    }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.stack.close();
-        self.engine.close();
-        self.ms.close();
-        self.task.abort();
+        close_tunnel(&self.stack, &self.engine, &self.ms);
+        self.tasks.iter().for_each(|t| t.abort());
     }
 }
 
 /// A client of one tailcat server. The tunnel comes up lazily on the
-/// first dial or ping. Clones share the same connection.
+/// first dial or ping. Clones share the same connection. If the server
+/// loses track of the client (it restarted, or disconnected it), the
+/// client announces itself again when a dial or its traffic goes
+/// unanswered.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
@@ -74,7 +157,6 @@ struct ClientInner {
     derp_map_cache: Option<Arc<dyn DerpMapCache>>,
     derp_map: Option<DerpMap>,
     running: OnceCell<Running>,
-    up_done: AtomicBool,
 }
 
 /// Options for [`Client::with_options`].
@@ -105,7 +187,6 @@ impl Client {
                 derp_map_cache: opts.derp_map_cache,
                 derp_map: opts.derp_map,
                 running: OnceCell::new(),
-                up_done: AtomicBool::new(false),
             }),
         }
     }
@@ -155,13 +236,13 @@ impl Client {
         let server_key = ci.server_public;
         let server_ip = server_key.tailcat_ip();
 
-        let (meow_tx, meow_rx) = watch::channel(false);
+        let (meow_tx, meow_rx) = watch::channel(0);
         let hook: magicsock::DerpRecvHook = Arc::new(move |_region, src, pkt| {
             if !meow::is_meow(pkt) {
                 return false;
             }
             if meow::is_meowed(pkt) && src == server_key {
-                meow_tx.send_replace(true);
+                meow_tx.send_modify(|n| *n += 1);
             }
             true // clients ignore meow pings
         });
@@ -180,22 +261,21 @@ impl Client {
             enable_udp: true,
         })
         .await?;
-        ms.upsert_peer(magicsock::PeerConfig {
+        let server_ms = magicsock::PeerConfig {
             node_key: server_key,
             disco_key: ci.server_disco_public,
             home_region: region.region_id,
             endpoints: Vec::new(),
-        });
+        };
+        ms.upsert_peer(server_ms.clone());
         let (engine, mut inbound) = Engine::start(&self.inner.key, ms.clone(), wg_rx, None, None);
         // The server may send from any address: it can be an exit node.
-        engine.upsert_peer(
-            server_key,
-            wg::PeerConfig {
-                allowed_ips: vec![IpNet::host(IpAddr::V6(server_ip)), "::/0".parse().expect("valid prefix")],
-                preshared_key: ci.preshared_key,
-                persistent_keepalive: None,
-            },
-        );
+        let server_wg = wg::PeerConfig {
+            allowed_ips: vec![IpNet::host(IpAddr::V6(server_ip)), "::/0".parse().expect("valid prefix")],
+            preshared_key: ci.preshared_key,
+            persistent_keepalive: None,
+        };
+        engine.upsert_peer(server_key, server_wg.clone());
         let out_engine = Arc::downgrade(&engine);
         let my_ip = IpAddr::V6(self.inner.key.public().tailcat_ip());
         // The client accepts no inbound connections at all.
@@ -215,53 +295,41 @@ impl Client {
                 inject.inject(p.data);
             }
         });
-        Ok(Running { ci, server_ip, my_ip, ms, engine, stack, meowed: meow_rx, task })
+        let watchdog = tokio::spawn(watch_server(Arc::downgrade(&self.inner)));
+        Ok(Running {
+            ci,
+            server_ip,
+            my_ip,
+            ms,
+            engine,
+            stack,
+            meowed: meow_rx,
+            joined: AtomicBool::new(false),
+            rejoined: tokio::sync::Mutex::new(None),
+            server_ms,
+            server_wg,
+            tasks: [task, watchdog],
+        })
     }
 
     /// Starts the client if needed, then announces it to the server over
     /// DERP (resending once a second, since DERP delivery is best effort)
     /// and waits for the acknowledgment, which also means the server has
     /// added it as a WireGuard peer. Dials do this implicitly; calling it
-    /// first tests connectivity and measures the relay round trip.
+    /// first tests connectivity and measures the relay round trip. (Acks
+    /// can't be matched to announcements, so a late ack to an earlier
+    /// ping can end this one.)
     pub async fn ping(&self) -> Result<PingResult> {
-        let r = self.ensure_started().await?;
-        let t0 = Instant::now();
-        let pkt = meow::encode_ping(&self.inner.key.public(), &r.ms.disco_public());
-        let server = r.ci.server_public;
-        let region = r.ms.home_region();
-        let mut meowed = r.meowed.clone();
-        let deadline = tokio::time::Instant::now() + MEOW_TIMEOUT;
-        // Give the relay connection a moment so the first meow isn't lost.
-        r.ms.wait_derp_connected(Duration::from_secs(5)).await;
-        let mut resend = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                _ = resend.tick() => {
-                    if !r.ms.send_derp(&server, region, &pkt) {
-                        debug!("tailcat: meow not sent (relay not connected yet)");
-                    }
-                }
-                res = meowed.wait_for(|m| *m) => {
-                    if res.is_ok() {
-                        // The server just learned who we are; tell it our
-                        // endpoints so both sides can try a direct path.
-                        r.ms.send_call_me_maybe(&server);
-                        self.inner.up_done.store(true, Ordering::Relaxed);
-                        return Ok(PingResult { latency: t0.elapsed() });
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(Error::Timeout("no answer from the tailcat server".into()));
-                }
-            }
-        }
+        let latency = self.ensure_started().await?.meow().await?;
+        Ok(PingResult { latency })
     }
 
     async fn up(&self) -> Result<&Running> {
-        if !self.inner.up_done.load(Ordering::Relaxed) {
-            self.ping().await?;
+        let r = self.ensure_started().await?;
+        if !r.joined.load(Ordering::Relaxed) {
+            r.meow().await?;
         }
-        self.ensure_started().await
+        Ok(r)
     }
 
     /// Sends a disco ping to the server and reports how the pong came
@@ -293,7 +361,12 @@ impl Client {
     /// over the IPv6-only tunnel.
     pub async fn dial_tcp(&self, dst: SocketAddr) -> std::io::Result<TcpStream> {
         let r = self.up().await?;
-        r.stack.dial_tcp(r.my_ip, map_nat64(dst)).await
+        let dst = map_nat64(dst);
+        if let Ok(res) = tokio::time::timeout(DIAL_REJOIN_TIMEOUT, r.stack.dial_tcp(r.my_ip, dst)).await {
+            return res;
+        }
+        r.rejoin().await?;
+        r.stack.dial_tcp(r.my_ip, dst).await
     }
 
     /// Opens a UDP flow to a port on the server.
@@ -315,5 +388,116 @@ impl Client {
     pub async fn drain_tcp(&self, timeout: Duration) -> bool {
         let Some(r) = self.inner.running.get() else { return true };
         r.stack.drain_tcp(timeout).await
+    }
+}
+
+/// Joins again whenever data sent to the server goes unanswered, which
+/// is how the client notices a server that lost track of it while no
+/// dial is waiting (say, a UDP flow's).
+async fn watch_server(client: Weak<ClientInner>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut stall = Stall::default();
+    loop {
+        tick.tick().await;
+        let Some(inner) = client.upgrade() else { return };
+        let Some(r) = inner.running.get() else { continue };
+        let server = r.ci.server_public;
+        let (_, tx, rx) = r.engine.peer_stats(&server).unwrap_or_default();
+        let path = r.ms.peer_path(&server);
+        let (last_send, last_recv) = path.map_or((None, None), |p| (p.last_send, p.last_recv));
+        if stall.stalled(Instant::now(), tx, rx, last_send, last_recv)
+            && let Err(e) = r.rejoin().await
+        {
+            debug!("tailcat: joining again: {e}");
+        }
+    }
+}
+
+/// Decides, from samples of the server's WireGuard byte counters and
+/// path timestamps, when data we sent has gone unanswered too long.
+#[derive(Default)]
+struct Stall {
+    tx: usize,
+    rx: usize,
+    /// When data first went out that nothing has answered since.
+    since: Option<Instant>,
+}
+
+impl Stall {
+    /// Takes a sample: bytes of data sent and received so far, and when
+    /// anything (keepalives and handshakes too) was last sent to or heard
+    /// from the server. It reports whether to join again.
+    fn stalled(
+        &mut self,
+        now: Instant,
+        tx: usize,
+        rx: usize,
+        last_send: Option<Instant>,
+        last_recv: Option<Instant>,
+    ) -> bool {
+        // The counters restart when the session is reset, hence `!=`.
+        let (sent, received) = (tx != self.tx, rx != self.rx);
+        (self.tx, self.rx) = (tx, rx);
+        if sent && self.since.is_none() {
+            self.since = Some(last_send.unwrap_or(now));
+        }
+        if received || last_recv.zip(self.since).is_some_and(|(heard, since)| heard >= since) {
+            self.since = None;
+        }
+        let stalled = self.since.is_some_and(|since| now.saturating_duration_since(since) >= STALL_TIMEOUT);
+        if stalled {
+            self.since = None;
+        }
+        stalled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `stall` one sample a second for `secs` seconds from `t0`,
+    /// with `sample` giving (tx, rx, last send, last receive) in seconds.
+    /// It returns the seconds at which it said to join again.
+    fn run(secs: u64, mut sample: impl FnMut(u64) -> (usize, usize, Option<u64>, Option<u64>)) -> Vec<u64> {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut stall = Stall::default();
+        (1..=secs)
+            .filter(|&s| {
+                let (tx, rx, send, recv) = sample(s);
+                stall.stalled(at(s), tx, rx, send.map(at), recv.map(at))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answered_data_never_stalls() {
+        // A request a second, each answered at once.
+        assert_eq!(run(60, |s| (s as usize, s as usize, Some(s), Some(s))), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn keepalives_answer_one_way_data() {
+        // Data a second, answered only by the server's keepalive every
+        // 10 seconds (which carries no data).
+        assert_eq!(run(60, |s| (s as usize, 0, Some(s), Some(s / 10 * 10))), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn idle_never_stalls() {
+        // One exchange, then quiet but for our own passive keepalive,
+        // which nothing answers.
+        assert_eq!(run(60, |s| (1, 1, Some(if s < 11 { 1 } else { 11 }), Some(1))), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn unanswered_data_stalls() {
+        // After an exchange, data every second into the void: it stalls
+        // once per timeout, while the data keeps going unanswered.
+        let got = run(60, |s| (s as usize, 1, Some(s), Some(1)));
+        assert_eq!(got, vec![17, 33, 49]);
+        // A single unanswered packet stalls once.
+        assert_eq!(run(60, |s| (if s < 5 { 1 } else { 2 }, 1, Some(if s < 5 { 1 } else { 5 }), Some(1))), vec![20]);
     }
 }

@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -234,15 +235,34 @@ struct Inner {
     listeners: Mutex<Listeners>,
     cfg: Handlers,
     task: tokio::task::JoinHandle<()>,
+    /// Set by close; a closing server admits no clients.
+    closed: AtomicBool,
 }
 
 impl Inner {
     fn close(&self) {
-        self.stack.close();
-        self.engine.close();
-        self.ms.close();
+        self.closed.store(true, Ordering::Relaxed);
+        close_tunnel(&self.stack, &self.engine, &self.ms);
         self.task.abort();
     }
+}
+
+/// Closes a tunnel from the top: the stack at once, aborting its
+/// connections, then the engine and magicsock below it once the RSTs
+/// from the stack's last poll have had a moment to get out through them.
+pub(crate) fn close_tunnel(stack: &Stack, engine: &Arc<Engine>, ms: &Arc<MagicSock>) {
+    stack.close();
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        engine.close();
+        ms.close();
+        return;
+    };
+    let (stack, engine, ms) = (stack.clone(), engine.clone(), ms.clone());
+    rt.spawn(async move {
+        stack.drain_tcp(Duration::from_secs(1)).await;
+        engine.close();
+        ms.close();
+    });
 }
 
 impl Drop for Inner {
@@ -448,6 +468,7 @@ impl Server {
             listeners: Mutex::default(),
             cfg: b.cfg,
             task,
+            closed: AtomicBool::new(false),
         });
         let _ = me.set(Arc::downgrade(&inner));
 
@@ -585,6 +606,9 @@ impl Server {
 
     async fn on_meow(&self, src: NodePublic, disco: DiscoPublic) -> bool {
         debug!("tailcat: got meow from {src}");
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return false;
+        }
         let (known, disconnects) = {
             let clients = self.inner.clients.lock().unwrap();
             (clients.ids.contains_key(&src), clients.disconnects)

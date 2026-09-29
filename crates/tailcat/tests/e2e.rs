@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use tailcat::derp::server::DevDerp;
 use tailcat::{
-    Client, ClientOptions, KeySet, NodePrivate, PortRange, Server, TcpStream, UdpConn, handler, udp_handler,
+    Client, ClientOptions, KeySet, NodePrivate, PortRange, PresharedKey, Server, ServerBuilder, TcpStream, UdpConn,
+    handler, udp_handler,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -15,10 +16,10 @@ fn init() {
 }
 
 /// Sends `msg` on `u` until it's echoed back; the first datagrams can be
-/// lost while the tunnel comes up.
+/// lost while the tunnel comes up (or back up).
 async fn udp_round_trip(u: &UdpConn, msg: &[u8]) {
     let mut buf = [0u8; 64];
-    for _ in 0..10 {
+    for _ in 0..30 {
         u.send(msg).await.unwrap();
         if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(1), u.recv(&mut buf)).await {
             assert_eq!(&buf[..n], msg);
@@ -38,32 +39,32 @@ async fn request(mut c: TcpStream, req: &[u8]) -> String {
 }
 
 async fn echo_server(dev: &DevDerp) -> Server {
-    Server::builder()
-        .region(dev.region.clone())
-        .on_tcp(|port| {
-            if port == 81 {
-                return None;
+    echo(Server::builder().region(dev.region.clone())).start().await.unwrap()
+}
+
+/// Adds TCP and UDP echo handlers; TCP port 81 refuses connections.
+fn echo(b: ServerBuilder) -> ServerBuilder {
+    b.on_tcp(|port| {
+        if port == 81 {
+            return None;
+        }
+        Some(handler(move |mut c: TcpStream| async move {
+            let mut buf = Vec::new();
+            c.read_to_end(&mut buf).await.unwrap();
+            c.write_all(format!("port {port}: ").as_bytes()).await.unwrap();
+            c.write_all(&buf).await.unwrap();
+            c.shutdown().await.unwrap();
+            c.drain(Duration::from_secs(5)).await;
+        }))
+    })
+    .on_udp(|_port| {
+        Some(udp_handler(|c: UdpConn| async move {
+            let mut buf = [0u8; 2048];
+            while let Ok(n) = c.recv(&mut buf).await {
+                let _ = c.send(&buf[..n]).await;
             }
-            Some(handler(move |mut c: TcpStream| async move {
-                let mut buf = Vec::new();
-                c.read_to_end(&mut buf).await.unwrap();
-                c.write_all(format!("port {port}: ").as_bytes()).await.unwrap();
-                c.write_all(&buf).await.unwrap();
-                c.shutdown().await.unwrap();
-                c.drain(Duration::from_secs(5)).await;
-            }))
-        })
-        .on_udp(|_port| {
-            Some(udp_handler(|c: UdpConn| async move {
-                let mut buf = [0u8; 2048];
-                while let Ok(n) = c.recv(&mut buf).await {
-                    let _ = c.send(&buf[..n]).await;
-                }
-            }))
-        })
-        .start()
-        .await
-        .unwrap()
+        }))
+    })
 }
 
 #[tokio::test]
@@ -157,6 +158,45 @@ async fn allowlist_rejects_strangers() {
 }
 
 #[tokio::test]
+async fn client_rejoins_a_restarted_server() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let (key, psk) = (NodePrivate::generate(), PresharedKey::generate());
+    let start = || echo(Server::builder().region(dev.region.clone()).key(key.clone()).preshared_key(psk)).start();
+    let server = start().await.unwrap();
+    let client = Client::new(server.tailcat_addr());
+    assert_eq!(request(client.dial_tcp_port(80).await.unwrap(), b"before").await, "port 80: before");
+    server.close();
+
+    // The same key and pre-shared key make the same address, but the new
+    // server has never heard of the client.
+    let server = start().await.unwrap();
+    assert_eq!(&server.tailcat_addr(), client.server());
+    let c = tokio::time::timeout(Duration::from_secs(30), client.dial_tcp_port(80)).await.expect("dial stalled");
+    assert_eq!(request(c.unwrap(), b"after").await, "port 80: after");
+
+    // Disconnected, the client joins again when its datagrams go
+    // unanswered.
+    assert!(server.disconnect_client(&client.public_key()));
+    let u = client.dial_udp_port(53).await.unwrap();
+    udp_round_trip(&u, b"still here").await;
+    assert_eq!(server.status().peers.len(), 1);
+    server.close();
+}
+
+#[tokio::test]
+async fn ping_needs_a_live_server() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
+    let client = Client::new(server.tailcat_addr());
+    client.ping().await.unwrap();
+    client.ping().await.unwrap();
+    server.close();
+    assert!(client.ping().await.is_err(), "ping answered by a closed server");
+}
+
+#[tokio::test]
 async fn listeners_take_precedence() {
     init();
     let dev = DevDerp::start_local().await.unwrap();
@@ -217,6 +257,38 @@ async fn udp_listener_flows_idle_out() {
         }
     };
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// Reads from `c` until the connection ends, which it must promptly.
+async fn wait_closed(mut c: TcpStream) {
+    let mut buf = [0u8; 64];
+    let end = async { while c.read(&mut buf).await.is_ok_and(|n| n > 0) {} };
+    tokio::time::timeout(Duration::from_secs(5), end).await.expect("connection outlived its peer");
+}
+
+#[tokio::test]
+async fn closing_resets_open_connections() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
+    let mut ln = server.listen_tcp(80).unwrap();
+
+    // A closed server's connections reset rather than hang.
+    let client = Client::new(server.tailcat_addr());
+    let c = client.dial_tcp_port(80).await.unwrap();
+    let _accepted = ln.accept().await.unwrap();
+    server.close();
+    wait_closed(c).await;
+
+    // And so do a dropped client's.
+    let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
+    let mut ln = server.listen_tcp(80).unwrap();
+    let client = Client::new(server.tailcat_addr());
+    let _c = client.dial_tcp_port(80).await.unwrap();
+    let accepted = ln.accept().await.unwrap();
+    drop((_c, client));
+    wait_closed(accepted).await;
+    server.close();
 }
 
 #[tokio::test]
