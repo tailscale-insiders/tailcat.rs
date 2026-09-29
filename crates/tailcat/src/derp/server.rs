@@ -9,9 +9,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace};
 
 use super::{
@@ -23,11 +25,23 @@ use crate::{Error, Result};
 
 const CLIENT_QUEUE: usize = 1024;
 const KEEPALIVE: Duration = Duration::from_secs(60);
+/// How long a client may take to send its HTTP request line and headers.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
+/// The most bytes of request line and headers we read.
+const MAX_REQUEST_SIZE: u64 = 16 << 10;
 
-/// The relay's state: its key and the connected clients' send queues.
+/// A connected client.
+struct Client {
+    /// Its send queue.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Closes its connection, when a newer one replaces it.
+    close: Arc<Notify>,
+}
+
+/// The relay's state: its key and the connected clients.
 pub struct Server {
     key: NodePrivate,
-    clients: Mutex<HashMap<NodePublic, mpsc::Sender<Vec<u8>>>>,
+    clients: Mutex<HashMap<NodePublic, Client>>,
 }
 
 impl Server {
@@ -68,31 +82,10 @@ impl Server {
 
     async fn handle_http<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: S, remote: SocketAddr) -> Result<()> {
         let mut br = BufReader::new(stream);
-        let mut request_line = String::new();
-        br.read_line(&mut request_line).await?;
-        let path = request_line.split_whitespace().nth(1).unwrap_or("");
-        let (mut upgrade, mut fast_start, mut total) = (false, false, 0);
-        loop {
-            let mut line = String::new();
-            let n = br.read_line(&mut line).await?;
-            total += n;
-            if n == 0 || total > 16 << 10 {
-                return Err(Error::Derp("bad HTTP request".into()));
-            }
-            let line = line.trim_end();
-            if line.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                let v = v.trim();
-                if k.eq_ignore_ascii_case("upgrade") {
-                    upgrade = v.eq_ignore_ascii_case("derp");
-                } else if k.eq_ignore_ascii_case(super::FAST_START_HEADER) {
-                    fast_start = v == "1";
-                }
-            }
-        }
-        let canned: &[u8] = match path {
+        let (path, upgrade, fast_start) = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut br))
+            .await
+            .map_err(|_| Error::Derp("timeout reading HTTP request".into()))??;
+        let canned: &[u8] = match path.as_str() {
             "/derp/probe" | "/derp/latency-check" => {
                 b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             }
@@ -135,8 +128,13 @@ impl Server {
         super::write_frame(br.get_mut(), FrameType::ServerInfo, &[&self.key.seal_to(&client, &si)]).await?;
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
-        self.clients.lock().unwrap().insert(client, tx.clone());
+        let close = Arc::new(Notify::new());
+        let old = self.clients.lock().unwrap().insert(client, Client { tx: tx.clone(), close: close.clone() });
         debug!("derp server: {remote} connected as {}", client.short_string());
+        if let Some(old) = old {
+            debug!("derp server: closing {}'s older connection", client.short_string());
+            old.close.notify_one();
+        }
 
         let (mut rd, wr) = tokio::io::split(br);
         let mut wr = BufWriter::new(wr);
@@ -149,7 +147,7 @@ impl Server {
                         let clients = self.clients.lock().unwrap();
                         // Frames are dropped if the recipient is slow.
                         let _ = match clients.get(&dst) {
-                            Some(dtx) => dtx.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
+                            Some(d) => d.tx.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
                             None => tx.try_send(frame(FrameType::PeerGone, &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]])),
                         };
                     }
@@ -179,14 +177,44 @@ impl Server {
         let res = tokio::select! {
             r = reader => r,
             r = writer => r,
+            _ = close.notified() => Err(Error::Derp("replaced by a newer connection".into())),
         };
         // A newer connection with the same key may have replaced ours.
         let mut clients = self.clients.lock().unwrap();
-        if clients.get(&client).is_some_and(|c| c.same_channel(&tx)) {
+        if clients.get(&client).is_some_and(|c| c.tx.same_channel(&tx)) {
             clients.remove(&client);
         }
         debug!("derp server: {} disconnected", client.short_string());
         res
+    }
+}
+
+/// Reads an HTTP request line and headers, returning the request's path
+/// and whether it asks to upgrade to DERP, and to skip the upgrade
+/// response.
+async fn read_request<R: AsyncBufRead + Unpin>(r: R) -> Result<(String, bool, bool)> {
+    let mut r = r.take(MAX_REQUEST_SIZE);
+    let (mut path, mut upgrade, mut fast_start) = (None, false, false);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // A line cut short by EOF or the size limit is an error.
+        if r.read_line(&mut line).await? == 0 || !line.ends_with('\n') {
+            return Err(Error::Derp("bad HTTP request".into()));
+        }
+        let line = line.trim_end();
+        if path.is_none() {
+            path = Some(line.split_whitespace().nth(1).unwrap_or("").to_string());
+        } else if line.is_empty() {
+            return Ok((path.unwrap_or_default(), upgrade, fast_start));
+        } else if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("upgrade") {
+                upgrade = v.eq_ignore_ascii_case("derp");
+            } else if k.eq_ignore_ascii_case(super::FAST_START_HEADER) {
+                fast_start = v == "1";
+            }
+        }
     }
 }
 
@@ -320,12 +348,18 @@ mod tests {
     /// returns the other end, with `request` already written.
     async fn http(request: &str) -> (Arc<Server>, BufReader<tokio::io::DuplexStream>) {
         let server = Server::new();
+        let c = connect(&server, request).await;
+        (server, c)
+    }
+
+    /// Like [`http`], on an existing server.
+    async fn connect(server: &Arc<Server>, request: &str) -> BufReader<tokio::io::DuplexStream> {
         let (near, far) = tokio::io::duplex(1 << 20);
         let s = server.clone();
         tokio::spawn(async move { s.handle_http(far, SocketAddr::from(([127, 0, 0, 1], 1))).await });
         let mut near = BufReader::new(near);
         near.get_mut().write_all(request.as_bytes()).await.unwrap();
-        (server, near)
+        near
     }
 
     async fn response(request: &str) -> String {
@@ -341,6 +375,15 @@ mod tests {
         assert!(response("GET /generate_204 HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 204 "));
         let r = response("GET /derp HTTP/1.1\r\nUpgrade: websocket\r\n\r\n").await;
         assert!(r.starts_with("HTTP/1.1 426 ") && r.ends_with("DERP requires connection upgrade"));
+    }
+
+    /// A request line or header that never ends, or headers that never
+    /// finish, get the connection closed instead of held open.
+    #[tokio::test]
+    async fn gives_up_on_unfinished_requests() {
+        assert_eq!(response(&"x".repeat(64 << 10)).await, "");
+        assert_eq!(response(&format!("GET /derp HTTP/1.1\r\nX: {}", "x".repeat(64 << 10))).await, "");
+        assert_eq!(response("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\n").await, "");
     }
 
     #[tokio::test]
@@ -380,6 +423,32 @@ mod tests {
             }
         };
         tokio::time::timeout(T, gone).await.unwrap();
+    }
+
+    /// A client that connects again with the same key replaces its older
+    /// connection, which the relay closes.
+    #[tokio::test]
+    async fn a_new_connection_replaces_the_old_one() {
+        let server = Server::new();
+        let key = NodePrivate::generate();
+        let mut conns = Vec::new();
+        for _ in 0..2 {
+            let mut c = connect(&server, "").await;
+            login(&mut c, "T", &key, "test").await.unwrap();
+            let (t, _) = read_frame(&mut c, 1 << 10).await.unwrap();
+            assert_eq!(t, FrameType::ServerInfo as u8);
+            conns.push(c);
+        }
+        let [mut old, mut new] = conns.try_into().unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_end(&mut old, &mut rest))
+            .await
+            .expect("the old connection is still open")
+            .unwrap();
+        assert!(server.is_client_connected(&key.public()));
+        new.get_mut().write_all(&frame(FrameType::Ping, &[b"12345678"])).await.unwrap();
+        let (t, payload) = read_frame(&mut new, 1 << 10).await.unwrap();
+        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, &b"12345678"[..]));
     }
 
     #[tokio::test]
