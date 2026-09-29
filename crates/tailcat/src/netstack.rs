@@ -809,8 +809,11 @@ impl UdpConn {
 
     /// Closes the flow; later receives and sends fail.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
-        self.shared.lock().udp.remove(&(self.local, self.remote));
+        // Only once: by the next close (or the drop), a new flow may
+        // have taken the 4-tuple.
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            self.shared.lock().udp.remove(&(self.local, self.remote));
+        }
     }
 }
 
@@ -854,6 +857,9 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 #[cfg(test)]
 mod model_tests;
+
+#[cfg(test)]
+mod udp_model_tests;
 
 #[cfg(test)]
 mod tests {
