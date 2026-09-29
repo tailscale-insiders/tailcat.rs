@@ -61,11 +61,13 @@ mod server;
 pub mod ssh;
 mod tls;
 
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
 pub use addr::{Addr, ConnInfo, PrivateKey};
 pub use client::{Client, ClientOptions, DiscoPingResult, PingResult};
 pub use derpmap::{DEFAULT_DERP_MAP_URL, DerpMap, DerpMapCache, DerpNode, DerpRegion, FetchMode, FetchOptions};
 pub use exec::peer_env;
-pub use http::shared_client;
+pub use http::client as shared_client;
 pub use key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 pub use keyset::KeySet;
 pub use netstack::{TcpStream, UdpConn};
@@ -120,11 +122,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// region selection and path discovery. Logging itself goes through the
 /// `tracing` crate; this only affects what's emitted.
 pub fn set_verbose(v: bool) {
-    VERBOSE.store(v, std::sync::atomic::Ordering::Relaxed);
+    VERBOSE.store(v, Relaxed);
 }
 
 pub(crate) fn verbose() -> bool {
-    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+    VERBOSE.load(Relaxed)
 }
 
-static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VERBOSE: AtomicBool = AtomicBool::new(false);

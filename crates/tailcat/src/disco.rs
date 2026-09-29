@@ -6,7 +6,7 @@
 //! ciphertext). Inside, a type byte and a version byte precede the
 //! message body. This matches Tailscale's `disco` package.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use crate::key::{DiscoPrivate, DiscoPublic, DiscoShared, NodePublic};
 
@@ -46,7 +46,7 @@ pub fn looks_like_disco(pkt: &[u8]) -> bool {
 
 /// Returns the sender's disco key from a disco packet.
 pub fn source(pkt: &[u8]) -> Option<DiscoPublic> {
-    looks_like_disco(pkt).then(|| DiscoPublic::from_slice(&pkt[6..HEADER_LEN]).expect("32 bytes"))
+    looks_like_disco(pkt).then(|| DiscoPublic::from_bytes(pkt[6..HEADER_LEN].try_into().unwrap()))
 }
 
 fn put_addr(out: &mut Vec<u8>, a: &SocketAddr) {
@@ -54,14 +54,13 @@ fn put_addr(out: &mut Vec<u8>, a: &SocketAddr) {
         IpAddr::V4(v4) => v4.to_ipv6_mapped(),
         IpAddr::V6(v6) => v6,
     };
-    out.extend_from_slice(&ip16.octets());
-    out.extend_from_slice(&a.port().to_be_bytes());
+    out.extend(ip16.octets());
+    out.extend(a.port().to_be_bytes());
 }
 
-fn get_addr(b: &[u8]) -> SocketAddr {
-    let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&b[..16]).expect("16 bytes"));
-    let ip = ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip));
-    SocketAddr::new(ip, u16::from_be_bytes([b[16], b[17]]))
+fn get_addr(b: &[u8; 18]) -> SocketAddr {
+    let ip: [u8; 16] = b[..16].try_into().unwrap();
+    SocketAddr::new(IpAddr::from(ip).to_canonical(), u16::from_be_bytes([b[16], b[17]]))
 }
 
 impl Message {
@@ -70,20 +69,20 @@ impl Message {
         let mut out = Vec::with_capacity(64);
         match self {
             Message::Ping { tx_id, node_key, padding } => {
-                out.extend_from_slice(&[TYPE_PING, 0]);
-                out.extend_from_slice(tx_id);
+                out.extend([TYPE_PING, 0]);
+                out.extend(tx_id);
                 if let Some(k) = node_key {
-                    out.extend_from_slice(k.as_bytes());
+                    out.extend(k.as_bytes());
                 }
                 out.resize(out.len() + padding, 0);
             }
             Message::Pong { tx_id, src } => {
-                out.extend_from_slice(&[TYPE_PONG, 0]);
-                out.extend_from_slice(tx_id);
+                out.extend([TYPE_PONG, 0]);
+                out.extend(tx_id);
                 put_addr(&mut out, src);
             }
             Message::CallMeMaybe { endpoints } => {
-                out.extend_from_slice(&[TYPE_CALL_ME_MAYBE, 0]);
+                out.extend([TYPE_CALL_ME_MAYBE, 0]);
                 for e in endpoints {
                     put_addr(&mut out, e);
                 }
@@ -95,39 +94,22 @@ impl Message {
     /// Decodes a message payload. Unknown types decode to `None`; longer
     /// than expected messages are accepted for forward compatibility.
     pub fn decode(p: &[u8]) -> Option<Message> {
-        if p.len() < 2 {
-            return None;
-        }
-        let (t, ver, body) = (p[0], p[1], &p[2..]);
-        match t {
+        let [t, ver, body @ ..] = p else { return None };
+        match *t {
             TYPE_PING => {
-                let tx_id: TxId = body.get(..12)?.try_into().ok()?;
-                let rest = &body[12..];
-                let mut padding = rest.len();
-                let mut node_key = None;
-                if rest.len() >= 32 {
-                    let k = NodePublic::from_slice(&rest[..32]).expect("32 bytes");
-                    if !k.is_zero() {
-                        node_key = Some(k);
-                        padding -= 32;
-                    }
-                }
-                Some(Message::Ping { tx_id, node_key, padding })
+                let (tx_id, rest) = body.split_first_chunk::<12>()?;
+                let node_key = rest.first_chunk().map(|k| NodePublic::from_bytes(*k)).filter(|k| !k.is_zero());
+                let padding = rest.len() - if node_key.is_some() { 32 } else { 0 };
+                Some(Message::Ping { tx_id: *tx_id, node_key, padding })
             }
             TYPE_PONG => {
-                if body.len() < 12 + 18 {
-                    return None;
-                }
-                let tx_id: TxId = body[..12].try_into().ok()?;
-                Some(Message::Pong { tx_id, src: get_addr(&body[12..30]) })
+                let (tx_id, rest) = body.split_first_chunk::<12>()?;
+                Some(Message::Pong { tx_id: *tx_id, src: get_addr(rest.first_chunk()?) })
             }
             TYPE_CALL_ME_MAYBE => {
-                let mut endpoints = Vec::new();
-                if ver == 0 && !body.is_empty() && body.len() % 18 == 0 {
-                    for chunk in body.chunks(18) {
-                        endpoints.push(get_addr(chunk));
-                    }
-                }
+                let (chunks, rest) = body.as_chunks();
+                let valid = *ver == 0 && rest.is_empty();
+                let endpoints = if valid { chunks.iter().map(get_addr).collect() } else { Vec::new() };
                 Some(Message::CallMeMaybe { endpoints })
             }
             _ => None,
@@ -147,11 +129,7 @@ impl Message {
 /// Seals `msg` from `ours` to the peer whose shared key is `shared`,
 /// producing a complete disco packet.
 pub fn seal(our_public: &DiscoPublic, shared: &DiscoShared, msg: &Message) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(128);
-    pkt.extend_from_slice(MAGIC);
-    pkt.extend_from_slice(our_public.as_bytes());
-    pkt.extend_from_slice(&shared.seal(&msg.encode()));
-    pkt
+    [MAGIC.as_slice(), our_public.as_bytes(), &shared.seal(&msg.encode())].concat()
 }
 
 /// Opens a disco packet with the shared key for its sender.
@@ -203,5 +181,45 @@ mod tests {
         let e = m.encode();
         assert_eq!(&e[14..30], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4]);
         assert_eq!(&e[30..32], &[1, 2]);
+    }
+
+    #[test]
+    fn decodes_edge_cases() {
+        assert_eq!(Message::decode(&[]), None);
+        assert_eq!(Message::decode(&[TYPE_PING]), None);
+        assert_eq!(Message::decode(&[0x7f, 0]), None, "unknown type");
+        // A ping too short for its transaction ID; one with a zero node key
+        // counts it as padding; one with a trailing extension is accepted.
+        assert_eq!(Message::decode(&[TYPE_PING, 0, 1, 2]), None);
+        let ping = |rest: &[u8]| Message::decode(&[&[TYPE_PING, 0][..], &[5; 12], rest].concat());
+        assert_eq!(ping(&[0; 40]), Some(Message::Ping { tx_id: [5; 12], node_key: None, padding: 40 }));
+        let k = NodePublic::from_bytes([1; 32]);
+        let got = ping(&[[1; 32].as_slice(), &[0; 3]].concat());
+        assert_eq!(got, Some(Message::Ping { tx_id: [5; 12], node_key: Some(k), padding: 3 }));
+        // A truncated pong.
+        let pong = Message::Pong { tx_id: [1; 12], src: "192.0.2.1:9".parse().unwrap() }.encode();
+        assert_eq!(Message::decode(&pong[..pong.len() - 1]), None);
+        // Call-me-maybe with a ragged body or unknown version carries no endpoints.
+        let cmm = Message::CallMeMaybe { endpoints: vec!["192.0.2.1:9".parse().unwrap()] }.encode();
+        assert_eq!(Message::decode(&cmm[..cmm.len() - 1]), Some(Message::CallMeMaybe { endpoints: vec![] }));
+        let mut v1 = cmm.clone();
+        v1[1] = 1;
+        assert_eq!(Message::decode(&v1), Some(Message::CallMeMaybe { endpoints: vec![] }));
+        assert_eq!(Message::decode(&cmm[..2]), Some(Message::CallMeMaybe { endpoints: vec![] }));
+    }
+
+    #[test]
+    fn rejects_foreign_packets() {
+        let a = DiscoPrivate::generate();
+        let b = DiscoPrivate::generate();
+        let m = Message::CallMeMaybe { endpoints: vec![] };
+        let pkt = seal_with(&a, &b.public(), &m);
+        // Not ours to open, too short, or without the magic.
+        assert_eq!(open(&a.shared(&a.public()), &pkt), None);
+        assert_eq!(source(&pkt[..HEADER_LEN + 23]), None);
+        let mut bad = pkt.clone();
+        bad[0] = b'X';
+        assert_eq!(source(&bad), None);
+        assert_eq!(open(&b.shared(&a.public()), &bad), None);
     }
 }

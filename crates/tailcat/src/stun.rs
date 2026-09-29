@@ -2,10 +2,10 @@
 //! Tailscale's: requests carry a `SOFTWARE: tailnode` attribute and a
 //! trailing `FINGERPRINT`, which Tailscale's STUN servers require.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
-use rand::RngCore;
-
+const BINDING_REQUEST: [u8; 2] = [0x00, 0x01];
+const BINDING_SUCCESS: [u8; 2] = [0x01, 0x01];
 const ATTR_SOFTWARE: u16 = 0x8022;
 const ATTR_FINGERPRINT: u16 = 0x8028;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
@@ -21,9 +21,7 @@ pub type TxId = [u8; 12];
 
 /// Returns a new random transaction ID.
 pub fn new_txid() -> TxId {
-    let mut t = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut t);
-    t
+    rand::random()
 }
 
 /// Reports whether `b` looks like a STUN packet.
@@ -31,21 +29,28 @@ pub fn is_stun(b: &[u8]) -> bool {
     b.len() >= HEADER_LEN && b[0] & 0b1100_0000 == 0 && b[4..8] == MAGIC_COOKIE
 }
 
+/// Starts a message of type `typ` whose attributes will take `attrs_len` bytes.
+fn header(typ: [u8; 2], attrs_len: usize, txid: &TxId) -> Vec<u8> {
+    let mut b = Vec::with_capacity(HEADER_LEN + attrs_len);
+    b.extend(typ);
+    b.extend((attrs_len as u16).to_be_bytes());
+    b.extend(MAGIC_COOKIE);
+    b.extend(txid);
+    b
+}
+
+fn put_attr(b: &mut Vec<u8>, t: u16, v: &[u8]) {
+    b.extend(t.to_be_bytes());
+    b.extend((v.len() as u16).to_be_bytes());
+    b.extend(v);
+}
+
 /// Encodes a binding request.
 pub fn request(txid: TxId) -> Vec<u8> {
-    let attrs_len = 4 + SOFTWARE.len() + FINGERPRINT_LEN;
-    let mut b = Vec::with_capacity(HEADER_LEN + attrs_len);
-    b.extend_from_slice(&[0x00, 0x01]);
-    b.extend_from_slice(&(attrs_len as u16).to_be_bytes());
-    b.extend_from_slice(&MAGIC_COOKIE);
-    b.extend_from_slice(&txid);
-    b.extend_from_slice(&ATTR_SOFTWARE.to_be_bytes());
-    b.extend_from_slice(&(SOFTWARE.len() as u16).to_be_bytes());
-    b.extend_from_slice(SOFTWARE);
+    let mut b = header(BINDING_REQUEST, 4 + SOFTWARE.len() + FINGERPRINT_LEN, &txid);
+    put_attr(&mut b, ATTR_SOFTWARE, SOFTWARE);
     let fp = fingerprint(&b);
-    b.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
-    b.extend_from_slice(&4u16.to_be_bytes());
-    b.extend_from_slice(&fp.to_be_bytes());
+    put_attr(&mut b, ATTR_FINGERPRINT, &fp.to_be_bytes());
     b
 }
 
@@ -53,126 +58,93 @@ pub fn request(txid: TxId) -> Vec<u8> {
 /// transaction ID. Like Tailscale's server, it insists on the
 /// `tailnode` software attribute and a valid trailing fingerprint.
 pub fn parse_binding_request(b: &[u8]) -> Option<TxId> {
-    if !is_stun(b) || b[0..2] != [0x00, 0x01] {
+    if !is_stun(b) || b[0..2] != BINDING_REQUEST {
         return None;
     }
-    let txid: TxId = b[8..20].try_into().ok()?;
     let mut software_ok = false;
     let mut last_attr = 0u16;
-    let mut got_fp = 0u32;
+    let mut got_fp = None;
     for_each_attr(&b[HEADER_LEN..], |t, a| {
         last_attr = t;
-        if t == ATTR_SOFTWARE && a == SOFTWARE {
-            software_ok = true;
-        }
-        if t == ATTR_FINGERPRINT && a.len() == 4 {
-            got_fp = u32::from_be_bytes(a.try_into().unwrap());
+        software_ok |= t == ATTR_SOFTWARE && a == SOFTWARE;
+        if t == ATTR_FINGERPRINT {
+            got_fp = a.try_into().ok().map(u32::from_be_bytes);
         }
     })?;
-    if !software_ok || last_attr != ATTR_FINGERPRINT {
-        return None;
-    }
-    (got_fp == fingerprint(&b[..b.len() - FINGERPRINT_LEN])).then_some(txid)
+    let want_fp = fingerprint(&b[..b.len() - FINGERPRINT_LEN]);
+    (software_ok && last_attr == ATTR_FINGERPRINT && got_fp == Some(want_fp)).then(|| txid(b))
 }
 
 /// Encodes a success response telling the client its address.
 pub fn response(txid: TxId, addr: SocketAddr) -> Vec<u8> {
-    let (fam, ip): (u8, Vec<u8>) = match addr.ip() {
+    let (fam, mut ip) = match addr.ip().to_canonical() {
         IpAddr::V4(v4) => (1, v4.octets().to_vec()),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => (1, v4.octets().to_vec()),
-            None => (2, v6.octets().to_vec()),
-        },
+        IpAddr::V6(v6) => (2, v6.octets().to_vec()),
     };
-    let attrs_len = 8 + ip.len();
-    let mut b = Vec::with_capacity(HEADER_LEN + attrs_len);
-    b.extend_from_slice(&[0x01, 0x01]);
-    b.extend_from_slice(&(attrs_len as u16).to_be_bytes());
-    b.extend_from_slice(&MAGIC_COOKIE);
-    b.extend_from_slice(&txid);
-    b.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-    b.extend_from_slice(&((4 + ip.len()) as u16).to_be_bytes());
-    b.push(0);
-    b.push(fam);
-    b.extend_from_slice(&(addr.port() ^ 0x2112).to_be_bytes());
-    for (i, o) in ip.iter().enumerate() {
-        b.push(if i < 4 { o ^ MAGIC_COOKIE[i] } else { o ^ txid[i - 4] });
-    }
+    xor_ip(&mut ip, &txid);
+    let mut v = vec![0, fam];
+    v.extend((addr.port() ^ 0x2112).to_be_bytes());
+    v.extend(ip);
+    let mut b = header(BINDING_SUCCESS, 4 + v.len(), &txid);
+    put_attr(&mut b, ATTR_XOR_MAPPED_ADDRESS, &v);
     b
 }
 
 /// Parses a binding success response, returning its transaction ID and
 /// the reflexive address it reports.
 pub fn parse_response(b: &[u8]) -> Option<(TxId, SocketAddr)> {
-    if !is_stun(b) || b[0..2] != [0x01, 0x01] {
+    if !is_stun(b) || b[0..2] != BINDING_SUCCESS {
         return None;
     }
-    let txid: TxId = b[8..20].try_into().ok()?;
+    let txid = txid(b);
     let attrs_len = u16::from_be_bytes([b[2], b[3]]) as usize;
-    let mut rest = &b[HEADER_LEN..];
-    if attrs_len > rest.len() {
-        return None;
-    }
-    rest = &rest[..attrs_len];
     let mut addr = None;
     let mut fallback = None;
-    for_each_attr(rest, |t, a| match t {
-        ATTR_XOR_MAPPED_ADDRESS | ATTR_XOR_MAPPED_ADDRESS_ALT => {
-            if let Some(sa) = decode_addr(a, Some(&txid)) {
-                addr = Some(sa);
-            }
-        }
-        ATTR_MAPPED_ADDRESS => {
-            if let Some(sa) = decode_addr(a, None) {
-                fallback = Some(sa);
-            }
-        }
+    for_each_attr(b.get(HEADER_LEN..HEADER_LEN + attrs_len)?, |t, a| match t {
+        ATTR_XOR_MAPPED_ADDRESS | ATTR_XOR_MAPPED_ADDRESS_ALT => addr = decode_addr(a, Some(&txid)).or(addr),
+        ATTR_MAPPED_ADDRESS => fallback = decode_addr(a, None).or(fallback),
         _ => {}
     })?;
     addr.or(fallback).map(|a| (txid, a))
 }
 
-fn decode_addr(a: &[u8], xor_txid: Option<&TxId>) -> Option<SocketAddr> {
-    if a.len() < 4 {
-        return None;
+fn txid(b: &[u8]) -> TxId {
+    b[8..HEADER_LEN].try_into().unwrap()
+}
+
+/// XORs an address with the magic cookie and then the transaction ID.
+fn xor_ip(ip: &mut [u8], txid: &TxId) {
+    for (o, k) in ip.iter_mut().zip(MAGIC_COOKIE.iter().chain(txid)) {
+        *o ^= k;
     }
-    let len = match a[1] {
+}
+
+fn decode_addr(a: &[u8], xor_txid: Option<&TxId>) -> Option<SocketAddr> {
+    let len = match a.get(1)? {
         1 => 4,
         2 => 16,
         _ => return None,
     };
-    let field = a.get(4..4 + len)?;
-    let mut port = u16::from_be_bytes([a[2], a[3]]);
-    let mut ip = field.to_vec();
+    let mut port = u16::from_be_bytes(a.get(2..4)?.try_into().ok()?);
+    let mut ip = a.get(4..4 + len)?.to_vec();
     if let Some(txid) = xor_txid {
         port ^= 0x2112;
-        for (i, o) in ip.iter_mut().enumerate() {
-            *o ^= if i < 4 { MAGIC_COOKIE[i] } else { txid[i - 4] };
-        }
+        xor_ip(&mut ip, txid);
     }
-    let ip = if len == 4 {
-        IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]))
-    } else {
-        let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(ip.as_slice()).ok()?);
-        v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6))
+    let ip = match <[u8; 4]>::try_from(ip.as_slice()) {
+        Ok(v4) => IpAddr::from(v4),
+        Err(_) => IpAddr::from(<[u8; 16]>::try_from(ip.as_slice()).ok()?),
     };
-    Some(SocketAddr::new(ip, port))
+    Some(SocketAddr::new(ip.to_canonical(), port))
 }
 
 fn for_each_attr(mut b: &[u8], mut f: impl FnMut(u16, &[u8])) -> Option<()> {
     while !b.is_empty() {
-        if b.len() < 4 {
-            return None;
-        }
-        let t = u16::from_be_bytes([b[0], b[1]]);
-        let len = u16::from_be_bytes([b[2], b[3]]) as usize;
+        let t = u16::from_be_bytes(b.get(0..2)?.try_into().ok()?);
+        let len = u16::from_be_bytes(b.get(2..4)?.try_into().ok()?) as usize;
         let padded = (len + 3) & !3;
-        b = &b[4..];
-        if padded > b.len() {
-            return None;
-        }
-        f(t, &b[..len]);
-        b = &b[padded..];
+        f(t, b.get(4..4 + len)?);
+        b = b.get(4 + padded..)?;
     }
     Some(())
 }
@@ -182,23 +154,22 @@ fn fingerprint(b: &[u8]) -> u32 {
 }
 
 fn crc32_ieee(data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    const TABLE: [u32; 256] = {
         let mut t = [0u32; 256];
-        for (i, e) in t.iter_mut().enumerate() {
+        let mut i = 0;
+        while i < 256 {
             let mut c = i as u32;
-            for _ in 0..8 {
+            let mut k = 0;
+            while k < 8 {
                 c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                k += 1;
             }
-            *e = c;
+            t[i] = c;
+            i += 1;
         }
         t
-    });
-    let mut crc = !0u32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
+    };
+    !data.iter().fold(!0u32, |crc, &b| TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8))
 }
 
 #[cfg(test)]
@@ -208,22 +179,70 @@ mod tests {
     #[test]
     fn crc_known_value() {
         assert_eq!(crc32_ieee(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32_ieee(b""), 0);
     }
 
     #[test]
     fn request_response_round_trip() {
         let tx = new_txid();
         let req = request(tx);
+        assert!(is_stun(&req));
         assert_eq!(parse_binding_request(&req), Some(tx));
         let mut bad = req.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert_eq!(parse_binding_request(&bad), None);
+        // A response isn't a request, and vice versa.
+        assert_eq!(parse_response(&req), None);
 
         for a in ["203.0.113.7:41641", "[2001:db8::1]:3478"] {
             let a: SocketAddr = a.parse().unwrap();
             let res = response(tx, a);
+            assert_eq!(parse_binding_request(&res), None);
             assert_eq!(parse_response(&res), Some((tx, a)));
         }
+        // IPv4-mapped IPv6 addresses are reported as IPv4.
+        let res = response(tx, "[::ffff:192.0.2.1]:5".parse().unwrap());
+        assert_eq!(res.len(), 20 + 12);
+        assert_eq!(parse_response(&res), Some((tx, "192.0.2.1:5".parse().unwrap())));
+    }
+
+    #[test]
+    fn requests_need_software_and_trailing_fingerprint() {
+        let tx = [3; 12];
+        // No SOFTWARE attribute: just a fingerprint.
+        let mut b = header(BINDING_REQUEST, FINGERPRINT_LEN, &tx);
+        let fp = fingerprint(&b);
+        put_attr(&mut b, ATTR_FINGERPRINT, &fp.to_be_bytes());
+        assert_eq!(parse_binding_request(&b), None);
+        // A truncated request.
+        let req = request(tx);
+        assert_eq!(parse_binding_request(&req[..req.len() - 2]), None);
+        assert!(!is_stun(&req[..19]));
+    }
+
+    /// A response byte-for-byte as RFC 5769 section 2.2 gives it, less
+    /// its SOFTWARE, MESSAGE-INTEGRITY and FINGERPRINT attributes.
+    #[test]
+    fn parses_rfc5769_ipv4_response() {
+        let tx: TxId = [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
+        let mut b = header(BINDING_SUCCESS, 12, &tx);
+        put_attr(&mut b, ATTR_XOR_MAPPED_ADDRESS, &[0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]);
+        assert_eq!(parse_response(&b), Some((tx, "192.0.2.1:32853".parse().unwrap())));
+        assert_eq!(response(tx, "192.0.2.1:32853".parse().unwrap()), b);
+    }
+
+    #[test]
+    fn falls_back_to_mapped_address() {
+        let tx = [9; 12];
+        let mut b = header(BINDING_SUCCESS, 8 + 12, &tx);
+        put_attr(&mut b, 0x7777, &[1, 2, 3]); // unknown, padded to 4
+        b.push(0);
+        put_attr(&mut b, ATTR_MAPPED_ADDRESS, &[0, 1, 0x12, 0x34, 198, 51, 100, 7]);
+        assert_eq!(parse_response(&b), Some((tx, "198.51.100.7:4660".parse().unwrap())));
+        // An attribute running past the end is rejected.
+        let mut b = header(BINDING_SUCCESS, 8, &tx);
+        b.extend([0x00, 0x20, 0x00, 0x08, 0, 1, 0, 0]);
+        assert_eq!(parse_response(&b), None);
     }
 
     /// A request byte-for-byte as Tailscale's Go stun.Request builds it for
