@@ -49,12 +49,14 @@ fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
 
-/// Go's time.Duration marshals to JSON as integer nanoseconds.
+/// Go's time.Duration marshals to JSON as integer nanoseconds. Longer
+/// durations than it holds (about 292 years) saturate at its maximum
+/// rather than wrapping negative.
 mod nanos {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_i64(d.as_nanos() as i64)
+        s.serialize_i64(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let n = i64::deserialize(d)?;
@@ -80,7 +82,7 @@ pub enum Direction {
 }
 
 /// Test parameters, chosen by the client and validated by the server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Params {
     pub proto: Proto,
     #[serde(rename = "dir")]
@@ -248,7 +250,7 @@ fn unix_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct UdpHeader {
     id: [u8; 8],
     stream: u16,
@@ -479,17 +481,6 @@ pub struct Progress {
     pub rtt: Duration,
 }
 
-/// Awaits every task, in order, skipping any that panicked.
-async fn join_all<T>(tasks: Vec<JoinHandle<T>>) -> Vec<T> {
-    let mut out = Vec::with_capacity(tasks.len());
-    for t in tasks {
-        if let Ok(v) = t.await {
-            out.push(v);
-        }
-    }
-    out
-}
-
 impl Test {
     fn new(p: Params, id: [u8; 8], is_server: bool, ctrl: Ctrl, on_progress: Option<OnProgress>) -> Arc<Test> {
         Arc::new(Test {
@@ -530,6 +521,23 @@ impl Test {
 
     fn err(&self) -> String {
         self.err.lock().unwrap().clone().unwrap_or_default()
+    }
+
+    /// Awaits every stream's task, in order. One that panicked fails the
+    /// test and leaves `None` in its place, so the rest keep their
+    /// stream's index.
+    async fn join_streams<T>(&self, tasks: Vec<JoinHandle<T>>) -> Vec<Option<T>> {
+        let mut out = Vec::with_capacity(tasks.len());
+        for (i, t) in tasks.into_iter().enumerate() {
+            out.push(match t.await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    self.fail(format!("stream {i}: {e}"));
+                    None
+                }
+            });
+        }
+        out
     }
 
     fn attach(&self, index: usize, c: StreamConn) -> bool {
@@ -653,7 +661,7 @@ impl Test {
             } else {
                 // Unused write sides stay open until the test ends, so the
                 // peer doesn't see an early EOF.
-                send_sides
+                send_sides.into_iter().map(Some).collect()
             }
         };
         let receivers = async {
@@ -680,8 +688,13 @@ impl Test {
                 }
             }
         }
-        let err = self.err.lock().unwrap().clone();
-        self.done.set();
+        // Finish under the error lock, so a concurrent fail() either lands
+        // first and is reported, or finds the test already done.
+        let err = {
+            let err = self.err.lock().unwrap();
+            self.done.set();
+            err.clone()
+        };
         drop(held);
         if let Some(e) = err {
             return Err(e);
@@ -731,18 +744,18 @@ impl Test {
         }
     }
 
-    async fn run_senders(self: &Arc<Self>, start: Instant, sides: Vec<SendSide>) -> Vec<SendSide> {
+    async fn run_senders(self: &Arc<Self>, start: Instant, sides: Vec<SendSide>) -> Vec<Option<SendSide>> {
         let tasks = sides.into_iter().enumerate().map(|(i, side)| {
             let t = self.clone();
             tokio::spawn(async move { t.send_stream(i, side, start).await })
         });
-        let mut sides = join_all(tasks.collect()).await;
+        let mut sides = self.join_streams(tasks.collect()).await;
         if self.done.is_set() {
             return sides;
         }
         let stats = Stats { duration: start.elapsed(), ..self.tx.totals() };
         let wire = self.tx.finish(stats);
-        for (i, side) in sides.iter_mut().enumerate() {
+        for (i, side) in sides.iter_mut().enumerate().filter_map(|(i, s)| Some((i, s.as_mut()?))) {
             let r = match side {
                 SendSide::Tcp(w) => w.shutdown().await,
                 SendSide::Udp(c) => {
@@ -827,10 +840,11 @@ impl Test {
             let t = self.clone();
             tokio::spawn(async move { t.recv_stream(i, side).await })
         });
-        let states = join_all(tasks.collect()).await;
+        let states = self.join_streams(tasks.collect()).await;
         if self.done.is_set() {
             return;
         }
+        let states: Vec<_> = states.into_iter().flatten().collect();
         let mut stats = self.rx.totals();
         let first = states.iter().filter_map(|s| s.first).min();
         let last = states.iter().filter_map(|s| s.last).max();
@@ -1075,6 +1089,8 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
         };
         t.attach(i, sc);
     }
+    // Once done, the test's tasks drop their references to it, closing
+    // its connections.
     let r = t.clone().run().await;
     t.done.set();
     r.map_err(|e| anyhow!(e))
@@ -1274,10 +1290,13 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
         r = run_client(&cl, p, progress) => r.map_err(|e| anyhow!("perf: {e}"))?,
         _ = crate::forward::shutdown_signal() => bail!("perf: interrupted"),
     };
-    let after = tokio::time::timeout(Duration::from_secs(3), probe_path(&cl, Duration::from_secs(3)))
-        .await
-        .ok()
-        .and_then(|r| r.ok());
+    let probe = tokio::time::timeout(Duration::from_secs(3), probe_path(&cl, Duration::from_secs(3)));
+    // The test's connections close as it ends, but the TCP stack lives in
+    // this process: let their last segments (in a download, the "result"
+    // the server is waiting for) get out before exiting, or the server
+    // waits out its report timeout, and is busy for new tests meanwhile.
+    let (after, _) = tokio::join!(probe, cl.drain_tcp(Duration::from_secs(5)));
+    let after = after.ok().and_then(|r| r.ok());
     if g.json {
         let mut v = serde_json::json!({ "path": before });
         if let Some(a) = &after {
@@ -1490,7 +1509,13 @@ pub fn go_duration(d: Duration) -> String {
 }
 
 #[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
 mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
     use super::*;
 
     #[test]
@@ -1571,6 +1596,55 @@ mod tests {
         assert_eq!(parse_id(&m.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(parse_id("0102"), None);
         assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
+    }
+
+    /// Any duration, well past the ~292 years Go's time.Duration holds.
+    fn draw_duration(tc: &TestCase) -> Duration {
+        if tc.draw(gs::booleans()) {
+            tc.draw(gs::durations())
+        } else {
+            Duration::new(tc.draw(gs::integers::<u64>()), tc.draw(gs::integers::<u32>().max_value(999_999_999)))
+        }
+    }
+
+    /// Params survive the hello line, with durations saturating at Go's
+    /// limit, and the server judges them as the client would.
+    #[hegel::test]
+    fn params_round_trip(tc: TestCase) {
+        let p = Params {
+            proto: [Proto::Tcp, Proto::Udp][tc.draw(gs::integers::<usize>().max_value(1))],
+            direction: [Direction::Upload, Direction::Download, Direction::Bidirectional]
+                [tc.draw(gs::integers::<usize>().max_value(2))],
+            duration: draw_duration(&tc),
+            bytes: tc.draw(gs::integers()),
+            streams: tc.draw(gs::integers()),
+            length: tc.draw(gs::integers()),
+            bitrate: tc.draw(gs::integers()),
+            interval: draw_duration(&tc),
+        };
+        let line = Message { params: Some(p.clone()), ..Message::new("hello") }.line();
+        let back = serde_json::from_slice::<Message>(&line).unwrap().params.expect("params");
+        let go_max = Duration::from_nanos(i64::MAX as u64);
+        let want = Params { duration: p.duration.min(go_max), interval: p.interval.min(go_max), ..p.clone() };
+        assert_eq!(back, want);
+        let judge = |p: &Params| p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok();
+        assert_eq!(judge(&back), judge(&p), "the server judges {back:?} differently from {p:?}");
+    }
+
+    #[hegel::test]
+    fn udp_header_round_trip(tc: TestCase) {
+        let h = UdpHeader {
+            id: tc.draw(gs::integers::<u64>()).to_be_bytes(),
+            stream: tc.draw(gs::integers()),
+            flags: tc.draw(gs::integers()),
+            seq: tc.draw(gs::integers()),
+            send_time: tc.draw(gs::integers()),
+        };
+        let mut b = vec![0xff; UDP_HEADER_LEN + tc.draw(gs::integers::<usize>().max_value(64))];
+        h.put(&mut b);
+        assert_eq!(b[11..16], [0; 5], "reserved bytes aren't zero");
+        assert_eq!(UdpHeader::parse(&b), Some(h));
+        assert_eq!(UdpHeader::parse(&h.datagram()), Some(h));
     }
 
     #[test]
