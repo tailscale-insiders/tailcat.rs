@@ -473,10 +473,9 @@ impl Stack {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.shared.polled.notified();
-            let busy = self.shared.lock().tcp_sockets().any(|t| {
-                !matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen)
-                    || t.send_queue() > 0
-            });
+            // A closed socket may still have unsent data: it was reset or
+            // aborted, and will never send it.
+            let busy = self.shared.lock().tcp_sockets().any(tcp::Socket::is_active);
             if !busy {
                 // Let the final ACK make it out through the tunnel.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -676,9 +675,12 @@ impl TcpStream {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.shared.polled.notified();
+            // A reset or aborted connection keeps its unsent data, but
+            // will never send it.
             let done = self.with(|s| {
-                s.send_queue() == 0
-                    && !matches!(s.state(), tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck)
+                s.state() == tcp::State::Closed
+                    || s.send_queue() == 0
+                        && !matches!(s.state(), tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck)
             });
             if done || tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return;

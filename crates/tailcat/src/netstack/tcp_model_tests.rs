@@ -969,7 +969,6 @@ fn reused_tuple_reaches_the_policy() {
 /// unacknowledged returns at once: the data stays queued in the closed
 /// socket, but will never be sent. drain and drain_tcp waited it out.
 #[test]
-#[ignore = "known bug: drains wait on data an aborted connection will never send"]
 fn aborted_connection_is_drained() {
     let mut net = Net::new();
     let i = net.dial();
