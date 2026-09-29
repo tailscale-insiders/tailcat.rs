@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use tailcat::{Addr, Client, NodePrivate};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::Global;
@@ -50,11 +50,7 @@ pub async fn classify(host: &str, port: u16) -> Result<Target> {
             addrs.iter().find(|a| a.is_ipv4()).unwrap_or(first).ip()
         }
     };
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    };
-    Ok(Target::Via(SocketAddr::new(ip, port)))
+    Ok(Target::Via(SocketAddr::new(ip.to_canonical(), port)))
 }
 
 /// Dials tailcat servers on behalf of the proxy.
@@ -62,36 +58,41 @@ struct Dialer {
     g: Global,
     key: NodePrivate,
     default: Option<Client>,
-    clients: Mutex<HashMap<String, Client>>,
+    clients: Mutex<HashMap<Addr, Client>>,
 }
 
 impl Dialer {
-    fn client_for(&self, a: &Addr) -> Client {
-        let mut m = self.clients.lock().unwrap();
-        m.entry(a.as_str().to_string())
-            .or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone()))
-            .clone()
-    }
-
-    fn default_client(&self) -> Result<&Client> {
-        self.default
-            .as_ref()
-            .ok_or_else(|| anyhow!("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed"))
+    /// The client that dials `t`.
+    fn client(&self, t: &Target) -> Result<Client> {
+        match t {
+            Target::Addr(a, _) => Ok(self
+                .clients
+                .lock()
+                .unwrap()
+                .entry(a.clone())
+                .or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone()))
+                .clone()),
+            _ => self.default.clone().ok_or_else(|| {
+                anyhow!(
+                    "no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed"
+                )
+            }),
+        }
     }
 
     async fn dial_tcp(&self, t: &Target) -> Result<tailcat::TcpStream> {
-        Ok(match t {
-            Target::Server(p) => self.default_client()?.dial_tcp_port(*p).await?,
-            Target::Addr(a, p) => self.client_for(a).dial_tcp_port(*p).await?,
-            Target::Via(dst) => self.default_client()?.dial_tcp(*dst).await?,
+        let c = self.client(t)?;
+        Ok(match *t {
+            Target::Server(p) | Target::Addr(_, p) => c.dial_tcp_port(p).await?,
+            Target::Via(dst) => c.dial_tcp(dst).await?,
         })
     }
 
     async fn dial_udp(&self, t: &Target) -> Result<tailcat::UdpConn> {
-        Ok(match t {
-            Target::Server(p) => self.default_client()?.dial_udp_port(*p).await?,
-            Target::Addr(a, p) => self.client_for(a).dial_udp_port(*p).await?,
-            Target::Via(dst) => self.default_client()?.dial_udp(*dst).await?,
+        let c = self.client(t)?;
+        Ok(match *t {
+            Target::Server(p) | Target::Addr(_, p) => c.dial_udp_port(p).await?,
+            Target::Via(dst) => c.dial_udp(dst).await?,
         })
     }
 }
@@ -102,6 +103,10 @@ pub fn normalize_listen(s: &str) -> String {
     if let Ok(p) = s.parse::<u16>() {
         return format!("127.0.0.1:{p}");
     }
+    // Before the ":port" check, which "::1" would otherwise match.
+    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        return format!("[{s}]:0");
+    }
     if let Some(port) = s.strip_prefix(':') {
         return format!("0.0.0.0:{}", if port.is_empty() { "0" } else { port });
     }
@@ -111,9 +116,6 @@ pub fn normalize_listen(s: &str) -> String {
     if let Some(h) = s.strip_suffix(':') {
         return format!("{h}:0");
     }
-    if s.contains(':') && s.parse::<std::net::Ipv6Addr>().is_ok() {
-        return format!("[{s}]:0");
-    }
     format!("{s}:0")
 }
 
@@ -121,16 +123,13 @@ pub async fn socks_mode(g: &Global, listen: &str, mut args: Vec<String>) -> Resu
     // The address argument is optional: tailcat address hostnames are
     // dialed directly, so a fixed server is only needed for
     // server.tailcat and exit-node destinations.
-    let mut addr: Option<Addr> = None;
-    if let Some(first) = args.first().cloned() {
-        if Addr::new(first.clone()).parse().is_ok() {
-            addr = Some(Addr::new(first));
-            args.remove(0);
-        } else if first.contains('.') && crate::serve::which(&first).is_none() {
-            addr = Some(crate::addrarg::tailcat_addr_arg(&first).await?);
-            args.remove(0);
+    let addr = match args.first() {
+        Some(first) if Addr::new(first.as_str()).parse().is_ok() => Some(Addr::new(args.remove(0))),
+        Some(first) if first.contains('.') && crate::serve::which(first).is_none() => {
+            Some(crate::addrarg::tailcat_addr_arg(&args.remove(0)).await?)
         }
-    }
+        _ => None,
+    };
     let key = crate::keys::client_key(g)?;
     let default = addr.map(|a| crate::client::new_client(g, a, key.clone()));
     if let Some(c) = &default {
@@ -141,19 +140,18 @@ pub async fn socks_mode(g: &Global, listen: &str, mut args: Vec<String>) -> Resu
     let ln = TcpListener::bind(normalize_listen(listen)).await?;
     let socks_addr = format!("socks5h://{}", ln.local_addr()?);
     let serve = tokio::spawn(serve(ln, dialer));
-    if args.is_empty() {
+    let Some((cmd, cmd_args)) = args.split_first() else {
         eprintln!("SOCKS running at {socks_addr}");
         serve.await?;
         bail!("SOCKS5 server exited");
-    }
+    };
     tracing::debug!("SOCKS running at {socks_addr}");
-    let status = tokio::process::Command::new(&args[0]).args(&args[1..]).env("all_proxy", &socks_addr).status().await?;
+    let status = tokio::process::Command::new(cmd).args(cmd_args).env("all_proxy", &socks_addr).status().await?;
     Ok(ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8))
 }
 
 async fn serve(ln: TcpListener, dialer: Arc<Dialer>) {
-    loop {
-        let Ok((c, peer)) = ln.accept().await else { return };
+    while let Ok((c, peer)) = ln.accept().await {
         let d = dialer.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(c, d).await {
@@ -170,52 +168,50 @@ const REP_ADDR_TYPE_NOT_SUPPORTED: u8 = 8;
 
 async fn reply(c: &mut TcpStream, rep: u8, bound: SocketAddr) -> std::io::Result<()> {
     let mut b = vec![5, rep, 0];
-    put_addr(&mut b, &bound);
+    put_addr(&mut b, &bound.ip().to_string(), bound.port());
     c.write_all(&b).await
 }
 
-fn put_addr(b: &mut Vec<u8>, a: &SocketAddr) {
-    match a.ip() {
-        IpAddr::V4(v4) => {
+/// Appends a SOCKS address (ATYP, address, port): an IP address, or
+/// else a domain name.
+fn put_addr(b: &mut Vec<u8>, host: &str, port: u16) {
+    match host.parse() {
+        Ok(IpAddr::V4(v4)) => {
             b.push(1);
-            b.extend_from_slice(&v4.octets());
+            b.extend(v4.octets());
         }
-        IpAddr::V6(v6) => {
+        Ok(IpAddr::V6(v6)) => {
             b.push(4);
-            b.extend_from_slice(&v6.octets());
+            b.extend(v6.octets());
+        }
+        Err(_) => {
+            b.extend([3, host.len() as u8]);
+            b.extend(host.as_bytes());
         }
     }
-    b.extend_from_slice(&a.port().to_be_bytes());
+    b.extend(port.to_be_bytes());
 }
 
 /// Reads a SOCKS address (ATYP, address, port) from `r`.
-async fn read_addr<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<(String, u16)> {
-    let atyp = r.read_u8().await?;
-    let host = match atyp {
-        1 => {
-            let mut a = [0u8; 4];
-            r.read_exact(&mut a).await?;
-            IpAddr::from(a).to_string()
-        }
+async fn read_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(String, u16)> {
+    let mut b = vec![r.read_u8().await?];
+    let len = match b[0] {
+        1 => 4,
         3 => {
-            let n = r.read_u8().await? as usize;
-            let mut h = vec![0u8; n];
-            r.read_exact(&mut h).await?;
-            String::from_utf8(h).map_err(|_| anyhow!("bad hostname"))?
+            b.push(r.read_u8().await?);
+            b[1] as usize
         }
-        4 => {
-            let mut a = [0u8; 16];
-            r.read_exact(&mut a).await?;
-            IpAddr::from(a).to_string()
-        }
-        _ => bail!("unsupported address type {atyp}"),
+        4 => 16,
+        atyp => bail!("unsupported address type {atyp}"),
     };
-    let port = r.read_u16().await?;
-    Ok((host, port))
+    let start = b.len();
+    b.resize(start + len + 2, 0);
+    r.read_exact(&mut b[start..]).await?;
+    let (addr, _) = parse_addr(&b).ok_or_else(|| anyhow!("bad hostname"))?;
+    Ok(addr)
 }
 
-/// Parses a SOCKS address from a UDP datagram, returning it and the
-/// rest of the datagram.
+/// Parses a SOCKS address, returning it and the rest of the input.
 fn parse_addr(b: &[u8]) -> Option<((String, u16), &[u8])> {
     let (host, rest) = match *b.first()? {
         1 => (IpAddr::from(<[u8; 4]>::try_from(b.get(1..5)?).ok()?).to_string(), &b[5..]),
@@ -226,8 +222,8 @@ fn parse_addr(b: &[u8]) -> Option<((String, u16), &[u8])> {
         4 => (IpAddr::from(<[u8; 16]>::try_from(b.get(1..17)?).ok()?).to_string(), &b[17..]),
         _ => return None,
     };
-    let port = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
-    Some(((host, port), &rest[2..]))
+    let (port, rest) = rest.split_first_chunk()?;
+    Some(((host, u16::from_be_bytes(*port)), rest))
 }
 
 async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
@@ -259,19 +255,14 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
         1 => {
             // The socks5 dial timeout is also WireGuard's handshake
             // retransmit interval, so be generous.
-            let dial = async {
-                let t = classify(&host, port).await?;
-                d.dial_tcp(&t).await
-            };
-            let remote = match tokio::time::timeout(Duration::from_secs(15), dial).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+            let dial = tokio::time::timeout(Duration::from_secs(15), async {
+                d.dial_tcp(&classify(&host, port).await?).await
+            });
+            let remote = match dial.await.unwrap_or_else(|_| Err(anyhow!("dial {host}:{port}: timed out"))) {
+                Ok(r) => r,
+                Err(e) => {
                     reply(&mut c, REP_HOST_UNREACHABLE, zero).await?;
                     return Err(e);
-                }
-                Err(_) => {
-                    reply(&mut c, REP_HOST_UNREACHABLE, zero).await?;
-                    bail!("dial {host}:{port}: timed out");
                 }
             };
             reply(&mut c, REP_SUCCESS, zero).await?;
@@ -321,21 +312,13 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
                         flows.lock().unwrap().insert(dst.clone(), f.clone());
                         // Replies from this flow go back to the client,
                         // wrapped with the destination's address.
-                        let (f2, sock2, ca, dst2) = (f.clone(), sock.clone(), client_addr.clone(), dst.clone());
+                        let (f2, sock2, ca) = (f.clone(), sock.clone(), client_addr.clone());
                         tokio::spawn(async move {
                             let mut b = vec![0u8; 65535];
                             while let Ok(n) = f2.recv(&mut b).await {
                                 let Some(to) = *ca.lock().unwrap() else { continue };
                                 let mut out = vec![0, 0, 0];
-                                match dst2.0.parse::<IpAddr>() {
-                                    Ok(ip) => put_addr(&mut out, &SocketAddr::new(ip, dst2.1)),
-                                    Err(_) => {
-                                        out.push(3);
-                                        out.push(dst2.0.len() as u8);
-                                        out.extend_from_slice(dst2.0.as_bytes());
-                                        out.extend_from_slice(&dst2.1.to_be_bytes());
-                                    }
-                                }
+                                put_addr(&mut out, &dst.0, dst.1);
                                 out.extend_from_slice(&b[..n]);
                                 let _ = sock2.send_to(&out, to).await;
                             }
@@ -351,7 +334,7 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     let mut sink = [0u8; 64];
     tokio::select! {
         _ = relay => {}
-        _ = async { while let Ok(n) = c.read(&mut sink).await { if n == 0 { break } } } => {}
+        _ = async { while c.read(&mut sink).await.is_ok_and(|n| n > 0) {} } => {}
     }
     for f in flows.lock().unwrap().values() {
         f.close();
@@ -363,22 +346,30 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
 mod tests {
     use super::*;
 
+    const ADDR: &str = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu";
+
     #[tokio::test]
     async fn classifies_destinations() {
         assert_eq!(classify("server.tailcat", 80).await.unwrap(), Target::Server(80));
         assert_eq!(classify("", 80).await.unwrap(), Target::Server(80));
-        let a = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu";
-        assert_eq!(classify(a, 81).await.unwrap(), Target::Addr(Addr::new(a), 81));
+        assert_eq!(classify(ADDR, 81).await.unwrap(), Target::Addr(Addr::new(ADDR), 81));
         assert_eq!(classify("10.1.2.3", 22).await.unwrap(), Target::Via("10.1.2.3:22".parse().unwrap()));
         assert_eq!(classify("::ffff:10.1.2.3", 22).await.unwrap(), Target::Via("10.1.2.3:22".parse().unwrap()));
+        assert_eq!(classify("fd7a::1", 22).await.unwrap(), Target::Via("[fd7a::1]:22".parse().unwrap()));
+        assert_eq!(classify("localhost", 22).await.unwrap(), Target::Via("127.0.0.1:22".parse().unwrap()));
     }
 
     #[test]
     fn listen_addrs() {
         assert_eq!(normalize_listen("1080"), "127.0.0.1:1080");
         assert_eq!(normalize_listen(":1080"), "0.0.0.0:1080");
+        assert_eq!(normalize_listen(":"), "0.0.0.0:0");
         assert_eq!(normalize_listen("127.0.0.1:0"), "127.0.0.1:0");
         assert_eq!(normalize_listen("0.0.0.0"), "0.0.0.0:0");
+        assert_eq!(normalize_listen("localhost:"), "localhost:0");
+        assert_eq!(normalize_listen("[::1]:5"), "[::1]:5");
+        assert_eq!(normalize_listen("::1"), "[::1]:0");
+        assert_eq!(normalize_listen("fd7a::1"), "[fd7a::1]:0");
     }
 
     #[test]
@@ -386,5 +377,57 @@ mod tests {
         let b = [3, 3, b'a', b'b', b'c', 0, 53, 9, 9];
         let ((h, p), rest) = parse_addr(&b).unwrap();
         assert_eq!((h.as_str(), p, rest), ("abc", 53, &[9u8, 9][..]));
+        // Truncated or unknown addresses don't parse.
+        for bad in [&[][..], &[1, 1, 2, 3, 4, 0], &[3, 5, b'a', 0, 1], &[4; 17], &[2, 0, 0], &[3, 1, 0xff, 0, 1]] {
+            assert!(parse_addr(bad).is_none(), "{bad:?} parsed");
+        }
+    }
+
+    #[tokio::test]
+    async fn addrs_round_trip() {
+        for (host, port) in [("10.1.2.3", 80), ("fd7a:115c:a1e0::1", 443), ("example.com", 53)] {
+            let mut b = Vec::new();
+            put_addr(&mut b, host, port);
+            b.push(7);
+            assert_eq!(parse_addr(&b), Some(((host.to_string(), port), &[7][..])));
+            assert_eq!(read_addr(&mut &b[..]).await.unwrap(), (host.to_string(), port));
+        }
+        assert!(read_addr(&mut &[9u8, 0, 0][..]).await.is_err());
+        assert!(read_addr(&mut &[1u8, 1, 2][..]).await.is_err());
+    }
+
+    /// Runs the proxy with no default server and returns its address.
+    async fn proxy() -> SocketAddr {
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = ln.local_addr().unwrap();
+        let g = Global { key: None, verbose: false, json: false, derpmap_url: String::new() };
+        let d = Dialer { g, key: NodePrivate::generate(), default: None, clients: Mutex::default() };
+        tokio::spawn(serve(ln, Arc::new(d)));
+        a
+    }
+
+    async fn roundtrip(a: SocketAddr, send: &[u8], want: usize) -> Vec<u8> {
+        let mut c = TcpStream::connect(a).await.unwrap();
+        c.write_all(send).await.unwrap();
+        let mut got = vec![0; want];
+        c.read_exact(&mut got).await.unwrap();
+        got
+    }
+
+    #[tokio::test]
+    async fn handshakes() {
+        let a = proxy().await;
+        // Only "no authentication" is acceptable.
+        assert_eq!(roundtrip(a, &[5, 1, 2], 2).await, [5, 0xff]);
+        let ok_reply = |rep| vec![5, 0, 5, rep, 0, 1, 0, 0, 0, 0, 0, 0];
+        // BIND isn't supported.
+        let bind = [5, 1, 0, 5, 2, 0, 1, 127, 0, 0, 1, 0, 80];
+        assert_eq!(roundtrip(a, &bind, 12).await, ok_reply(REP_COMMAND_NOT_SUPPORTED));
+        // Nor are unknown address types.
+        assert_eq!(roundtrip(a, &[5, 1, 0, 5, 1, 0, 9], 12).await, ok_reply(REP_ADDR_TYPE_NOT_SUPPORTED));
+        // Without a server argument, only tailcat address hostnames can
+        // be dialed.
+        let connect = [&[5, 1, 0, 5, 1, 0, 3, 14][..], b"server.tailcat", &[0, 80]].concat();
+        assert_eq!(roundtrip(a, &connect, 12).await, ok_reply(REP_HOST_UNREACHABLE));
     }
 }

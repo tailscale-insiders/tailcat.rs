@@ -48,8 +48,8 @@ pub fn validate_dns_name(name: &str) -> std::result::Result<(), String> {
         if label.starts_with('-') || label.ends_with('-') {
             return Err("name contains a label beginning or ending with a hyphen".into());
         }
-        if let Some(c) = label.bytes().find(|c| !(c.is_ascii_alphanumeric() || *c == b'-')) {
-            return Err(format!("name contains invalid character {:?}", c as char));
+        if let Some(c) = label.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '-')) {
+            return Err(format!("name contains invalid character {c:?}"));
         }
     }
     Ok(())
@@ -58,11 +58,9 @@ pub fn validate_dns_name(name: &str) -> std::result::Result<(), String> {
 /// Looks up the `tailcat=` TXT record of `name`.
 pub async fn lookup_txt(name: &str) -> Result<Addr> {
     let resolver = hickory_resolver::Resolver::builder_tokio()
-        .map_err(|e| anyhow!("DNS resolver: {e}"))?
-        .build()
+        .and_then(|b| b.build())
         .map_err(|e| anyhow!("DNS resolver: {e}"))?;
-    let fut = resolver.txt_lookup(name);
-    let res = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), resolver.txt_lookup(name))
         .await
         .map_err(|_| anyhow!("looking up TXT record for {name:?}: timeout"))?
         .map_err(|e| anyhow!("looking up TXT record for {name:?}: {e}"))?;
@@ -86,6 +84,7 @@ pub async fn tailcat_addr_arg(arg: &str) -> Result<Addr> {
 }
 
 /// Like [`tailcat_addr_arg`], also reporting whether it came from DNS.
+#[cfg(feature = "ssh")]
 pub async fn validated_addr(arg: &str) -> Result<(Addr, bool)> {
     let via_dns = arg.contains('.');
     let a = if via_dns { tailcat_addr_arg(arg).await? } else { Addr::new(arg) };
@@ -108,5 +107,36 @@ mod tests {
         assert!(classify(&format!("{ADDR}.example.com")).is_err());
         assert!(classify("bad_name.com").is_err());
         assert!(classify("-x.com").is_err());
+        // A fully qualified name keeps its dot for the lookup.
+        assert_eq!(classify("example.com.").unwrap(), AddrArg::Dns("example.com.".into()));
+        assert!(classify("a..b").is_err());
+    }
+
+    #[test]
+    fn dns_names() {
+        assert!(validate_dns_name("a-b.example.com").is_ok());
+        assert!(validate_dns_name(&format!("{}.com", "a".repeat(63))).is_ok());
+        let cases: [(&str, &str); 8] = [
+            ("", "name is empty"),
+            (&format!("{}.com", "a".repeat(64)), "longer than 63"),
+            (&vec!["a".repeat(60); 5].join("."), "longer than 253"),
+            ("x.-a", "hyphen"),
+            ("a-.x", "hyphen"),
+            ("a.b.", "empty label"),
+            ("caf\u{e9}.fr", "invalid character '\u{e9}'"),
+            ("a b.c", "invalid character ' '"),
+        ];
+        for (name, want) in cases {
+            let e = validate_dns_name(name).unwrap_err();
+            assert!(e.contains(want), "{name:?}: {e}");
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn validated_addrs() {
+        let (a, via_dns) = validated_addr(ADDR).await.unwrap();
+        assert_eq!((a.as_str(), via_dns), (ADDR, false));
+        assert!(validated_addr("tcnope").await.unwrap_err().to_string().contains("invalid tailcat address"));
     }
 }

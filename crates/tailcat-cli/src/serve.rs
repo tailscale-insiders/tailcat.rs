@@ -1,20 +1,20 @@
 //! Server mode: `tailcat`, `tailcat serve`, `tailcat recv`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
-    Addr, ConnInfo, DerpRegion, FetchMode, FetchOptions, KeySet, NodePublic, PortRange, PresharedKey, PrivateKey,
-    Server, TcpStream, UdpConn, handler, udp_handler,
+    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpStream, UdpConn,
+    handler, udp_handler,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-use crate::cache::DiskDerpMapCache;
-use crate::{Global, ServeFlags, usagef};
+use crate::perf::PORT as PERF_PORT;
+use crate::{Global, ServeFlags};
 
 /// The services `serve` knows by name.
 const SERVICES: &[&str] = &["all", "ssh", "no-auth-ssh", "files", "exec", "exit-node", "perf"];
@@ -56,42 +56,37 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
     if s.is_empty() {
         return Ok(ps);
     }
-    for r in s.split(',') {
-        let r = r.trim();
+    for r in s.split(',').map(str::trim) {
         match r {
-            "all" => {
-                ps.all = true;
-                continue;
-            }
+            "all" => ps.all = true,
             "ssh" | "no-auth-ssh" | "files" if !cfg!(feature = "ssh") => {
                 bail!("SSH support not included in this build");
             }
-            "ssh" | "no-auth-ssh" | "files" | "exit-node" | "exec" | "perf" => {
+            _ if SERVICES.contains(&r) => {
                 ps.services.insert(r.to_string());
-                continue;
             }
-            _ => {}
-        }
-        if let Some((port, target)) = r.split_once(':') {
-            let (port, target) = parse_port_target(port, target)?;
-            if let Some(prev) = ps.targets.get(&port)
-                && *prev != target
-            {
-                bail!("port {port} is mapped to both {prev} and {target}");
+            _ => {
+                if let Some((port, target)) = r.split_once(':') {
+                    let (port, target) = parse_port_target(port, target)?;
+                    if let Some(prev) = ps.targets.get(&port)
+                        && *prev != target
+                    {
+                        bail!("port {port} is mapped to both {prev} and {target}");
+                    }
+                    ps.ports.insert(port);
+                    ps.targets.insert(port, target);
+                    continue;
+                }
+                let (a, b) = match r.split_once('-') {
+                    Some((a, b)) if is_num(a) && is_num(b) => (a, b),
+                    _ if is_num(r) => (r, r),
+                    _ => bail!("{r:?} is not a known named service (want one of: {})", SERVICES.join(", ")),
+                };
+                let lo: u16 = a.parse().map_err(|_| anyhow!("{a:?} is not a valid port"))?;
+                let hi: u16 = b.parse().map_err(|_| anyhow!("{b:?} is not a valid port number"))?;
+                ps.ports.extend(lo.min(hi)..=lo.max(hi));
             }
-            ps.ports.insert(port);
-            ps.targets.insert(port, target);
-            continue;
         }
-        let (a, b) = match r.split_once('-') {
-            Some((a, b)) if is_num(a) && is_num(b) => (a, b),
-            _ if is_num(r) => (r, r),
-            _ => bail!("{r:?} is not a known named service (want one of: {})", SERVICES.join(", ")),
-        };
-        let lo: u16 = a.parse().map_err(|_| anyhow!("{a:?} is not a valid port"))?;
-        let hi: u16 = b.parse().map_err(|_| anyhow!("{b:?} is not a valid port number"))?;
-        let (lo, hi) = if hi < lo { (hi, lo) } else { (lo, hi) };
-        ps.ports.extend(lo..=hi);
     }
     Ok(ps)
 }
@@ -105,7 +100,7 @@ pub fn parse_port_target(port: &str, target: &str) -> Result<(u16, String)> {
         .filter(|p| *p != 0)
         .ok_or_else(|| anyhow!("{port:?} is not a valid port in mapping {mapping:?}"))?;
     if is_num(target) {
-        let _: u16 = target.parse().map_err(|_| anyhow!("{target:?} is not a valid port in mapping {mapping:?}"))?;
+        target.parse::<u16>().map_err(|_| anyhow!("{target:?} is not a valid port in mapping {mapping:?}"))?;
         return Ok((p, format!("localhost:{target}")));
     }
     let (host, tport) = crate::util::split_host_port(target)
@@ -162,19 +157,16 @@ pub async fn proxy_and_drain(c: TcpStream, local: tokio::net::TcpStream) {
 }
 
 async fn udp_forward_to(dst: SocketAddr, c: UdpConn) {
-    let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
-    let sock = match tokio::net::UdpSocket::bind(bind).await {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("error proxying to {dst}: {e}");
-            return;
-        }
+    let any = if dst.is_ipv4() { Ipv4Addr::UNSPECIFIED.into() } else { Ipv6Addr::UNSPECIFIED.into() };
+    let sock = async {
+        let sock = tokio::net::UdpSocket::bind(SocketAddr::new(any, 0)).await?;
+        sock.connect(dst).await?;
+        std::io::Result::Ok(sock)
     };
-    if let Err(e) = sock.connect(dst).await {
-        debug!("error proxying to {dst}: {e}");
-        return;
+    match sock.await {
+        Ok(sock) => tailcat::proxy_packet_conns(&c, &sock, tailcat::DEFAULT_UDP_IDLE_TIMEOUT).await,
+        Err(e) => debug!("error proxying to {dst}: {e}"),
     }
-    tailcat::proxy_packet_conns(&c, &sock, tailcat::DEFAULT_UDP_IDLE_TIMEOUT).await;
 }
 
 /// Runs a server until killed.
@@ -184,19 +176,14 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     let exec_args = match exec_args {
         Some(a) if a.is_empty() => bail!("no command given after --"),
         Some(mut a) => {
-            let exe = which(&a[0]).with_context(|| format!("exec command: {:?} not found", a[0]))?;
-            a[0] = exe;
+            a[0] = which(&a[0]).with_context(|| format!("exec command: {:?} not found", a[0]))?;
             if !services.contains("ssh") && !services.contains("no-auth-ssh") {
                 services.insert("exec".into());
             }
             Some(a)
         }
-        None => {
-            if services.contains("exec") {
-                bail!("the 'exec' service requires a command after --");
-            }
-            None
-        }
+        None if services.contains("exec") => bail!("the 'exec' service requires a command after --"),
+        None => None,
     };
     if flags.files.is_some() {
         if !cfg!(feature = "ssh") {
@@ -204,12 +191,14 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         }
         services.insert("files".into());
     }
-    let serve_perf = services.contains("perf");
-    if serve_perf && ps.contains(crate::perf::PORT) {
-        bail!("port {} is used by the 'perf' service and cannot also be proxied", crate::perf::PORT);
+    let has = |s: &str| services.contains(s);
+    let (ssh_auth, ssh_noauth, serve_perf, exit_node, serve_exec) =
+        (has("ssh"), has("no-auth-ssh"), has("perf"), has("exit-node"), has("exec"));
+    let ssh_shell = ssh_auth || ssh_noauth;
+    let ssh_services = ssh_shell || has("files");
+    if serve_perf && ps.contains(PERF_PORT) {
+        bail!("port {PERF_PORT} is used by the 'perf' service and cannot also be proxied");
     }
-    let ssh_auth = services.contains("ssh");
-    let ssh_noauth = services.contains("no-auth-ssh");
     if ssh_auth && ssh_noauth {
         bail!("the 'ssh' and 'no-auth-ssh' services cannot be served together");
     }
@@ -222,7 +211,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     if flags.ssh_authorized_keys.is_some() && !ssh_auth {
         bail!("--ssh-authorized-keys requires the 'ssh' service");
     }
-    if (ssh_auth || ssh_noauth) && exec_args.is_some() && services.contains("files") {
+    if ssh_shell && exec_args.is_some() && has("files") {
         bail!("the 'files' service cannot be served with an SSH -- command, which allows nothing but that command");
     }
     #[cfg(feature = "ssh")]
@@ -240,99 +229,74 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         None
     };
 
-    // Which key.
-    let key_name = match g.key.as_deref() {
-        None | Some("") => {
-            if crate::keys::key_path("default")?.exists() {
-                "default".to_string()
-            } else {
-                "new".to_string()
-            }
-        }
-        Some(k) => k.to_string(),
-    };
-    let (private, mut ci) = if key_name == "new" {
+    let key_name = crate::keys::key_name(g, "default")?;
+    let new_key = key_name == "new";
+    let (private, mut ci) = if new_key {
         let k = PrivateKey::generate();
-        let mut ci = k.public.clone();
-        ci.region_id = -1;
-        (k.private, ci)
+        (k.private, ConnInfo { region_id: -1, ..k.public })
     } else {
         let k = crate::keys::load(&key_name)?;
         (k.private, k.public)
     };
-    let mut use_psk = flags.psk.unwrap_or(true);
-    if key_name != "new" && ci.preshared_key.is_zero() && flags.psk.is_none() {
-        // Saved keys remember whether they use a PSK.
-        use_psk = false;
-    }
+    // Saved keys remember whether they use a PSK.
+    let use_psk = flags.psk.unwrap_or(new_key || !ci.preshared_key.is_zero());
     if use_psk && ci.preshared_key.is_zero() {
         bail!("key file {} has no WireGuard pre-shared key", crate::keys::key_path(&key_name)?.display());
     }
-    if !use_psk {
-        ci.preshared_key = PresharedKey::default();
-    }
-    let psk = ci.preshared_key;
+    let psk = if use_psk { ci.preshared_key } else { PresharedKey::default() };
 
-    let (region, print_ci) = match &dev_derp {
-        Some(d) => {
-            let ci = ConnInfo { preshared_key: psk, region: vec![d.region.clone()], ..Default::default() };
-            (d.region.clone(), ci)
-        }
+    let (region, embed) = match &dev_derp {
+        Some(d) => (d.region.clone(), true),
         None => {
             // A key with custom DERP hostnames has regions with no map ID,
             // so its address always embeds them.
             let embed = flags.full_address || !ci.region.is_empty();
-            let cache = DiskDerpMapCache;
-            ci.expand(FetchOptions { url: Some(&g.derpmap_url), mode: FetchMode::Server, cache: Some(&cache) }, None)
+            ci.expand(crate::cache::fetch_options(g, FetchMode::Server), None)
                 .await
                 .map_err(|e| anyhow!("Expand: {e}"))?;
-            let mut reg = ci.region[0].clone();
+            let mut reg = ci.region.swap_remove(0);
             clear_unnecessary_region_fields(&mut reg);
             eprintln!("# Selected bootstrap relay region {}, {}", reg.region_id, reg.region_name);
-            let print = if embed {
-                ConnInfo { preshared_key: psk, region: vec![reg.clone()], ..Default::default() }
-            } else {
-                ConnInfo { preshared_key: psk, region_id: reg.region_id, ..Default::default() }
-            };
-            (reg, print)
+            (reg, embed)
         }
     };
-    let print_ci =
-        ConnInfo { server_public: private.public(), server_disco_public: private.disco_private().public(), ..print_ci };
-    let conn_str = print_ci.addr();
+    let conn_str = ConnInfo {
+        server_public: private.public(),
+        server_disco_public: private.disco_private().public(),
+        preshared_key: psk,
+        region: if embed { vec![region.clone()] } else { Vec::new() },
+        region_id: if embed { 0 } else { region.region_id },
+    }
+    .addr();
 
     let mut b =
         Server::builder().key(private.clone()).preshared_key(psk).disable_preshared_key(!use_psk).region(region);
 
-    let ssh_services = services.contains("ssh") || services.contains("no-auth-ssh") || services.contains("files");
     // Outside the accept-one-connection mode (and exit-node and exec,
     // which accept any port), admit only the served ports.
-    if !one_shot_stdout && !services.contains("exit-node") && !services.contains("exec") {
+    if !one_shot_stdout && !exit_node && !serve_exec {
         let mut ports = ps.sorted_ports();
         if ssh_services && !ps.contains(22) {
             ports.insert(0, 22);
         }
         if serve_perf {
-            ports.push(crate::perf::PORT);
+            ports.push(PERF_PORT);
             ports.sort();
         }
         b = b.served_tcp_ports(PortRange::coalesce(&ports));
     }
     if serve_perf {
-        b = b.served_udp_ports(vec![PortRange::single(crate::perf::PORT)]);
+        b = b.served_udp_ports(vec![PortRange::single(PERF_PORT)]);
     }
     if let Some(allow) = &flags.allow {
         let set = KeySet::default();
-        for ks in allow.split(',') {
-            if ks == "none" {
-                continue; // an empty set allows no clients
-            }
-            let k: NodePublic = ks.parse().map_err(|e| anyhow!("invalid key {ks:?} in --allow: {e}"))?;
-            set.add(k);
+        // "none" adds nothing, and an empty set allows no clients.
+        for ks in allow.split(',').filter(|&k| k != "none") {
+            set.add(ks.parse().map_err(|e| anyhow!("invalid key {ks:?} in --allow: {e}"))?);
         }
         b = b.allow_client(set.checker());
     }
-    if services.contains("exit-node") {
+    if exit_node {
         b = b
             .on_tcp_forward(|dst| Some(handler(move |c| proxy_to_local(dst.to_string(), c))))
             .on_udp_forward(|dst| Some(udp_handler(move |c| udp_forward_to(dst, c))));
@@ -340,22 +304,16 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
 
     // Handlers that need the server itself (for peer identity, draining)
     // get it through this cell, filled in after start.
-    let me: Arc<OnceLock<Server>> = Arc::new(OnceLock::new());
+    let me: Arc<OnceLock<Server>> = Arc::default();
 
     #[cfg(feature = "ssh")]
     let ssh_handler = if ssh_services {
-        let mut opts = tailcat::ssh::SshOptions {
-            shell: services.contains("ssh") || services.contains("no-auth-ssh"),
-            authorized_keys,
-            ..Default::default()
-        };
-        if opts.shell
-            && let Some(a) = &exec_args
-        {
+        let mut opts = tailcat::ssh::SshOptions { shell: ssh_shell, authorized_keys, ..Default::default() };
+        if ssh_shell && let Some(a) = &exec_args {
             opts.exec = a.clone();
             eprintln!("# SSH sessions run only {}", a.join(" "));
         }
-        if services.contains("files") {
+        if has("files") {
             let (fs, mode_name) = parse_files_flag(flags.files.as_deref().unwrap_or(""))?;
             eprintln!("# Serving files from {} ({mode_name})", fs.dir.display());
             opts.files = Some(fs);
@@ -364,104 +322,83 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     } else {
         None
     };
+    // Without SSH support, no SSH service gets past the checks above.
     #[cfg(not(feature = "ssh"))]
-    let ssh_handler: Option<tailcat::TcpHandler> = {
-        if ssh_services {
-            bail!("SSH server not supported in this build");
-        }
-        None
-    };
+    let ssh_handler: Option<tailcat::TcpHandler> = None;
 
     let perf_srv = if serve_perf {
-        let p = Arc::new(crate::perf::Server::new());
+        let p = Arc::new(crate::perf::Server::default());
         let pu = p.clone();
         b = b.on_udp(move |port| {
-            if port != crate::perf::PORT {
-                return None;
-            }
             let pu = pu.clone();
-            Some(udp_handler(move |c| {
-                let pu = pu.clone();
-                async move { pu.handle_udp(c).await }
-            }))
+            (port == PERF_PORT).then(|| udp_handler(move |c| pu.clone().handle_udp(c)))
         });
-        eprintln!("# Accepting perf tests on TCP and UDP port {}", crate::perf::PORT);
+        eprintln!("# Accepting perf tests on TCP and UDP port {PERF_PORT}");
         Some(p)
     } else {
         None
     };
 
-    let exec_handler = match (&exec_args, services.contains("exec")) {
-        (Some(a), true) => {
-            eprintln!("# Running {} for each connection", a.join(" "));
-            Some(a.clone())
-        }
-        _ => None,
-    };
+    let exec_cmd = exec_args.clone().filter(|_| serve_exec);
+    if let Some(a) = &exec_cmd {
+        eprintln!("# Running {} for each connection", a.join(" "));
+    }
     for (port, t) in &ps.targets {
         eprintln!("# Proxying port {port} to {t}");
     }
 
-    let exit_node = services.contains("exit-node");
     let ps = Arc::new(ps);
-    let me2 = me.clone();
-    let exec_h: Arc<OnceLock<tailcat::TcpHandler>> = Arc::new(OnceLock::new());
-    let exec_h2 = exec_h.clone();
-    b = b.on_tcp(move |port| {
-        if port == 22
-            && let Some(h) = &ssh_handler
-        {
-            return Some(h.clone());
-        }
-        if port == crate::perf::PORT
-            && let Some(p) = &perf_srv
-        {
-            let p = p.clone();
-            return Some(handler(move |c| {
+    let exec_h: Arc<OnceLock<tailcat::TcpHandler>> = Arc::default();
+    b = b.on_tcp({
+        let (me, exec_h) = (me.clone(), exec_h.clone());
+        move |port| {
+            if port == 22
+                && let Some(h) = &ssh_handler
+            {
+                return Some(h.clone());
+            }
+            if port == PERF_PORT
+                && let Some(p) = &perf_srv
+            {
                 let p = p.clone();
-                async move { p.handle_tcp(c).await }
-            }));
+                return Some(handler(move |c| p.clone().handle_tcp(c)));
+            }
+            if ps.contains(port) {
+                let t = ps.targets.get(&port).cloned().unwrap_or_else(|| format!("localhost:{port}"));
+                return Some(handler(move |c| proxy_to_local(t.clone(), c)));
+            }
+            if let Some(h) = exec_h.get() {
+                return Some(h.clone());
+            }
+            if exit_node {
+                // Being an exit node includes localhost's ports too.
+                return Some(handler(move |c| proxy_to_local(format!("localhost:{port}"), c)));
+            }
+            if one_shot_stdout {
+                let me = me.clone();
+                return Some(handler(move |c| one_shot(me.clone(), c)));
+            }
+            None
         }
-        if ps.contains(port) {
-            let t = ps.targets.get(&port).cloned().unwrap_or_else(|| format!("localhost:{port}"));
-            return Some(handler(move |c| proxy_to_local(t.clone(), c)));
-        }
-        if let Some(h) = exec_h2.get() {
-            return Some(h.clone());
-        }
-        if exit_node {
-            // Being an exit node includes localhost's ports too.
-            return Some(handler(move |c| proxy_to_local(format!("localhost:{port}"), c)));
-        }
-        if one_shot_stdout {
-            let me = me2.clone();
-            return Some(handler(move |c| one_shot(me.clone(), c)));
-        }
-        None
     });
 
     let s = b.start().await.map_err(|e| anyhow!("Server.Start: {e}"))?;
     let _ = me.set(s.clone());
-    if let Some(a) = exec_handler {
+    if let Some(a) = exec_cmd {
         let _ = exec_h.set(s.exec_conn_handler(a));
     }
     if psk.is_zero() {
-        if key_name == "new" {
+        if new_key {
             eprintln!("# ⚠️ WARNING: serving without a WireGuard PSK");
         } else {
             eprintln!("# ⚠️ WARNING: saved key {key_name:?} is not using a WireGuard PSK");
         }
     }
     if ssh_noauth && flags.allow.is_none() {
-        if exec_args.is_some() {
-            eprintln!(
-                "# ⚠️ WARNING: no-auth-ssh runs the command for anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow"
-            );
-        } else {
-            eprintln!(
-                "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow"
-            );
-        }
+        let gives = if exec_args.is_some() { "runs the command for" } else { "gives a shell to" };
+        eprintln!(
+            "# ⚠️ WARNING: no-auth-ssh {gives} anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow"
+        );
     }
     if let Some(d) = &dev_derp
         && !d.wait_for_client(&private.public(), Duration::from_secs(30)).await
@@ -471,10 +408,9 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     announce(g, &key_name, &conn_str).await?;
 
     if std::env::var("TAILCAT_STATUS_LOOP").as_deref() == Ok("1") {
-        let s2 = s.clone();
         tokio::spawn(async move {
             loop {
-                eprintln!("status = {:?}", s2.status());
+                eprintln!("status = {:?}", s.status());
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
@@ -493,36 +429,21 @@ async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
     if g.json {
         println!("{}", serde_json::json!({ "listenAddr": conn_str.as_str() }));
     }
-    if let Ok(v) = std::env::var("TAILCAT_ADDR_FILE")
-        && !v.is_empty()
-    {
-        if let Some(tcp) = v.strip_prefix("tcp:") {
-            let mut c = tokio::net::TcpStream::connect(tcp)
-                .await
-                .map_err(|e| anyhow!("TAILCAT_ADDR_FILE tcp dial {tcp:?}: {e}"))?;
-            c.write_all(format!("{conn_str}\n").as_bytes()).await?;
-            c.shutdown().await?;
-        } else {
-            write_private(&v, conn_str.as_str().as_bytes())?;
-        }
+    match std::env::var("TAILCAT_ADDR_FILE") {
+        Ok(v) if v.is_empty() => {}
+        Ok(v) => match v.strip_prefix("tcp:") {
+            Some(tcp) => {
+                let mut c = tokio::net::TcpStream::connect(tcp)
+                    .await
+                    .map_err(|e| anyhow!("TAILCAT_ADDR_FILE tcp dial {tcp:?}: {e}"))?;
+                c.write_all(format!("{conn_str}\n").as_bytes()).await?;
+                c.shutdown().await?;
+            }
+            None => crate::util::write_private(&v, conn_str.as_str().as_bytes())?,
+        },
+        Err(_) => {}
     }
     Ok(())
-}
-
-fn write_private(path: &str, data: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(data)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, data)?;
-        Ok(())
-    }
 }
 
 /// The accept-one-connection mode: copy it to stdout and exit.
@@ -576,7 +497,7 @@ fn is_executable(p: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -588,22 +509,20 @@ fn is_executable(p: &std::path::Path) -> bool {
 #[cfg(feature = "ssh")]
 pub fn parse_files_flag(v: &str) -> Result<(tailcat::ssh::FileService, &'static str)> {
     use tailcat::ssh::FileServeMode as M;
-    let (dir, mode, name) = if let Some(d) = v.strip_suffix(":ro") {
-        (d, M::ReadOnly, "read-only")
-    } else if let Some(d) = v.strip_suffix(":rw") {
-        (d, M::ReadWrite, "read-write")
-    } else if let Some(d) = v.strip_suffix(":wo+") {
-        (d, M::WriteOnlyTree, "recursive write-only")
-    } else if let Some(d) = v.strip_suffix(":wo") {
-        (d, M::WriteOnly, "flat write-only")
-    } else {
-        (v, M::ReadOnly, "read-only")
-    };
+    let (dir, mode, name) = [
+        (":ro", M::ReadOnly, "read-only"),
+        (":rw", M::ReadWrite, "read-write"),
+        (":wo+", M::WriteOnlyTree, "recursive write-only"),
+        (":wo", M::WriteOnly, "flat write-only"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, mode, name)| Some((v.strip_suffix(suffix)?, mode, name)))
+    .unwrap_or((v, M::ReadOnly, "read-only"));
     let dir = if dir.is_empty() { "." } else { dir };
     let abs = std::path::absolute(dir)?;
     let md = std::fs::metadata(&abs).map_err(|e| anyhow!("--files: {}: {e}", abs.display()))?;
     if !md.is_dir() {
-        return Err(usagef!("--files: {} is not a directory", abs.display()));
+        return Err(crate::usagef!("--files: {} is not a directory", abs.display()));
     }
     Ok((tailcat::ssh::FileService { dir: abs, mode }, name))
 }
@@ -614,9 +533,9 @@ mod tests {
 
     #[test]
     fn port_sets() {
-        let ps = parse_port_set("22, 80,8000-8002,ssh").unwrap();
+        let ps = parse_port_set("22, 80,8000-8002,exec").unwrap();
         assert_eq!(ps.ports.iter().copied().collect::<Vec<_>>(), vec![22, 80, 8000, 8001, 8002]);
-        assert!(ps.services.contains("ssh"));
+        assert!(ps.services.contains("exec"));
         let ps = parse_port_set("5555:10.2.200.213:5555,8080:80,9:[fd7a::1]:22").unwrap();
         assert_eq!(ps.targets[&5555], "10.2.200.213:5555");
         assert_eq!(ps.targets[&8080], "localhost:80");
@@ -628,5 +547,61 @@ mod tests {
         assert!(parse_port_set("all").unwrap().contains(443));
         assert_eq!(parse_port_set("9-7").unwrap().ports.len(), 3);
         assert!(parse_port_set("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn port_set_edges() {
+        // "all" admits every port but 0, and isn't a service.
+        let ps = parse_port_set(" all , perf ").unwrap();
+        assert!(ps.all && !ps.contains(0) && ps.contains(65535));
+        assert_eq!(ps.services.iter().collect::<Vec<_>>(), ["perf"]);
+        assert_eq!(ps.sorted_ports().len(), 65535);
+        // SSH services need SSH support.
+        assert_eq!(parse_port_set("files").is_ok(), cfg!(feature = "ssh"));
+        let ps = parse_port_set("exec,exit-node").unwrap();
+        assert!(ps.is_empty());
+        assert_eq!(ps.services.len(), 2);
+        // The same mapping twice is fine; mapping a port also serves it.
+        let ps = parse_port_set("80:8080,80:8080").unwrap();
+        assert_eq!((ps.targets.len(), ps.contains(80)), (1, true));
+        for bad in ["65536", "1-65536", "80-", "-80", "a-b", "80:host:0", "80::22", "80:[::1]"] {
+            assert!(parse_port_set(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn finds_executables() {
+        assert!(which("definitely-not-a-tailcat-command").is_none());
+        assert!(which("/definitely/not/a/path").is_none());
+        #[cfg(unix)]
+        {
+            assert!(which("sh").is_some_and(|p| p.ends_with("/sh")));
+            assert_eq!(which("/bin/sh").as_deref(), Some("/bin/sh"));
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn files_flags() {
+        use tailcat::ssh::FileServeMode as M;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        for (suffix, mode, name) in [
+            ("", M::ReadOnly, "read-only"),
+            (":ro", M::ReadOnly, "read-only"),
+            (":rw", M::ReadWrite, "read-write"),
+            (":wo", M::WriteOnly, "flat write-only"),
+            (":wo+", M::WriteOnlyTree, "recursive write-only"),
+        ] {
+            let (fs, n) = parse_files_flag(&format!("{d}{suffix}")).unwrap();
+            assert_eq!((fs.dir.as_path(), fs.mode, n), (dir.path(), mode, name));
+        }
+        let (fs, _) = parse_files_flag(":rw").unwrap();
+        assert_eq!(fs.dir, std::env::current_dir().unwrap());
+        let file = dir.path().join("f");
+        std::fs::write(&file, "").unwrap();
+        let e = parse_files_flag(file.to_str().unwrap()).unwrap_err();
+        assert!(e.is::<crate::UsageError>());
+        assert!(parse_files_flag(dir.path().join("missing").to_str().unwrap()).is_err());
     }
 }

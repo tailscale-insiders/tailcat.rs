@@ -8,8 +8,7 @@
 //! the test ID, stream, flags, sequence number and send time.
 
 use std::collections::HashMap;
-use std::process::ExitCode;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tailcat::{TcpStream, UdpConn};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::Global;
 
@@ -44,11 +44,9 @@ const FLAG_FIN: u8 = 2;
 /// The default size of each TCP write.
 const DEFAULT_TCP_LENGTH: usize = 128 << 10;
 
-fn is_zero_i64(v: &i64) -> bool {
-    *v == 0
-}
-fn is_zero_usize(v: &usize) -> bool {
-    *v == 0
+/// For `skip_serializing_if`: Go's `omitempty`.
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Go's time.Duration marshals to JSON as integer nanoseconds.
@@ -61,9 +59,6 @@ mod nanos {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let n = i64::deserialize(d)?;
         Ok(Duration::from_nanos(n.max(0) as u64))
-    }
-    pub fn is_zero(d: &Duration) -> bool {
-        d.is_zero()
     }
 }
 
@@ -90,15 +85,15 @@ pub struct Params {
     pub proto: Proto,
     #[serde(rename = "dir")]
     pub direction: Direction,
-    #[serde(default, with = "nanos", skip_serializing_if = "nanos::is_zero")]
+    #[serde(default, with = "nanos", skip_serializing_if = "is_zero")]
     pub duration: Duration,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub bytes: i64,
     pub streams: usize,
     pub length: usize,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub bitrate: i64,
-    #[serde(default, with = "nanos", skip_serializing_if = "nanos::is_zero")]
+    #[serde(default, with = "nanos", skip_serializing_if = "is_zero")]
     pub interval: Duration,
 }
 
@@ -155,23 +150,30 @@ impl Params {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Interval {
     pub bytes: i64,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub datagrams: i64,
+}
+
+impl Interval {
+    /// The traffic between an earlier snapshot and this one.
+    fn since(&self, earlier: &Interval) -> Interval {
+        Interval { bytes: self.bytes - earlier.bytes, datagrams: self.datagrams - earlier.datagrams }
+    }
 }
 
 /// What one side sent or received.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
     pub bytes: i64,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub datagrams: i64,
     #[serde(with = "nanos")]
     pub duration: Duration,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intervals: Vec<Interval>,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub reordered: i64,
-    #[serde(default, with = "nanos", skip_serializing_if = "nanos::is_zero")]
+    #[serde(default, with = "nanos", skip_serializing_if = "is_zero")]
     pub jitter: Duration,
 }
 
@@ -210,11 +212,11 @@ struct Message {
     params: Option<Params>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     id: String,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     stream: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     error: String,
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     t: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stats: Option<Stats>,
@@ -224,6 +226,22 @@ impl Message {
     fn new(t: &str) -> Self {
         Message { typ: t.into(), ..Default::default() }
     }
+
+    fn error(e: impl Into<String>) -> Self {
+        Message { error: e.into(), ..Message::new("error") }
+    }
+
+    /// The message as a JSON line.
+    fn line(&self) -> Vec<u8> {
+        let mut b = serde_json::to_vec(self).expect("message serializes");
+        b.push(b'\n');
+        b
+    }
+}
+
+/// Parses a hex test ID.
+fn parse_id(s: &str) -> Option<[u8; 8]> {
+    hex::decode(s).ok()?.try_into().ok()
 }
 
 fn unix_nanos() -> i64 {
@@ -240,25 +258,31 @@ struct UdpHeader {
 }
 
 impl UdpHeader {
+    /// Writes the header to the start of `b`.
     fn put(&self, b: &mut [u8]) {
         b[0..8].copy_from_slice(&self.id);
         b[8..10].copy_from_slice(&self.stream.to_be_bytes());
         b[10] = self.flags;
         b[11..16].fill(0);
         b[16..24].copy_from_slice(&self.seq.to_be_bytes());
-        b[24..32].copy_from_slice(&(self.send_time as u64).to_be_bytes());
+        b[24..32].copy_from_slice(&self.send_time.to_be_bytes());
+    }
+
+    /// A header-only datagram.
+    fn datagram(&self) -> [u8; UDP_HEADER_LEN] {
+        let mut b = [0; UDP_HEADER_LEN];
+        self.put(&mut b);
+        b
     }
 
     fn parse(b: &[u8]) -> Option<UdpHeader> {
-        if b.len() < UDP_HEADER_LEN {
-            return None;
-        }
+        let b: &[u8; UDP_HEADER_LEN] = b.get(..UDP_HEADER_LEN)?.try_into().ok()?;
         Some(UdpHeader {
             id: b[0..8].try_into().ok()?,
             stream: u16::from_be_bytes([b[8], b[9]]),
             flags: b[10],
             seq: u64::from_be_bytes(b[16..24].try_into().ok()?),
-            send_time: u64::from_be_bytes(b[24..32].try_into().ok()?) as i64,
+            send_time: i64::from_be_bytes(b[24..32].try_into().ok()?),
         })
     }
 }
@@ -278,22 +302,20 @@ impl Ctrl {
     }
 
     async fn send(&self, m: &Message) -> std::io::Result<()> {
-        let mut b = serde_json::to_vec(m).expect("message serializes");
-        b.push(b'\n');
+        let b = m.line();
         let mut w = self.wr.lock().await;
         w.write_all(&b).await?;
         w.flush().await
     }
 
     async fn recv(&self) -> std::io::Result<Message> {
-        let mut rd = self.rd.lock().await;
-        read_message(&mut rd).await
+        read_message(&mut *self.rd.lock().await).await
     }
 }
 
 async fn read_message<R: AsyncRead + Unpin>(br: &mut BufReader<R>) -> std::io::Result<Message> {
     let mut line = Vec::new();
-    let n = (&mut *br).take(CTRL_BUF_SIZE as u64).read_until(b'\n', &mut line).await?;
+    let n = br.take(CTRL_BUF_SIZE as u64).read_until(b'\n', &mut line).await?;
     if n == 0 {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
@@ -304,10 +326,29 @@ async fn read_message<R: AsyncRead + Unpin>(br: &mut BufReader<R>) -> std::io::R
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad control message: {e}")))
 }
 
+/// The sending half of a stream's connection.
+enum SendSide {
+    Tcp(BoxWrite),
+    Udp(Arc<UdpConn>),
+}
+
+/// The receiving half of a stream's connection, with any datagram
+/// already read from it.
+enum RecvSide {
+    Tcp(BoxRead),
+    Udp(Arc<UdpConn>, Option<Vec<u8>>),
+}
+
 /// One stream's connection.
-enum StreamConn {
-    Tcp { rd: Option<BoxRead>, wr: Option<BoxWrite> },
-    Udp { conn: Arc<UdpConn>, pending: Option<Vec<u8>> },
+type StreamConn = (SendSide, RecvSide);
+
+fn tcp_stream(rd: BoxRead, wr: BoxWrite) -> StreamConn {
+    (SendSide::Tcp(wr), RecvSide::Tcp(rd))
+}
+
+fn udp_stream(c: UdpConn, pending: Option<Vec<u8>>) -> StreamConn {
+    let c = Arc::new(c);
+    (SendSide::Udp(c.clone()), RecvSide::Udp(c, pending))
 }
 
 #[derive(Default)]
@@ -321,13 +362,10 @@ struct RecvState {
 }
 
 /// Flags that can be waited on.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Flag(watch::Sender<bool>);
 
 impl Flag {
-    fn new() -> Self {
-        Flag(watch::channel(false).0)
-    }
     fn set(&self) {
         self.0.send_replace(true);
     }
@@ -335,37 +373,102 @@ impl Flag {
         *self.0.borrow()
     }
     async fn wait(&self) {
-        let mut rx = self.0.subscribe();
-        let _ = rx.wait_for(|v| *v).await;
+        let _ = self.0.subscribe().wait_for(|v| *v).await;
     }
 }
 
+/// Stats the peer reports once, and a flag for their arrival.
+#[derive(Default)]
+struct Report {
+    stats: Mutex<Option<Stats>>,
+    arrived: Flag,
+}
+
+impl Report {
+    fn set(&self, s: Option<Stats>) {
+        *self.stats.lock().unwrap() = s;
+        self.arrived.set();
+    }
+    fn get(&self) -> Option<Stats> {
+        self.stats.lock().unwrap().clone()
+    }
+}
+
+/// One direction's running counters, and its final stats.
+#[derive(Default)]
+struct Tally {
+    bytes: AtomicI64,
+    datagrams: AtomicI64,
+    intervals: Mutex<Vec<Interval>>,
+    stats: Mutex<Option<Stats>>,
+}
+
+impl Tally {
+    fn add(&self, bytes: usize, datagram: bool) {
+        self.bytes.fetch_add(bytes as i64, Ordering::Relaxed);
+        if datagram {
+            self.datagrams.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Interval {
+        Interval { bytes: self.bytes.load(Ordering::Relaxed), datagrams: self.datagrams.load(Ordering::Relaxed) }
+    }
+
+    /// The totals and intervals so far.
+    fn totals(&self) -> Stats {
+        let Interval { bytes, datagrams } = self.snapshot();
+        Stats { bytes, datagrams, intervals: self.intervals.lock().unwrap().clone(), ..Default::default() }
+    }
+
+    /// Records the final stats and returns them as sent to the peer,
+    /// without intervals.
+    fn finish(&self, s: Stats) -> Stats {
+        *self.stats.lock().unwrap() = Some(s.clone());
+        Stats { intervals: Vec::new(), ..s }
+    }
+}
+
+/// Round-trip times of the control connection's pings.
+#[derive(Default)]
+struct RttTracker {
+    stats: Option<Rtt>,
+    sum: Duration,
+    last: Duration,
+}
+
+impl RttTracker {
+    fn record(&mut self, d: Duration) {
+        self.sum += d;
+        self.last = d;
+        let r = self.stats.get_or_insert(Rtt { min: d, avg: d, max: d, count: 0 });
+        r.min = r.min.min(d);
+        r.max = r.max.max(d);
+        r.count += 1;
+        r.avg = self.sum / r.count as u32;
+    }
+}
+
+type OnProgress = Box<dyn Fn(Progress) + Send + Sync>;
+
 struct Test {
     p: Params,
-    id: Mutex<[u8; 8]>,
+    id: [u8; 8],
     is_server: bool,
     ctrl: Ctrl,
     streams: Vec<Mutex<Option<StreamConn>>>,
-    attached: AtomicI64,
+    attached: AtomicUsize,
     all_attached: Flag,
     ready: Flag,
-    peer_done: Flag,
-    peer_result: Flag,
     done: Flag,
     err: Mutex<Option<String>>,
-    peer_sent: Mutex<Option<Stats>>,
-    peer_received: Mutex<Option<Stats>>,
-    send_bytes: AtomicI64,
-    send_datagrams: AtomicI64,
-    recv_bytes: AtomicI64,
-    recv_datagrams: AtomicI64,
-    send_intervals: Mutex<Vec<Interval>>,
-    recv_intervals: Mutex<Vec<Interval>>,
-    rtt: Mutex<Option<(Rtt, Duration, Duration)>>, // (stats, sum, last)
-    /// This side's final sender and receiver stats.
-    sent: Mutex<Option<Stats>>,
-    received: Mutex<Option<Stats>>,
-    on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>,
+    /// The peer's sender ("done") and receiver ("result") reports.
+    peer_sent: Report,
+    peer_received: Report,
+    tx: Tally,
+    rx: Tally,
+    rtt: Mutex<RttTracker>,
+    on_progress: Option<OnProgress>,
 }
 
 /// A client-side snapshot at the end of a reporting interval.
@@ -376,47 +479,45 @@ pub struct Progress {
     pub rtt: Duration,
 }
 
+/// Awaits every task, in order, skipping any that panicked.
+async fn join_all<T>(tasks: Vec<JoinHandle<T>>) -> Vec<T> {
+    let mut out = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        if let Ok(v) = t.await {
+            out.push(v);
+        }
+    }
+    out
+}
+
 impl Test {
-    fn new(p: Params, is_server: bool, ctrl: Ctrl) -> Arc<Test> {
-        let n = p.streams;
+    fn new(p: Params, id: [u8; 8], is_server: bool, ctrl: Ctrl, on_progress: Option<OnProgress>) -> Arc<Test> {
         Arc::new(Test {
+            streams: (0..p.streams).map(|_| Mutex::default()).collect(),
             p,
-            id: Mutex::new([0; 8]),
+            id,
             is_server,
             ctrl,
-            streams: (0..n).map(|_| Mutex::new(None)).collect(),
-            attached: AtomicI64::new(0),
-            all_attached: Flag::new(),
-            ready: Flag::new(),
-            peer_done: Flag::new(),
-            peer_result: Flag::new(),
-            done: Flag::new(),
-            err: Mutex::new(None),
-            peer_sent: Mutex::new(None),
-            peer_received: Mutex::new(None),
-            send_bytes: AtomicI64::new(0),
-            send_datagrams: AtomicI64::new(0),
-            recv_bytes: AtomicI64::new(0),
-            recv_datagrams: AtomicI64::new(0),
-            send_intervals: Mutex::new(Vec::new()),
-            recv_intervals: Mutex::new(Vec::new()),
-            rtt: Mutex::new(None),
-            sent: Mutex::new(None),
-            received: Mutex::new(None),
-            on_progress: None,
+            attached: AtomicUsize::default(),
+            all_attached: Flag::default(),
+            ready: Flag::default(),
+            done: Flag::default(),
+            err: Mutex::default(),
+            peer_sent: Report::default(),
+            peer_received: Report::default(),
+            tx: Tally::default(),
+            rx: Tally::default(),
+            rtt: Mutex::default(),
+            on_progress,
         })
     }
 
-    fn id(&self) -> [u8; 8] {
-        *self.id.lock().unwrap()
-    }
-
     fn sends(&self) -> bool {
-        if self.is_server { self.p.direction != Direction::Upload } else { self.p.direction != Direction::Download }
+        self.p.direction != if self.is_server { Direction::Upload } else { Direction::Download }
     }
 
     fn receives(&self) -> bool {
-        if self.is_server { self.p.direction != Direction::Download } else { self.p.direction != Direction::Upload }
+        self.p.direction != if self.is_server { Direction::Download } else { Direction::Upload }
     }
 
     fn fail(&self, e: String) {
@@ -427,34 +528,24 @@ impl Test {
         }
     }
 
+    fn err(&self) -> String {
+        self.err.lock().unwrap().clone().unwrap_or_default()
+    }
+
     fn attach(&self, index: usize, c: StreamConn) -> bool {
         let mut slot = self.streams[index].lock().unwrap();
         if slot.is_some() {
             return false;
         }
         *slot = Some(c);
-        if self.attached.fetch_add(1, Ordering::SeqCst) + 1 == self.streams.len() as i64 {
+        if self.attached.fetch_add(1, Ordering::SeqCst) + 1 == self.streams.len() {
             self.all_attached.set();
         }
         true
     }
 
     fn peer_reported(&self) -> bool {
-        (!self.receives() || self.peer_done.is_set()) && (!self.sends() || self.peer_result.is_set())
-    }
-
-    fn record_rtt(&self, d: Duration) {
-        let mut g = self.rtt.lock().unwrap();
-        let (mut r, mut sum) = match g.take() {
-            Some((r, sum, _)) => (r, sum),
-            None => (Rtt { min: d, avg: d, max: d, count: 0 }, Duration::ZERO),
-        };
-        r.min = r.min.min(d);
-        r.max = r.max.max(d);
-        r.count += 1;
-        sum += d;
-        r.avg = sum / r.count as u32;
-        *g = Some((r, sum, d));
+        (!self.receives() || self.peer_sent.arrived.is_set()) && (!self.sends() || self.peer_received.arrived.is_set())
     }
 
     async fn read_control(self: Arc<Self>) {
@@ -480,17 +571,11 @@ impl Test {
                 }
                 "pong" => {
                     let d = unix_nanos() - m.t;
-                    self.record_rtt(Duration::from_nanos(d.max(0) as u64));
+                    self.rtt.lock().unwrap().record(Duration::from_nanos(d.max(0) as u64));
                 }
                 "ready" => self.ready.set(),
-                "done" => {
-                    *self.peer_sent.lock().unwrap() = m.stats;
-                    self.peer_done.set();
-                }
-                "result" => {
-                    *self.peer_received.lock().unwrap() = m.stats;
-                    self.peer_result.set();
-                }
+                "done" => self.peer_sent.set(m.stats),
+                "result" => self.peer_received.set(m.stats),
                 "error" => {
                     self.fail(format!("peer: {}", m.error));
                     return;
@@ -501,15 +586,13 @@ impl Test {
     }
 
     async fn send_openers(&self) -> std::io::Result<()> {
-        let id = self.id();
         for (i, s) in self.streams.iter().enumerate() {
             let conn = match &*s.lock().unwrap() {
-                Some(StreamConn::Udp { conn, .. }) => conn.clone(),
+                Some((SendSide::Udp(conn), _)) => conn.clone(),
                 _ => continue,
             };
-            let mut buf = [0u8; UDP_HEADER_LEN];
-            UdpHeader { id, stream: i as u16, flags: FLAG_OPEN, ..Default::default() }.put(&mut buf);
-            conn.send(&buf).await?;
+            conn.send(&UdpHeader { id: self.id, stream: i as u16, flags: FLAG_OPEN, ..Default::default() }.datagram())
+                .await?;
         }
         Ok(())
     }
@@ -518,34 +601,27 @@ impl Test {
         let timeout = tokio::time::sleep(HANDSHAKE_TIMEOUT);
         tokio::pin!(timeout);
         if self.is_server {
-            tokio::select! {
-                _ = self.all_attached.wait() => {
-                    return self.ctrl.send(&Message::new("ready")).await.map_err(|e| e.to_string());
-                }
-                _ = self.done.wait() => return Err(self.err.lock().unwrap().clone().unwrap_or_default()),
-                _ = &mut timeout => return Err("timed out waiting for the client's streams to connect".into()),
-            }
+            return tokio::select! {
+                _ = self.all_attached.wait() => self.ctrl.send(&Message::new("ready")).await.map_err(|e| e.to_string()),
+                _ = self.done.wait() => Err(self.err()),
+                _ = &mut timeout => Err("timed out waiting for the client's streams to connect".into()),
+            };
         }
+        // UDP flows open on the server's side with their first datagram;
+        // repeat the openers until it's ready, in case some are lost.
         let udp = self.p.proto == Proto::Udp;
-        if udp {
-            self.send_openers().await.map_err(|e| format!("opening UDP flow: {e}"))?;
-        }
         let mut openers = tokio::time::interval(OPENER_INTERVAL);
-        openers.tick().await;
         loop {
             tokio::select! {
+                biased;
                 _ = self.ready.wait() => return Ok(()),
-                _ = self.done.wait() => return Err(self.err.lock().unwrap().clone().unwrap_or_default()),
+                _ = self.done.wait() => return Err(self.err()),
                 _ = &mut timeout => return Err("timed out waiting for the server to be ready".into()),
                 _ = openers.tick(), if udp => {
                     self.send_openers().await.map_err(|e| format!("opening UDP flow: {e}"))?;
                 }
             }
         }
-    }
-
-    fn take_stream(&self, i: usize) -> Option<StreamConn> {
-        self.streams[i].lock().unwrap().take()
     }
 
     async fn run(self: Arc<Self>) -> Result<PerfResult, String> {
@@ -555,7 +631,7 @@ impl Test {
             return Err(e);
         }
         let start = Instant::now();
-        let stop = Flag::new();
+        let stop = Flag::default();
         if !self.p.interval.is_zero() {
             tokio::spawn(self.clone().intervals(start, stop.clone()));
         }
@@ -563,60 +639,45 @@ impl Test {
             tokio::spawn(self.clone().pings(stop.clone()));
         }
 
-        // Split each stream into its send and receive sides.
-        let mut send_sides = Vec::new();
-        let mut recv_sides = Vec::new();
-        for i in 0..self.streams.len() {
-            match self.take_stream(i) {
-                Some(StreamConn::Tcp { rd, wr }) => {
-                    send_sides.push(SendSide::Tcp(wr));
-                    recv_sides.push(RecvSide::Tcp(rd));
-                }
-                Some(StreamConn::Udp { conn, pending }) => {
-                    send_sides.push(SendSide::Udp(conn.clone()));
-                    recv_sides.push(RecvSide::Udp(conn, pending));
-                }
-                None => return Err("stream not attached".into()),
-            }
-        }
-        let senders = {
-            let t = self.clone();
-            async move {
-                if t.sends() {
-                    t.run_senders(start, send_sides).await
-                } else {
-                    // Unused write sides stay open until the test ends, so the
-                    // peer doesn't see an early EOF.
-                    send_sides
-                }
+        let (send_sides, recv_sides): (Vec<_>, Vec<_>) = self
+            .streams
+            .iter()
+            .map(|s| s.lock().unwrap().take())
+            .collect::<Option<Vec<_>>>()
+            .ok_or("stream not attached")?
+            .into_iter()
+            .unzip();
+        let senders = async {
+            if self.sends() {
+                self.run_senders(start, send_sides).await
+            } else {
+                // Unused write sides stay open until the test ends, so the
+                // peer doesn't see an early EOF.
+                send_sides
             }
         };
-        let receivers = {
-            let t = self.clone();
-            async move {
-                if t.receives() {
-                    t.run_receivers(recv_sides).await;
-                }
+        let receivers = async {
+            if self.receives() {
+                self.run_receivers(recv_sides).await;
             }
         };
         // Hold the (possibly half-closed) connections until the test ends.
-        let (held, _) = tokio::join!(senders, receivers);
+        let (held, ()) = tokio::join!(senders, receivers);
         stop.set();
 
         // Wait for the peer's view of what it sent and received.
         let deadline = tokio::time::Instant::now() + REPORT_TIMEOUT;
-        if self.receives() {
-            tokio::select! {
-                _ = self.peer_done.wait() => {}
-                _ = self.done.wait() => {}
-                _ = tokio::time::sleep_until(deadline) => self.fail("timed out waiting for the peer's sender report".into()),
-            }
-        }
-        if self.sends() {
-            tokio::select! {
-                _ = self.peer_result.wait() => {}
-                _ = self.done.wait() => {}
-                _ = tokio::time::sleep_until(deadline) => self.fail("timed out waiting for the peer's receiver report".into()),
+        for (needed, report, what) in
+            [(self.receives(), &self.peer_sent, "sender"), (self.sends(), &self.peer_received, "receiver")]
+        {
+            if needed {
+                tokio::select! {
+                    _ = report.arrived.wait() => {}
+                    _ = self.done.wait() => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.fail(format!("timed out waiting for the peer's {what} report"));
+                    }
+                }
             }
         }
         let err = self.err.lock().unwrap().clone();
@@ -625,29 +686,11 @@ impl Test {
         if let Some(e) = err {
             return Err(e);
         }
-        let peer_sent = self.peer_sent.lock().unwrap().clone();
-        let peer_received = self.peer_received.lock().unwrap().clone();
-        let (sent, received) = (self.sent.lock().unwrap().clone(), self.received.lock().unwrap().clone());
-        let rtt = self.rtt.lock().unwrap().as_ref().map(|r| r.0.clone());
-        Ok(if self.is_server {
-            PerfResult {
-                params: self.p.clone(),
-                server_sent: sent,
-                server_received: received,
-                client_sent: peer_sent,
-                client_received: peer_received,
-                rtt: None,
-            }
-        } else {
-            PerfResult {
-                params: self.p.clone(),
-                client_sent: sent,
-                client_received: received,
-                server_sent: peer_sent,
-                server_received: peer_received,
-                rtt,
-            }
-        })
+        let mine = (self.tx.stats.lock().unwrap().clone(), self.rx.stats.lock().unwrap().clone());
+        let peer = (self.peer_sent.get(), self.peer_received.get());
+        let ((client_sent, client_received), (server_sent, server_received), rtt) =
+            if self.is_server { (peer, mine, None) } else { (mine, peer, self.rtt.lock().unwrap().stats.clone()) };
+        Ok(PerfResult { params: self.p.clone(), client_sent, server_received, server_sent, client_received, rtt })
     }
 
     async fn intervals(self: Arc<Self>, start: Instant, stop: Flag) {
@@ -659,26 +702,17 @@ impl Test {
                 _ = stop.wait() => return,
                 _ = self.done.wait() => return,
             }
-            let sent = Interval {
-                bytes: self.send_bytes.load(Ordering::Relaxed),
-                datagrams: self.send_datagrams.load(Ordering::Relaxed),
-            };
-            let recv = Interval {
-                bytes: self.recv_bytes.load(Ordering::Relaxed),
-                datagrams: self.recv_datagrams.load(Ordering::Relaxed),
-            };
-            let ds = Interval { bytes: sent.bytes - last_sent.bytes, datagrams: sent.datagrams - last_sent.datagrams };
-            let dr = Interval { bytes: recv.bytes - last_recv.bytes, datagrams: recv.datagrams - last_recv.datagrams };
-            last_sent = sent;
-            last_recv = recv;
+            let (sent, recv) = (self.tx.snapshot(), self.rx.snapshot());
+            let (ds, dr) = (sent.since(&last_sent), recv.since(&last_recv));
+            (last_sent, last_recv) = (sent, recv);
             if self.sends() {
-                self.send_intervals.lock().unwrap().push(ds.clone());
+                self.tx.intervals.lock().unwrap().push(ds.clone());
             }
             if self.receives() {
-                self.recv_intervals.lock().unwrap().push(dr.clone());
+                self.rx.intervals.lock().unwrap().push(dr.clone());
             }
             if let Some(f) = &self.on_progress {
-                let rtt = self.rtt.lock().unwrap().as_ref().map(|r| r.2).unwrap_or_default();
+                let rtt = self.rtt.lock().unwrap().last;
                 f(Progress { elapsed: start.elapsed(), sent: ds, received: dr, rtt });
             }
         }
@@ -698,44 +732,34 @@ impl Test {
     }
 
     async fn run_senders(self: &Arc<Self>, start: Instant, sides: Vec<SendSide>) -> Vec<SendSide> {
-        let mut tasks = Vec::new();
-        for (i, side) in sides.into_iter().enumerate() {
+        let tasks = sides.into_iter().enumerate().map(|(i, side)| {
             let t = self.clone();
-            tasks.push(tokio::spawn(async move { t.send_stream(i, side, start).await }));
-        }
-        let mut sides = Vec::new();
-        for t in tasks {
-            if let Ok(s) = t.await {
-                sides.push(s);
-            }
-        }
+            tokio::spawn(async move { t.send_stream(i, side, start).await })
+        });
+        let mut sides = join_all(tasks.collect()).await;
         if self.done.is_set() {
             return sides;
         }
-        let stats = Stats {
-            bytes: self.send_bytes.load(Ordering::Relaxed),
-            datagrams: self.send_datagrams.load(Ordering::Relaxed),
-            duration: start.elapsed(),
-            intervals: self.send_intervals.lock().unwrap().clone(),
-            ..Default::default()
-        };
-        *self.sent.lock().unwrap() = Some(stats.clone());
-        let id = self.id();
+        let stats = Stats { duration: start.elapsed(), ..self.tx.totals() };
+        let wire = self.tx.finish(stats);
         for (i, side) in sides.iter_mut().enumerate() {
             let r = match side {
-                SendSide::Tcp(Some(w)) => w.shutdown().await,
-                SendSide::Tcp(None) => Ok(()),
+                SendSide::Tcp(w) => w.shutdown().await,
                 SendSide::Udp(c) => {
-                    let mut buf = [0u8; UDP_HEADER_LEN];
-                    UdpHeader { id, stream: i as u16, flags: FLAG_FIN, send_time: unix_nanos(), ..Default::default() }
-                        .put(&mut buf);
+                    let fin = UdpHeader {
+                        id: self.id,
+                        stream: i as u16,
+                        flags: FLAG_FIN,
+                        send_time: unix_nanos(),
+                        ..Default::default()
+                    };
                     let mut r = Ok(());
                     for _ in 0..FIN_REPEAT {
-                        if let Err(e) = c.send(&buf).await {
+                        if let Err(e) = c.send(&fin.datagram()).await {
                             r = Err(e);
                         }
                     }
-                    r.map(|_| ())
+                    r
                 }
             };
             if let Err(e) = r {
@@ -743,7 +767,6 @@ impl Test {
                 return sides;
             }
         }
-        let wire = Stats { intervals: Vec::new(), ..stats };
         if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new("done") }).await {
             self.fail(format!("sending done: {e}"));
         }
@@ -757,16 +780,9 @@ impl Test {
         let mut next: Option<tokio::time::Instant> = None;
         let mut sent: i64 = 0;
         let mut seq: u64 = 0;
-        let id = self.id();
         loop {
-            if self.p.bytes > 0 {
-                if sent >= self.p.bytes {
-                    return side;
-                }
-            } else if start.elapsed() >= self.p.duration {
-                return side;
-            }
-            if self.done.is_set() {
+            let finished = if self.p.bytes > 0 { sent >= self.p.bytes } else { start.elapsed() >= self.p.duration };
+            if finished || self.done.is_set() {
                 return side;
             }
             if let Some(step) = step {
@@ -780,21 +796,20 @@ impl Test {
             let mut n = buf.len();
             let r = match &mut side {
                 SendSide::Udp(c) => {
-                    UdpHeader { id, stream: i as u16, seq, send_time: unix_nanos(), ..Default::default() }
+                    UdpHeader { id: self.id, stream: i as u16, seq, send_time: unix_nanos(), ..Default::default() }
                         .put(&mut buf);
                     seq += 1;
                     c.send(&buf).await.map(|_| ())
                 }
-                SendSide::Tcp(Some(w)) => {
-                    if self.p.bytes > 0 && ((self.p.bytes - sent) as usize) < n {
-                        n = (self.p.bytes - sent) as usize;
+                SendSide::Tcp(w) => {
+                    if self.p.bytes > 0 {
+                        n = n.min((self.p.bytes - sent) as usize);
                     }
                     tokio::select! {
                         r = w.write_all(&buf[..n]) => r,
                         _ = self.done.wait() => return side,
                     }
                 }
-                SendSide::Tcp(None) => return side,
             };
             if let Err(e) = r {
                 if !self.done.is_set() {
@@ -803,34 +818,20 @@ impl Test {
                 return side;
             }
             sent += n as i64;
-            self.send_bytes.fetch_add(n as i64, Ordering::Relaxed);
-            if matches!(side, SendSide::Udp(_)) {
-                self.send_datagrams.fetch_add(1, Ordering::Relaxed);
-            }
+            self.tx.add(n, matches!(side, SendSide::Udp(_)));
         }
     }
 
     async fn run_receivers(self: &Arc<Self>, sides: Vec<RecvSide>) {
-        let mut tasks = Vec::new();
-        for (i, side) in sides.into_iter().enumerate() {
+        let tasks = sides.into_iter().enumerate().map(|(i, side)| {
             let t = self.clone();
-            tasks.push(tokio::spawn(async move { t.recv_stream(i, side).await }));
-        }
-        let mut states = Vec::new();
-        for t in tasks {
-            if let Ok(s) = t.await {
-                states.push(s);
-            }
-        }
+            tokio::spawn(async move { t.recv_stream(i, side).await })
+        });
+        let states = join_all(tasks.collect()).await;
         if self.done.is_set() {
             return;
         }
-        let mut stats = Stats {
-            bytes: self.recv_bytes.load(Ordering::Relaxed),
-            datagrams: self.recv_datagrams.load(Ordering::Relaxed),
-            intervals: self.recv_intervals.lock().unwrap().clone(),
-            ..Default::default()
-        };
+        let mut stats = self.rx.totals();
         let first = states.iter().filter_map(|s| s.first).min();
         let last = states.iter().filter_map(|s| s.last).max();
         if let (Some(f), Some(l)) = (first, last) {
@@ -841,8 +842,7 @@ impl Test {
             let j: f64 = states.iter().map(|s| s.jitter).sum::<f64>() / self.p.streams as f64;
             stats.jitter = Duration::from_nanos(j.max(0.0) as u64);
         }
-        *self.received.lock().unwrap() = Some(stats.clone());
-        let wire = Stats { intervals: Vec::new(), ..stats };
+        let wire = self.rx.finish(stats);
         if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new("result") }).await {
             self.fail(format!("sending result: {e}"));
         }
@@ -851,76 +851,67 @@ impl Test {
     /// Resolves once the peer said it's done sending and the grace
     /// period for in-flight data has passed.
     async fn grace_expired(&self) {
-        self.peer_done.wait().await;
+        self.peer_sent.arrived.wait().await;
         tokio::time::sleep(if self.p.proto == Proto::Udp { UDP_GRACE } else { TCP_GRACE }).await;
     }
 
     async fn recv_stream(&self, i: usize, side: RecvSide) -> RecvState {
         let mut st = RecvState::default();
-        match side {
-            RecvSide::Tcp(Some(mut rd)) => {
-                let mut buf = vec![0u8; self.p.length.max(64 << 10)];
-                loop {
-                    let r = tokio::select! {
-                        r = rd.read(&mut buf) => r,
-                        _ = self.grace_expired() => return st,
-                        _ = self.done.wait() => return st,
-                    };
-                    match r {
-                        Ok(0) => return st,
-                        Ok(n) => self.count(&mut st, n),
-                        Err(e) => {
-                            if !self.peer_done.is_set() && !self.done.is_set() {
-                                self.fail(format!("stream {i}: read: {e}"));
-                            }
-                            return st;
+        let res: std::io::Result<()> = async {
+            match side {
+                RecvSide::Tcp(mut rd) => {
+                    let mut buf = vec![0u8; self.p.length.max(64 << 10)];
+                    loop {
+                        let n = tokio::select! {
+                            r = rd.read(&mut buf) => r?,
+                            _ = self.grace_expired() => return Ok(()),
+                            _ = self.done.wait() => return Ok(()),
+                        };
+                        if n == 0 {
+                            return Ok(());
                         }
+                        self.count(&mut st, n, false);
                     }
                 }
-            }
-            RecvSide::Tcp(None) => st,
-            RecvSide::Udp(conn, pending) => {
-                if let Some(p) = pending
-                    && self.process_datagram(&mut st, &p)
-                {
-                    return st;
-                }
-                let mut buf = vec![0u8; MAX_UDP_SIZE];
-                loop {
-                    let r = tokio::select! {
-                        r = conn.recv(&mut buf) => r,
-                        _ = self.grace_expired() => return st,
-                        _ = self.done.wait() => return st,
-                    };
-                    match r {
-                        Ok(n) => {
-                            if self.process_datagram(&mut st, &buf[..n]) {
-                                return st;
-                            }
-                        }
-                        Err(e) => {
-                            if !self.peer_done.is_set() && !self.done.is_set() {
-                                self.fail(format!("stream {i}: read: {e}"));
-                            }
-                            return st;
+                RecvSide::Udp(conn, pending) => {
+                    if pending.is_some_and(|p| self.process_datagram(&mut st, &p)) {
+                        return Ok(());
+                    }
+                    let mut buf = vec![0u8; MAX_UDP_SIZE];
+                    loop {
+                        let n = tokio::select! {
+                            r = conn.recv(&mut buf) => r?,
+                            _ = self.grace_expired() => return Ok(()),
+                            _ = self.done.wait() => return Ok(()),
+                        };
+                        if self.process_datagram(&mut st, &buf[..n]) {
+                            return Ok(());
                         }
                     }
                 }
             }
         }
+        .await;
+        if let Err(e) = res
+            && !self.peer_sent.arrived.is_set()
+            && !self.done.is_set()
+        {
+            self.fail(format!("stream {i}: read: {e}"));
+        }
+        st
     }
 
-    fn count(&self, st: &mut RecvState, n: usize) {
+    fn count(&self, st: &mut RecvState, n: usize, datagram: bool) {
         let now = Instant::now();
         st.first.get_or_insert(now);
         st.last = Some(now);
-        self.recv_bytes.fetch_add(n as i64, Ordering::Relaxed);
+        self.rx.add(n, datagram);
     }
 
     /// Accounts for one datagram, reporting whether it was a fin.
     fn process_datagram(&self, st: &mut RecvState, pkt: &[u8]) -> bool {
         let Some(h) = UdpHeader::parse(pkt) else { return false };
-        if h.id != self.id() {
+        if h.id != self.id {
             return false;
         }
         if h.flags & FLAG_FIN != 0 {
@@ -929,8 +920,7 @@ impl Test {
         if h.flags & FLAG_OPEN != 0 {
             return false;
         }
-        self.count(st, pkt.len());
-        self.recv_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.count(st, pkt.len(), true);
         if h.seq < st.expect_seq {
             st.reordered += 1;
         } else {
@@ -948,16 +938,6 @@ impl Test {
     }
 }
 
-enum SendSide {
-    Tcp(Option<BoxWrite>),
-    Udp(Arc<UdpConn>),
-}
-
-enum RecvSide {
-    Tcp(Option<BoxRead>),
-    Udp(Arc<UdpConn>, Option<Vec<u8>>),
-}
-
 /// The perf service: one test at a time.
 #[derive(Default)]
 pub struct Server {
@@ -965,10 +945,6 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn lookup(&self, id: [u8; 8], index: usize) -> Result<Arc<Test>, String> {
         let t = self.tests.lock().unwrap().get(&id).cloned().ok_or("unknown test")?;
         if index >= t.streams.len() {
@@ -979,20 +955,16 @@ impl Server {
 
     /// Serves one TCP connection to the perf port: a control connection
     /// starting a test, or a data stream of the running one.
-    pub async fn handle_tcp(&self, c: TcpStream) {
+    pub async fn handle_tcp(self: Arc<Self>, c: TcpStream) {
         let remote = c.peer_addr();
         let (rd, wr) = tokio::io::split(c);
         let mut br: BufReader<BoxRead> = BufReader::with_capacity(CTRL_BUF_SIZE, Box::new(rd));
         let wr: BoxWrite = Box::new(wr);
-        let m = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut br)).await {
-            Ok(Ok(m)) => m,
-            _ => return,
-        };
+        let Ok(Ok(m)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut br)).await else { return };
         match m.typ.as_str() {
-            "hello" => self.run_test(br, wr, m, remote).await,
+            "hello" => self.run_test(Ctrl::new(br, wr), m, remote).await,
             "stream" => {
-                let Ok(b) = hex::decode(&m.id) else { return };
-                let Ok(id) = <[u8; 8]>::try_from(b.as_slice()) else { return };
+                let Some(id) = parse_id(&m.id) else { return };
                 let t = match self.lookup(id, m.stream) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1001,10 +973,9 @@ impl Server {
                     }
                 };
                 // The BufReader may already hold data after the header.
-                if !t.attach(m.stream, StreamConn::Tcp { rd: Some(Box::new(br)), wr: Some(wr) }) {
-                    return;
+                if t.attach(m.stream, tcp_stream(Box::new(br), wr)) {
+                    t.done.wait().await;
                 }
-                t.done.wait().await;
             }
             _ => {}
         }
@@ -1012,13 +983,11 @@ impl Server {
 
     /// Serves one UDP flow to the perf port, a data stream of the
     /// running test.
-    pub async fn handle_udp(&self, c: UdpConn) {
+    pub async fn handle_udp(self: Arc<Self>, c: UdpConn) {
         let mut buf = vec![0u8; MAX_UDP_SIZE];
-        let n = match tokio::time::timeout(HANDSHAKE_TIMEOUT, c.recv(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            _ => return,
-        };
-        let Some(h) = UdpHeader::parse(&buf[..n]) else { return };
+        let Ok(Ok(n)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, c.recv(&mut buf)).await else { return };
+        buf.truncate(n);
+        let Some(h) = UdpHeader::parse(&buf) else { return };
         let t = match self.lookup(h.id, h.stream as usize) {
             Ok(t) => t,
             Err(e) => {
@@ -1026,45 +995,38 @@ impl Server {
                 return;
             }
         };
-        let c = Arc::new(c);
-        if !t.attach(h.stream as usize, StreamConn::Udp { conn: c.clone(), pending: Some(buf[..n].to_vec()) }) {
-            return;
+        if t.attach(h.stream as usize, udp_stream(c, Some(buf))) {
+            t.done.wait().await;
         }
-        t.done.wait().await;
     }
 
-    async fn run_test(&self, br: BufReader<BoxRead>, wr: BoxWrite, hello: Message, remote: std::net::SocketAddr) {
-        let ctrl = Ctrl::new(br, wr);
-        let Some(p) = hello.params else {
-            let _ = ctrl.send(&Message { error: "hello without params".into(), ..Message::new("error") }).await;
-            return;
+    async fn run_test(&self, ctrl: Ctrl, hello: Message, remote: std::net::SocketAddr) {
+        let p = hello
+            .params
+            .ok_or_else(|| "hello without params".to_string())
+            .and_then(|p| p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).map(|()| p));
+        let p = match p {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = ctrl.send(&Message::error(e)).await;
+                return;
+            }
         };
-        if let Err(e) = p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION) {
-            let _ = ctrl.send(&Message { error: e, ..Message::new("error") }).await;
-            return;
-        }
-        let t = Test::new(p, true, ctrl);
         let mut id = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
-        *t.id.lock().unwrap() = id;
+        let t = Test::new(p, id, true, ctrl, None);
         let registered = {
             let mut tests = self.tests.lock().unwrap();
             tests.is_empty() && tests.insert(id, t.clone()).is_none()
         };
         if !registered {
-            let _ = t
-                .ctrl
-                .send(&Message { error: "the server is busy with another test".into(), ..Message::new("error") })
-                .await;
+            let _ = t.ctrl.send(&Message::error("the server is busy with another test")).await;
             return;
         }
         let res = async {
             t.ctrl.send(&Message { id: hex::encode(id), ..Message::new("ok") }).await.map_err(|e| e.to_string())?;
             let limit = DEFAULT_MAX_DURATION + HANDSHAKE_TIMEOUT + REPORT_TIMEOUT;
-            match tokio::time::timeout(limit, t.clone().run()).await {
-                Ok(r) => r,
-                Err(_) => Err("test timed out".to_string()),
-            }
+            tokio::time::timeout(limit, t.clone().run()).await.unwrap_or_else(|_| Err("test timed out".into()))
         }
         .await;
         t.done.set();
@@ -1077,22 +1039,15 @@ impl Server {
 }
 
 /// Runs one test against a server.
-async fn run_client(
-    cl: &tailcat::Client,
-    p: Params,
-    on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>,
-) -> Result<PerfResult> {
+async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgress>) -> Result<PerfResult> {
     p.validate(0, Duration::ZERO).map_err(|e| anyhow!(e))?;
     let cc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing control connection: {e}"))?;
     let (rd, wr) = tokio::io::split(cc);
     let ctrl = Ctrl::new(BufReader::with_capacity(CTRL_BUF_SIZE, Box::new(rd)), Box::new(wr));
-    let mut t = Test::new(p.clone(), false, ctrl);
-    Arc::get_mut(&mut t).expect("unshared").on_progress = on_progress;
-    t.ctrl
-        .send(&Message { params: Some(p.clone()), ..Message::new("hello") })
+    ctrl.send(&Message { params: Some(p.clone()), ..Message::new("hello") })
         .await
         .map_err(|e| anyhow!("sending hello: {e}"))?;
-    let m = tokio::time::timeout(HANDSHAKE_TIMEOUT, t.ctrl.recv())
+    let m = tokio::time::timeout(HANDSHAKE_TIMEOUT, ctrl.recv())
         .await
         .map_err(|_| anyhow!("reading hello reply: timed out"))?
         .map_err(|e| anyhow!("reading hello reply: {e}"))?;
@@ -1101,24 +1056,21 @@ async fn run_client(
         "ok" => {}
         other => bail!("unexpected reply {other:?} to hello"),
     }
-    let id: [u8; 8] = hex::decode(&m.id)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
-    *t.id.lock().unwrap() = id;
-    for i in 0..p.streams {
-        let sc = match p.proto {
+    let id = parse_id(&m.id).ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
+    let (proto, streams) = (p.proto, p.streams);
+    let t = Test::new(p, id, false, ctrl, on_progress);
+    for i in 0..streams {
+        let sc = match proto {
             Proto::Tcp => {
                 let mut dc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing stream {i}: {e}"))?;
-                let mut hdr = serde_json::to_vec(&Message { id: m.id.clone(), stream: i, ..Message::new("stream") })?;
-                hdr.push(b'\n');
+                let hdr = Message { id: m.id.clone(), stream: i, ..Message::new("stream") }.line();
                 dc.write_all(&hdr).await.map_err(|e| anyhow!("stream {i}: sending header: {e}"))?;
                 let (rd, wr) = tokio::io::split(dc);
-                StreamConn::Tcp { rd: Some(Box::new(rd)), wr: Some(Box::new(wr)) }
+                tcp_stream(Box::new(rd), Box::new(wr))
             }
             Proto::Udp => {
                 let dc = cl.dial_udp_port(PORT).await.map_err(|e| anyhow!("dialing UDP stream {i}: {e}"))?;
-                StreamConn::Udp { conn: Arc::new(dc), pending: None }
+                udp_stream(dc, None)
             }
         };
         t.attach(i, sc);
@@ -1172,11 +1124,12 @@ pub struct PerfArgs {
     addr: String,
 }
 
+/// Parses a number with an optional K, M, or G (powers of 1000) suffix.
 fn parse_si(s: &str) -> Result<i64> {
-    let (num, mult) = match s.chars().last() {
-        Some('k' | 'K') => (&s[..s.len() - 1], 1e3),
-        Some('m' | 'M') => (&s[..s.len() - 1], 1e6),
-        Some('g' | 'G') => (&s[..s.len() - 1], 1e9),
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 'k' | 'K')) => (&s[..i], 1e3),
+        Some((i, 'm' | 'M')) => (&s[..i], 1e6),
+        Some((i, 'g' | 'G')) => (&s[..i], 1e9),
         _ => (s, 1.0),
     };
     let v: f64 = num.parse::<f64>()? * mult;
@@ -1207,18 +1160,12 @@ impl std::fmt::Display for PathInfo {
     }
 }
 
-async fn probe_path(cl: &tailcat::Client, timeout: Duration) -> Result<PathInfo> {
+async fn probe_path(cl: &tailcat::Client, timeout: Duration) -> tailcat::Result<PathInfo> {
     let r = cl.disco_ping(timeout).await?;
     Ok(PathInfo {
         direct: r.endpoint.is_some(),
         endpoint: r.endpoint.map(|e| e.to_string()).unwrap_or_default(),
-        derp_region: if r.endpoint.is_some() {
-            String::new()
-        } else if r.derp_region_code.is_empty() {
-            r.derp_region_id.to_string()
-        } else {
-            r.derp_region_code
-        },
+        derp_region: if r.endpoint.is_some() { String::new() } else { crate::client::derp_region_name(&r) },
         rtt: r.latency,
     })
 }
@@ -1227,14 +1174,13 @@ async fn wait_for_direct_path(cl: &tailcat::Client, timeout: Duration) -> Result
     let deadline = Instant::now() + timeout;
     loop {
         let t0 = Instant::now();
-        let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let remaining = deadline.saturating_duration_since(t0).max(Duration::from_millis(1));
         let p = match tokio::time::timeout(remaining, probe_path(cl, remaining)).await {
             Ok(Ok(p)) => p,
-            Ok(Err(e)) if matches!(e.downcast_ref::<tailcat::Error>(), Some(tailcat::Error::Timeout(_))) => {
+            Ok(Err(tailcat::Error::Timeout(_))) | Err(_) => {
                 bail!("no reply to pings after {}", go_duration(timeout))
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => bail!("no reply to pings after {}", go_duration(timeout)),
+            Ok(Err(e)) => return Err(e.into()),
         };
         if p.direct || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
             return Ok(p);
@@ -1253,7 +1199,7 @@ fn shared_tailscale_derp(r: &tailcat::DerpRegion) -> Option<String> {
         .map(|n| n.host_name.clone())
 }
 
-pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
+pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
     if a.reverse && a.bidir {
         return Err(crate::usagef!("--reverse and --bidir are exclusive"));
     }
@@ -1274,8 +1220,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
         interval: a.interval,
     };
     if let Some(b) = &a.bytes {
-        let n = parse_si(b).ok().filter(|n| *n > 0).ok_or_else(|| crate::usagef!("invalid --bytes value {b:?}"))?;
-        p.bytes = n;
+        p.bytes = parse_si(b).ok().filter(|n| *n > 0).ok_or_else(|| crate::usagef!("invalid --bytes value {b:?}"))?;
         p.duration = Duration::ZERO;
     }
     if let Some(b) = &a.bitrate {
@@ -1316,7 +1261,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
             tailcat::MAX_UDP_PAYLOAD
         );
     }
-    let progress: Option<Box<dyn Fn(Progress) + Send + Sync>> = if !g.json && !p.interval.is_zero() {
+    let progress: Option<OnProgress> = if !g.json && !p.interval.is_zero() {
         let pp = p.clone();
         Some(Box::new(move |pr: Progress| println!("{}", progress_line(&pp, &pr))))
     } else {
@@ -1345,10 +1290,9 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
         }
         let mut buf = Vec::new();
         let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-        v.serialize(&mut ser)?;
+        v.serialize(&mut serde_json::Serializer::with_formatter(&mut buf, fmt))?;
         println!("{}", String::from_utf8(buf)?);
-        return Ok(ExitCode::SUCCESS);
+        return Ok(());
     }
     for l in result_lines(&res) {
         println!("{l}");
@@ -1358,7 +1302,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
     {
         eprintln!("# path changed during the test, now: {a}");
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 fn describe(p: &Params) -> String {
@@ -1404,43 +1348,41 @@ fn progress_line(p: &Params, pr: &Progress) -> String {
 
 fn result_lines(res: &PerfResult) -> Vec<String> {
     let udp = res.params.proto == Proto::Udp;
-    let mut out = Vec::new();
-    let add = |indent: &str, sent: &Option<Stats>, recv: &Option<Stats>, out: &mut Vec<String>| {
-        let (Some(sent), Some(recv)) = (sent, recv) else { return };
-        let mut s = format!(
-            "{indent}sent      {:>9} in {:6.1}s {:>13}",
-            fmt_bytes(sent.bytes),
-            sent.duration.as_secs_f64(),
-            fmt_rate(sent.bytes, sent.duration)
-        );
-        let mut r = format!(
-            "{indent}received  {:>9} in {:6.1}s {:>13}",
-            fmt_bytes(recv.bytes),
-            recv.duration.as_secs_f64(),
-            fmt_rate(recv.bytes, recv.duration)
-        );
+    // The sent and received lines of one direction.
+    let pair = |indent: &str, sent: &Option<Stats>, recv: &Option<Stats>| {
+        let (Some(sent), Some(recv)) = (sent, recv) else { return Vec::new() };
+        let line = |what: &str, st: &Stats| {
+            format!(
+                "{indent}{what:<9} {:>9} in {:6.1}s {:>13}",
+                fmt_bytes(st.bytes),
+                st.duration.as_secs_f64(),
+                fmt_rate(st.bytes, st.duration)
+            )
+        };
+        let (mut s, mut r) = (line("sent", sent), line("received", recv));
         if udp {
             s += &format!("  {} datagrams", sent.datagrams);
-            let lost = sent.datagrams - recv.datagrams;
-            let pct = if sent.datagrams > 0 { lost as f64 / sent.datagrams as f64 * 100.0 } else { 0.0 };
             r += &format!(
-                "  {} datagrams, {lost} lost ({pct:.1}%), {} reordered, jitter {}",
+                "  {} datagrams, {} lost ({:.1}%), {} reordered, jitter {}",
                 recv.datagrams,
+                sent.datagrams - recv.datagrams,
+                loss_pct(sent, recv),
                 recv.reordered,
                 fmt_rtt(recv.jitter)
             );
         }
-        out.push(s);
-        out.push(r);
+        vec![s, r]
     };
+    let (up, down) = ((&res.client_sent, &res.server_received), (&res.server_sent, &res.client_received));
+    let mut out = Vec::new();
     if res.params.direction == Direction::Bidirectional {
         out.push("client -> server:".to_string());
-        add("  ", &res.client_sent, &res.server_received, &mut out);
+        out.extend(pair("  ", up.0, up.1));
         out.push("server -> client:".to_string());
-        add("  ", &res.server_sent, &res.client_received, &mut out);
+        out.extend(pair("  ", down.0, down.1));
     } else {
-        add("", &res.client_sent, &res.server_received, &mut out);
-        add("", &res.server_sent, &res.client_received, &mut out);
+        out.extend(pair("", up.0, up.1));
+        out.extend(pair("", down.0, down.1));
     }
     if let Some(r) = &res.rtt {
         out.push(format!(
@@ -1454,6 +1396,11 @@ fn result_lines(res: &PerfResult) -> Vec<String> {
     out
 }
 
+/// The percentage of sent datagrams that weren't received.
+fn loss_pct(sent: &Stats, recv: &Stats) -> f64 {
+    if sent.datagrams > 0 { (sent.datagrams - recv.datagrams) as f64 / sent.datagrams as f64 * 100.0 } else { 0.0 }
+}
+
 /// The one-line summary the server prints per test.
 fn perf_summary(res: &PerfResult) -> String {
     let udp = res.params.proto == Proto::Udp;
@@ -1463,19 +1410,17 @@ fn perf_summary(res: &PerfResult) -> String {
         if let (true, Some(sent)) = (udp, sent)
             && sent.datagrams > 0
         {
-            s += &format!(" ({:.1}% lost)", (sent.datagrams - recv.datagrams) as f64 / sent.datagrams as f64 * 100.0);
+            s += &format!(" ({:.1}% lost)", loss_pct(sent, recv));
         }
         s
     };
     let proto = if udp { "UDP" } else { "TCP" };
+    let up = || format!("client -> server {}", rate(&res.client_sent, &res.server_received));
+    let down = || format!("server -> client {}", rate(&res.server_sent, &res.client_received));
     match res.params.direction {
-        Direction::Upload => format!("{proto} client -> server {}", rate(&res.client_sent, &res.server_received)),
-        Direction::Download => format!("{proto} server -> client {}", rate(&res.server_sent, &res.client_received)),
-        Direction::Bidirectional => format!(
-            "{proto} client -> server {}, server -> client {}",
-            rate(&res.client_sent, &res.server_received),
-            rate(&res.server_sent, &res.client_received)
-        ),
+        Direction::Upload => format!("{proto} {}", up()),
+        Direction::Download => format!("{proto} {}", down()),
+        Direction::Bidirectional => format!("{proto} {}, {}", up(), down()),
     }
 }
 
@@ -1487,15 +1432,14 @@ fn fmt_si(mut v: f64, unit: &str) -> String {
         v /= 1000.0;
         i += 1;
     }
-    if i == 0 {
-        format!("{v:.0} {unit}")
-    } else if v >= 100.0 {
-        format!("{v:.0} {}{unit}", P[i])
+    let prec = if i == 0 || v >= 100.0 {
+        0
     } else if v >= 10.0 {
-        format!("{v:.1} {}{unit}", P[i])
+        1
     } else {
-        format!("{v:.2} {}{unit}", P[i])
-    }
+        2
+    };
+    format!("{v:.prec$} {}{unit}", P[i])
 }
 
 fn fmt_bytes(n: i64) -> String {
@@ -1509,57 +1453,39 @@ fn fmt_rate(n: i64, d: Duration) -> String {
     fmt_si(n as f64 * 8.0 / d.as_secs_f64(), "bit/s")
 }
 
+/// Formats a round-trip time rounded to 10µs.
 fn fmt_rtt(d: Duration) -> String {
     let n = d.as_nanos() as u64;
-    let rounded = (n + 5_000) / 10_000 * 10_000;
-    go_duration(Duration::from_nanos(rounded))
+    go_duration(Duration::from_nanos((n + 5_000) / 10_000 * 10_000))
 }
 
 /// Formats a duration like Go's `time.Duration.String`.
 pub fn go_duration(d: Duration) -> String {
-    let n = d.as_nanos();
-    if n == 0 {
-        return "0s".into();
-    }
-    fn frac(v: u128, prec: u32) -> (u128, String) {
-        // Returns v / 10^prec and the fractional digits, trailing zeros trimmed.
+    // v / 10^prec with its fractional digits, trailing zeros trimmed.
+    fn decimal(v: u128, prec: u32, unit: &str) -> String {
         let div = 10u128.pow(prec);
-        let (int, mut f) = (v / div, v % div);
-        let mut digits = String::new();
-        let mut printed = false;
-        for _ in 0..prec {
-            let dgt = f % 10;
-            f /= 10;
-            if printed || dgt != 0 {
-                printed = true;
-                digits.insert(0, char::from(b'0' + dgt as u8));
+        let frac = format!("{:0w$}", v % div, w = prec as usize);
+        match frac.trim_end_matches('0') {
+            "" => format!("{}{unit}", v / div),
+            f => format!("{}.{f}{unit}", v / div),
+        }
+    }
+    let n = d.as_nanos();
+    match n {
+        0 => "0s".into(),
+        1..1_000 => format!("{n}ns"),
+        1_000..1_000_000 => decimal(n, 3, "µs"),
+        1_000_000..1_000_000_000 => decimal(n, 6, "ms"),
+        _ => {
+            let (secs, nanos) = (n / 1_000_000_000, n % 1_000_000_000);
+            let (h, m) = (secs / 3600, secs % 3600 / 60);
+            let sec = decimal(secs % 60 * 1_000_000_000 + nanos, 9, "s");
+            match (h, m) {
+                (0, 0) => sec,
+                (0, m) => format!("{m}m{sec}"),
+                (h, m) => format!("{h}h{m}m{sec}"),
             }
         }
-        (int, digits)
-    }
-    let with_frac = |int: u128, digits: String, unit: &str| {
-        if digits.is_empty() { format!("{int}{unit}") } else { format!("{int}.{digits}{unit}") }
-    };
-    if n < 1_000 {
-        return format!("{n}ns");
-    }
-    if n < 1_000_000 {
-        let (i, f) = frac(n, 3);
-        return with_frac(i, f, "µs");
-    }
-    if n < 1_000_000_000 {
-        let (i, f) = frac(n, 6);
-        return with_frac(i, f, "ms");
-    }
-    let (secs, f) = frac(n, 9);
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let sec = with_frac(s, f, "s");
-    if h > 0 {
-        format!("{h}h{m}m{sec}")
-    } else if m > 0 {
-        format!("{m}m{sec}")
-    } else {
-        sec
     }
 }
 
@@ -1575,6 +1501,17 @@ mod tests {
         assert_eq!(go_duration(Duration::from_micros(680)), "680µs");
         assert_eq!(go_duration(Duration::from_secs(90)), "1m30s");
         assert_eq!(fmt_rtt(Duration::from_nanos(1_234_567)), "1.23ms");
+        // Cases checked against Go's time.Duration.String.
+        assert_eq!(go_duration(Duration::ZERO), "0s");
+        assert_eq!(go_duration(Duration::from_nanos(999)), "999ns");
+        assert_eq!(go_duration(Duration::from_nanos(1_500)), "1.5µs");
+        assert_eq!(go_duration(Duration::from_nanos(1_000_001)), "1.000001ms");
+        assert_eq!(go_duration(Duration::from_nanos(1_000_000_001)), "1.000000001s");
+        assert_eq!(go_duration(Duration::from_secs(600)), "10m0s");
+        assert_eq!(go_duration(Duration::from_secs(3600)), "1h0m0s");
+        assert_eq!(go_duration(Duration::from_millis(3_723_500)), "1h2m3.5s");
+        assert_eq!(fmt_rtt(Duration::from_nanos(4_999)), "0s");
+        assert_eq!(fmt_rtt(Duration::from_nanos(5_000)), "10µs");
     }
 
     #[test]
@@ -1582,14 +1519,23 @@ mod tests {
         assert_eq!(fmt_si(1.18e9, "B"), "1.18 GB");
         assert_eq!(fmt_si(943e6, "bit/s"), "943 Mbit/s");
         assert_eq!(fmt_si(12.0, "B"), "12 B");
+        assert_eq!(fmt_si(999.0, "B"), "999 B");
+        assert_eq!(fmt_si(12_345.0, "B"), "12.3 KB");
+        assert_eq!(fmt_si(2e15, "B"), "2000 TB");
+        assert_eq!(fmt_rate(1_000_000, Duration::from_secs(8)), "1.00 Mbit/s");
+        assert_eq!(fmt_rate(1, Duration::ZERO), "-");
         assert_eq!(parse_si("10M").unwrap(), 10_000_000);
         assert_eq!(parse_si("1.5G").unwrap(), 1_500_000_000);
+        assert_eq!(parse_si("2k").unwrap(), 2_000);
+        assert_eq!(parse_si("7").unwrap(), 7);
         assert!(parse_si("x").is_err());
+        assert!(parse_si("").is_err());
+        assert!(parse_si("M").is_err());
+        assert!(parse_si("1e30G").is_err());
     }
 
-    #[test]
-    fn wire_formats() {
-        let p = Params {
+    fn params() -> Params {
+        Params {
             proto: Proto::Udp,
             direction: Direction::Bidirectional,
             duration: Duration::from_secs(10),
@@ -1598,16 +1544,119 @@ mod tests {
             length: 1232,
             bitrate: 1_000_000,
             interval: Duration::from_secs(1),
-        };
-        let j = serde_json::to_string(&Message { params: Some(p), ..Message::new("hello") }).unwrap();
+        }
+    }
+
+    #[test]
+    fn wire_formats() {
+        let j = serde_json::to_string(&Message { params: Some(params()), ..Message::new("hello") }).unwrap();
         assert_eq!(
             j,
             r#"{"type":"hello","params":{"proto":"udp","dir":"both","duration":10000000000,"streams":1,"length":1232,"bitrate":1000000,"interval":1000000000}}"#
         );
-        let mut b = [0u8; 32];
         let h = UdpHeader { id: [1; 8], stream: 2, flags: FLAG_FIN, seq: 9, send_time: 42 };
-        h.put(&mut b);
+        let b = h.datagram();
+        assert_eq!(b[..11], [1, 1, 1, 1, 1, 1, 1, 1, 0, 2, FLAG_FIN]);
         let back = UdpHeader::parse(&b).unwrap();
-        assert_eq!((back.stream, back.flags, back.seq, back.send_time), (2, FLAG_FIN, 9, 42));
+        assert_eq!((back.id, back.stream, back.flags, back.seq, back.send_time), ([1; 8], 2, FLAG_FIN, 9, 42));
+        assert!(UdpHeader::parse(&b[..31]).is_none());
+        // Zero fields are omitted, like Go's omitempty.
+        let j = serde_json::to_string(&Message {
+            stats: Some(Stats { bytes: 5, duration: Duration::from_millis(1), ..Default::default() }),
+            ..Message::new("done")
+        })
+        .unwrap();
+        assert_eq!(j, r#"{"type":"done","stats":{"bytes":5,"duration":1000000}}"#);
+        let m: Message = serde_json::from_str(r#"{"type":"ok","id":"0102030405060708","extra":1}"#).unwrap();
+        assert_eq!(parse_id(&m.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(parse_id("0102"), None);
+        assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
+    }
+
+    #[test]
+    fn validates_params() {
+        assert!(params().validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok());
+        let bad = |f: fn(&mut Params), want: &str| {
+            let mut p = params();
+            f(&mut p);
+            let e = p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).unwrap_err();
+            assert!(e.contains(want), "{e:?} doesn't contain {want:?}");
+        };
+        bad(|p| p.bytes = -1, "negative byte count");
+        bad(|p| p.duration = Duration::ZERO, "duration or byte count");
+        bad(|p| p.duration = Duration::from_secs(601), "exceeds the server's limit of 10m0s");
+        bad(|p| p.streams = 0, "at least one stream");
+        bad(|p| p.streams = 129, "129 streams");
+        bad(|p| p.length = 31, "smaller than the 32-byte header");
+        bad(|p| p.length = MAX_UDP_SIZE + 1, "UDP length");
+        bad(
+            |p| {
+                p.proto = Proto::Tcp;
+                p.length = MAX_LENGTH + 1;
+            },
+            "TCP length",
+        );
+        bad(|p| p.bitrate = -1, "negative bitrate");
+        bad(|p| p.interval = Duration::from_millis(50), "interval 50ms is shorter than 100ms");
+        // A byte count lifts the duration limit, and clients have no limits.
+        let mut p = params();
+        (p.bytes, p.duration) = (1, Duration::from_secs(10_000));
+        assert!(p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok());
+        p.streams = 1000;
+        assert!(p.validate(0, Duration::ZERO).is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_lines() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (_ar, mut aw) = tokio::io::split(a);
+        let mut br = BufReader::new(b);
+        aw.write_all(&Message::new("ready").line()).await.unwrap();
+        aw.write_all(b"not json\n").await.unwrap();
+        aw.write_all(&vec![b' '; CTRL_BUF_SIZE + 1]).await.unwrap();
+        assert_eq!(read_message(&mut br).await.unwrap().typ, "ready");
+        let e = read_message(&mut br).await.unwrap_err();
+        assert!(e.to_string().contains("bad control message"), "{e}");
+        let e = read_message(&mut br).await.unwrap_err();
+        assert!(e.to_string().contains("control line too long"), "{e}");
+        drop(aw);
+    }
+
+    fn stats(bytes: i64, datagrams: i64, secs: u64) -> Option<Stats> {
+        Some(Stats { bytes, datagrams, duration: Duration::from_secs(secs), ..Default::default() })
+    }
+
+    #[test]
+    fn reports() {
+        let res = PerfResult {
+            params: params(),
+            client_sent: stats(1_250_000, 1000, 10),
+            server_received: stats(1_120_000, 900, 10),
+            server_sent: stats(0, 0, 10),
+            client_received: None,
+            rtt: Some(Rtt {
+                min: Duration::from_millis(1),
+                avg: Duration::from_millis(2),
+                max: Duration::from_millis(3),
+                count: 4,
+            }),
+        };
+        assert_eq!(
+            result_lines(&res),
+            [
+                "client -> server:",
+                "  sent        1.25 MB in   10.0s   1.00 Mbit/s  1000 datagrams",
+                "  received    1.12 MB in   10.0s    896 Kbit/s  900 datagrams, 100 lost (10.0%), 0 reordered, jitter 0s",
+                "server -> client:",
+                "rtt under load  min 1ms  avg 2ms  max 3ms  (4 samples)",
+            ]
+        );
+        assert_eq!(perf_summary(&res), "UDP client -> server 896 Kbit/s (10.0% lost), server -> client ?");
+        let res =
+            PerfResult { params: Params { proto: Proto::Tcp, direction: Direction::Download, ..params() }, ..res };
+        assert_eq!(perf_summary(&res), "TCP server -> client ?");
+        assert_eq!(describe(&res.params), "TCP, server -> client, 1 stream, 10s, 1.00 Mbit/s per stream");
+        let p = Params { bytes: 5_000_000, streams: 2, bitrate: 0, ..params() };
+        assert_eq!(describe(&p), "UDP, both directions, 2 streams, 5.00 MB per stream");
     }
 }

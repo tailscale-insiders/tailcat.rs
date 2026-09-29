@@ -1,12 +1,11 @@
 //! Client modes: the stdin/stdout pipe and `tailcat ping`.
 
 use std::net::SocketAddr;
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
-use tailcat::{Addr, Client, ClientOptions};
+use anyhow::{Result, anyhow, bail};
+use tailcat::{Addr, Client, ClientOptions, DiscoPingResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::cache::DiskDerpMapCache;
@@ -28,7 +27,7 @@ pub fn new_client(g: &Global, addr: Addr, key: tailcat::NodePrivate) -> Client {
 
 /// `tailcat <tc-addr> [<port>|<ip:port>]`: pipes stdin and stdout
 /// through a TCP connection to the server (port 1 by default).
-pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Result<ExitCode> {
+pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Result<()> {
     let addr = crate::addrarg::tailcat_addr_arg(addr_arg).await?;
     let cl = new_client(g, addr, crate::keys::client_key(g)?);
     enum Dest {
@@ -81,43 +80,37 @@ pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Resu
     up.abort();
     // Our ACK of the server's FIN starts in this process; let it drain.
     cl.drain_tcp(Duration::from_secs(5)).await;
-    Ok(ExitCode::SUCCESS)
+    Ok(())
+}
+
+/// The name of the DERP region a pong came through: its code, or else
+/// its ID.
+pub fn derp_region_name(r: &DiscoPingResult) -> String {
+    if r.derp_region_code.is_empty() { r.derp_region_id.to_string() } else { r.derp_region_code.clone() }
 }
 
 /// `tailcat ping [--until-direct] <tc-addr>`.
-pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_arg: &str) -> Result<ExitCode> {
+pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_arg: &str) -> Result<()> {
     let addr = crate::addrarg::tailcat_addr_arg(addr_arg).await?;
     let cl = new_client(g, addr, crate::keys::client_key(g)?);
+    let no_direct = || anyhow!("no direct path to the server after {}", crate::util::fmt_duration(timeout));
     let deadline = Instant::now() + timeout;
     loop {
         let t0 = Instant::now();
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(t0);
         let res = match tokio::time::timeout(remaining, cl.disco_ping(remaining.max(Duration::from_millis(1)))).await {
             Ok(Ok(r)) => r,
-            Ok(Err(tailcat::Error::Timeout(_))) | Err(_) if until_direct => {
-                return Err(anyhow!("no direct path to the server after {}", crate::util::fmt_duration(timeout)));
-            }
-            Ok(Err(e)) => return Err(anyhow!("ping: {e}")),
-            Err(_) => return Err(anyhow!("ping: timed out")),
+            Ok(Err(tailcat::Error::Timeout(_))) | Err(_) if until_direct => return Err(no_direct()),
+            Ok(Err(e)) => bail!("ping: {e}"),
+            Err(_) => bail!("ping: timed out"),
         };
-        let via = match res.endpoint {
-            Some(ep) => ep.to_string(),
-            None => format!(
-                "DERP({})",
-                if res.derp_region_code.is_empty() {
-                    res.derp_region_id.to_string()
-                } else {
-                    res.derp_region_code.clone()
-                }
-            ),
-        };
+        let via = res.endpoint.map_or_else(|| format!("DERP({})", derp_region_name(&res)), |ep| ep.to_string());
         println!("pong in {} via {via}", crate::util::fmt_duration(res.latency));
-        let direct = res.endpoint.is_some();
-        if direct || !until_direct {
-            return Ok(ExitCode::SUCCESS);
+        if res.endpoint.is_some() || !until_direct {
+            return Ok(());
         }
         if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
-            return Err(anyhow!("no direct path to the server after {}", crate::util::fmt_duration(timeout)));
+            return Err(no_direct());
         }
         tokio::time::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed())).await;
     }
