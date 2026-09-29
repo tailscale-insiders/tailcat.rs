@@ -57,6 +57,8 @@ mod http;
 mod keyset;
 mod proxy;
 mod server;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 mod tls;
 
 pub use addr::{Addr, ConnInfo, PrivateKey};
