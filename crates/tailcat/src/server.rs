@@ -5,7 +5,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -230,10 +229,7 @@ struct Inner {
     ms: Arc<MagicSock>,
     engine: Arc<Engine>,
     stack: Stack,
-    /// Connected clients and their node IDs, for logs; like the Go
-    /// server, IDs are never reused.
-    clients: Mutex<HashMap<NodePublic, u64>>,
-    next_client_id: AtomicU64,
+    clients: Mutex<Clients>,
     pending_allow: Mutex<HashSet<NodePublic>>,
     listeners: Mutex<Listeners>,
     cfg: Handlers,
@@ -253,6 +249,18 @@ impl Drop for Inner {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The connected clients. Joins and disconnects configure a client's
+/// WireGuard and magicsock peers while holding this, so neither can
+/// catch the other half done: a client is a peer exactly when it's here.
+struct Clients {
+    /// Node IDs, for logs; like the Go server, IDs are never reused.
+    ids: HashMap<NodePublic, u64>,
+    next_id: u64,
+    /// Counts calls to [`Server::disconnect_client`], so a join whose
+    /// allow hook answered before a revocation can't complete after it.
+    disconnects: u64,
 }
 
 /// The per-flow hooks and filters, set through [`ServerBuilder`].
@@ -435,8 +443,7 @@ impl Server {
             ms,
             engine,
             stack,
-            clients: Mutex::default(),
-            next_client_id: AtomicU64::new(2),
+            clients: Mutex::new(Clients { ids: HashMap::new(), next_id: 2, disconnects: 0 }),
             pending_allow: Mutex::default(),
             listeners: Mutex::default(),
             cfg: b.cfg,
@@ -493,14 +500,17 @@ impl Server {
     /// authenticated the peer by this key.
     pub fn peer_key(&self, remote: SocketAddr) -> Option<NodePublic> {
         let IpAddr::V6(ip) = remote.ip() else { return None };
-        self.inner.clients.lock().unwrap().keys().find(|k| k.tailcat_ip() == ip).copied()
+        self.inner.clients.lock().unwrap().ids.keys().find(|k| k.tailcat_ip() == ip).copied()
     }
 
     /// Drops the connected client `k` and reports whether it was
     /// connected. Its connections stall rather than reset. Nothing stops
-    /// it reconnecting unless the allow hook now rejects it.
+    /// it reconnecting unless the allow hook now rejects it (a join the
+    /// hook approved before this call is dropped, and asked about again).
     pub fn disconnect_client(&self, k: &NodePublic) -> bool {
-        let Some(id) = self.inner.clients.lock().unwrap().remove(k) else { return false };
+        let mut clients = self.inner.clients.lock().unwrap();
+        clients.disconnects += 1;
+        let Some(id) = clients.ids.remove(k) else { return false };
         debug!("tailcat: disconnecting client {} (peer {id})", k.short_string());
         self.inner.engine.remove_peer(k);
         self.inner.ms.remove_peer(k);
@@ -509,7 +519,7 @@ impl Server {
 
     /// Returns a status snapshot with one entry per connected client.
     pub fn status(&self) -> ServerStatus {
-        let clients: Vec<NodePublic> = self.inner.clients.lock().unwrap().keys().copied().collect();
+        let clients: Vec<NodePublic> = self.inner.clients.lock().unwrap().ids.keys().copied().collect();
         let peers = clients
             .into_iter()
             .map(|k| {
@@ -575,10 +585,11 @@ impl Server {
 
     async fn on_meow(&self, src: NodePublic, disco: DiscoPublic) -> bool {
         debug!("tailcat: got meow from {src}");
-        if self.inner.clients.lock().unwrap().contains_key(&src) {
-            return true;
-        }
-        if let Some(allow) = self.inner.cfg.allow_client.clone() {
+        let (known, disconnects) = {
+            let clients = self.inner.clients.lock().unwrap();
+            (clients.ids.contains_key(&src), clients.disconnects)
+        };
+        if !known && let Some(allow) = self.inner.cfg.allow_client.clone() {
             if !self.inner.pending_allow.lock().unwrap().insert(src) {
                 // An earlier meow is still waiting on the hook; the client retries.
                 return false;
@@ -590,13 +601,20 @@ impl Server {
                 return false;
             }
         }
-        match self.inner.clients.lock().unwrap().entry(src) {
-            Entry::Occupied(_) => return true,
-            Entry::Vacant(e) => {
-                let id = *e.insert(self.inner.next_client_id.fetch_add(1, Ordering::Relaxed));
-                debug!("tailcat: client {} added as peer {id}", src.short_string());
-            }
+        let mut clients = self.inner.clients.lock().unwrap();
+        if clients.disconnects != disconnects {
+            // The hook's answer may predate a revocation; the client retries.
+            debug!("tailcat: ignoring meow from {src}: a client was disconnected meanwhile");
+            return false;
         }
+        let id = clients.next_id;
+        if let Entry::Vacant(e) = clients.ids.entry(src) {
+            e.insert(id);
+            clients.next_id += 1;
+            debug!("tailcat: client {} added as peer {id}", src.short_string());
+        }
+        // A known client is refreshed, since it may have restarted with a
+        // new disco key; neither upsert disturbs a working session.
         self.inner.ms.upsert_peer(magicsock::PeerConfig {
             node_key: src,
             disco_key: disco,
@@ -611,7 +629,8 @@ impl Server {
                 persistent_keepalive: None,
             },
         );
-        // Tell the new client our UDP endpoints so both sides can try a
+        drop(clients);
+        // Tell the client our UDP endpoints so both sides can try a
         // direct path.
         self.inner.ms.send_call_me_maybe(&src);
         true
@@ -721,7 +740,126 @@ impl<T> Drop for Listener<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
     use super::*;
+    use crate::KeySet;
+    use crate::derp::server::DevDerp;
+    use crate::key::DiscoPrivate;
+
+    /// Whether `k` is a connected client, a WireGuard peer, and a
+    /// magicsock peer, which should always agree.
+    fn membership(s: &Server, k: &NodePublic) -> (bool, bool, bool) {
+        let client = s.status().peers.iter().any(|p| p.key == *k);
+        (client, s.inner.engine.peer_stats(k).is_some(), s.inner.ms.peer_path(k).is_some())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_beats_a_pending_allow() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let k = NodePrivate::generate().public();
+        let allow = KeySet::default();
+        allow.add(k);
+        // The hook reads the allowlist, then stalls until the test has
+        // revoked the key, like a slow lookup.
+        let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (check, hook_asked, hook_resume) = (allow.checker(), asked.clone(), resume.clone());
+        let server = Server::builder()
+            .region(dev.region.clone())
+            .allow_client(move |k| {
+                let ok = check(k);
+                hook_asked.wait();
+                hook_resume.wait();
+                ok
+            })
+            .start()
+            .await
+            .unwrap();
+        let join = tokio::spawn({
+            let s = server.clone();
+            async move { s.on_meow(k, DiscoPrivate::generate().public()).await }
+        });
+        tokio::task::spawn_blocking(move || asked.wait()).await.unwrap();
+        // The documented revocation, while the hook's stale answer is
+        // still in flight.
+        allow.remove(&k);
+        assert!(!server.disconnect_client(&k));
+        tokio::task::spawn_blocking(move || resume.wait()).await.unwrap();
+        assert!(!join.await.unwrap(), "revoked client was acked");
+        assert_eq!(membership(&server, &k), (false, false, false));
+        server.close();
+    }
+
+    /// Clients meowing and being disconnected from several threads at
+    /// once, against one server.
+    struct Membership {
+        server: Server,
+        rt: tokio::runtime::Handle,
+        keys: [NodePublic; 2],
+    }
+
+    impl Membership {
+        fn key(&self, tc: &TestCase) -> NodePublic {
+            self.keys[tc.draw(gs::integers::<usize>().max_value(self.keys.len() - 1))]
+        }
+
+        fn meow(&self, k: NodePublic) -> bool {
+            self.rt.block_on(self.server.on_meow(k, DiscoPrivate::generate().public()))
+        }
+    }
+
+    #[hegel::concurrent_state_machine]
+    impl Membership {
+        #[rule(group = "churn")]
+        fn join(&self, tc: TestCase) {
+            let k = self.key(&tc);
+            self.meow(k);
+        }
+
+        #[rule(group = "churn")]
+        fn disconnect(&self, tc: TestCase) {
+            let k = self.key(&tc);
+            self.server.disconnect_client(&k);
+        }
+
+        /// With no disconnects about, an ack means the client is a
+        /// WireGuard peer: it starts dialing on the ack.
+        #[rule(group = "joins")]
+        fn join_then_check(&self, tc: TestCase) {
+            let k = self.key(&tc);
+            assert!(self.meow(k));
+            assert!(self.server.inner.engine.peer_stats(&k).is_some(), "acked before the WireGuard peer was added");
+        }
+
+        #[invariant]
+        fn peers_agree(&self, _: TestCase) {
+            for k in &self.keys {
+                let (client, wg, ms) = membership(&self.server, k);
+                assert!(client == wg && wg == ms, "{k}: client {client}, WireGuard peer {wg}, magicsock peer {ms}");
+            }
+        }
+    }
+
+    #[hegel::test(test_cases = 200)]
+    fn joins_and_disconnects_are_atomic(tc: TestCase) {
+        // One relay and server for every test case; each case uses fresh keys.
+        static WORLD: OnceLock<(tokio::runtime::Runtime, DevDerp, Server)> = OnceLock::new();
+        let (rt, _, server) = WORLD.get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let (dev, server) = rt.block_on(async {
+                let dev = DevDerp::start_local().await.unwrap();
+                let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
+                (dev, server)
+            });
+            (rt, dev, server)
+        });
+        let keys = [(); 2].map(|_| NodePrivate::generate().public());
+        let m = Membership { server: server.clone(), rt: rt.handle().clone(), keys };
+        hegel::stateful::machine(m).steps(20).max_concurrency(4).run_concurrent(tc);
+    }
 
     #[test]
     fn nat64_round_trip() {
