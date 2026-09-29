@@ -10,7 +10,9 @@ use crate::netstack::UdpConn;
 /// have finished. When one direction's source reaches EOF, the
 /// destination gets a write shutdown, propagating TCP half-close rather
 /// than tearing the connection down, so netcat-style protocols (send a
-/// request, FIN, read the reply) work through the proxy.
+/// request, FIN, read the reply) work through the proxy. An error in
+/// either direction (a reset) ends both: the other side's peer may
+/// never close its end otherwise.
 ///
 /// It returns the byte counts copied a→b and b→a.
 pub async fn proxy_conns<A, B>(a: A, b: B) -> (u64, u64)
@@ -20,7 +22,9 @@ where
 {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    tokio::join!(pipe(&mut ar, &mut bw), pipe(&mut br, &mut aw))
+    let (mut ab, mut ba) = (0, 0);
+    let _ = tokio::try_join!(copy(&mut ar, &mut bw, &mut ab), copy(&mut br, &mut aw, &mut ba));
+    (ab, ba)
 }
 
 /// Copies `r` to `w` until EOF or an error on either side, then shuts
@@ -30,16 +34,33 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 64 << 10];
-    let mut total = 0u64;
-    while let Ok(n @ 1..) = r.read(&mut buf).await {
-        if w.write_all(&buf[..n]).await.is_err() || w.flush().await.is_err() {
-            break;
-        }
-        total += n as u64;
-    }
-    let _ = w.shutdown().await;
+    let mut total = 0;
+    let _ = copy(r, w, &mut total).await;
     total
+}
+
+/// Copies `r` to `w`, counting bytes into `total`, until EOF or an error
+/// on either side, then shuts `w` down; it reports the error, if any.
+async fn copy<R, W>(r: &mut R, w: &mut W, total: &mut u64) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 64 << 10];
+    let r = async {
+        loop {
+            let n = r.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            w.write_all(&buf[..n]).await?;
+            w.flush().await?;
+            *total += n as u64;
+        }
+    }
+    .await;
+    let _ = w.shutdown().await;
+    r
 }
 
 /// Copies whole datagrams between a tunnel UDP flow and a connected OS
@@ -93,5 +114,55 @@ mod tests {
         assert_eq!(reply, b"a longer reply");
 
         assert_eq!(proxy.await.unwrap(), (7, 14));
+    }
+
+    /// A connection whose reads fail, as a reset one's do.
+    struct Reset;
+
+    impl AsyncRead for Reset {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        }
+    }
+
+    impl AsyncWrite for Reset {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// When one side resets, the proxy ends, and closes the other side,
+    /// even if that side's peer ignores the FIN and stays quiet.
+    #[tokio::test]
+    async fn proxy_conns_ends_when_a_side_resets() {
+        let (mut b, b_far) = tokio::io::duplex(1024);
+        let proxy = tokio::spawn(proxy_conns(Reset, b_far));
+        let counts = tokio::time::timeout(Duration::from_secs(5), proxy).await.expect("proxy still running");
+        assert_eq!(counts.unwrap(), (0, 0));
+        // `b` sees its connection closed, not just half-closed: writes fail.
+        assert_eq!(b.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(b.write_all(b"x").await.is_err());
     }
 }

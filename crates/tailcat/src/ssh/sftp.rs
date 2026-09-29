@@ -5,29 +5,52 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata, OpenOptions};
+use cap_std::fs::{Dir, Metadata, OpenOptions, ReadDir};
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
 
 use super::{FileServeMode, FileService};
 
+/// The most handles a session may have open at once.
+const MAX_HANDLES: usize = 128;
+/// The most bytes a read returns, leaving room for the reply's header in
+/// OpenSSH's 256KiB message limit (as its server does).
+const MAX_READ: u32 = (256 << 10) - 1024;
+/// The most names one readdir reply carries.
+const READDIR_BATCH: usize = 100;
+
 enum Open {
-    File(cap_std::fs::File),
-    Dir(Option<Vec<File>>),
+    File(Arc<cap_std::fs::File>, Option<Upload>),
+    /// A listing, until it's been read to the end (or a read failed).
+    Dir(Option<ReadDir>),
+}
+
+/// A drop-box upload, written under a hidden temporary name and moved to
+/// its own when closed, so an interrupted upload never looks complete.
+struct Upload {
+    requested: String,
+    temp: String,
 }
 
 pub(crate) struct Sftp {
-    root: Dir,
+    root: Arc<Dir>,
     /// `None` is full access; otherwise the file service mode.
     mode: Option<FileServeMode>,
     /// The virtual working directory ("/" for rooted services).
     cwd: String,
     handles: HashMap<String, Open>,
     next_handle: u64,
-    /// For write-only modes: requested path -> the path actually written.
-    /// Always empty in other modes.
+    /// For write-only modes: requested path -> the path actually written
+    /// (the temporary one, while it's open). Always empty in other modes.
     wrote: HashMap<String, String>,
+}
+
+/// Runs filesystem work that may block (reads, writes, listings) off the
+/// async runtime's threads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> Result<T, StatusCode> {
+    tokio::task::spawn_blocking(f).await.map_err(|_| StatusCode::Failure)?.map_err(io_code)
 }
 
 fn ok(id: u32) -> Status {
@@ -103,15 +126,41 @@ fn longname(name: &str, a: &FileAttributes) -> String {
     format!("{kind}{perms}    1 {uid:<8} {gid:<8} {size:>8} {name}")
 }
 
+/// Splits a path relative to the root into its directory (with its
+/// trailing slash, or empty) and base name.
+fn split_dir(p: &str) -> (&str, &str) {
+    p.split_at(p.rfind('/').map_or(0, |i| i + 1))
+}
+
 /// A unique name for a drop-box upload: stem.YYYYMMDDhhmmss.<random>.ext.
 fn unique_upload_path(requested: &str) -> String {
-    let (dir, base) = requested.split_at(requested.rfind('/').map_or(0, |i| i + 1));
+    let (dir, base) = split_dir(requested);
     let (stem, ext) = match base.rfind('.') {
         Some(i) if i > 0 => base.split_at(i),
         _ => (base, ""),
     };
     let rnd = hex::encode(rand::random::<[u8; 8]>());
     format!("{dir}{stem}.{}.{rnd}{ext}", utc_timestamp())
+}
+
+/// The hidden name an upload to `requested` is written under until it's
+/// closed: .base.<random>.part, beside it.
+fn temp_upload_path(requested: &str) -> String {
+    let (dir, base) = split_dir(requested);
+    format!("{dir}.{base}.{}.part", hex::encode(rand::random::<[u8; 8]>()))
+}
+
+/// Gives the file `from` the name `to` too, failing if `to` exists.
+fn link_new(root: &Dir, from: &str, to: &str) -> io::Result<()> {
+    match root.hard_link(from, root, to) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+            // Some filesystems have no hard links: claim the name, then
+            // move the file over it.
+            root.open_with(to, OpenOptions::new().write(true).create_new(true))?;
+            root.rename(from, root, to)
+        }
+        r => r,
+    }
 }
 
 /// The current UTC time as YYYYMMDDhhmmss.
@@ -128,7 +177,7 @@ impl Sftp {
             None => ("/".into(), None, super::session::current_user().home),
         };
         Ok(Sftp {
-            root: Dir::open_ambient_dir(dir, ambient_authority())?,
+            root: Arc::new(Dir::open_ambient_dir(dir, ambient_authority())?),
             mode,
             cwd,
             handles: HashMap::new(),
@@ -154,6 +203,11 @@ impl Sftp {
         matches!(self.mode, None | Some(FileServeMode::ReadWrite))
     }
 
+    /// Fails unless another handle may be opened.
+    fn handle_room(&self) -> Result<(), StatusCode> {
+        if self.handles.len() < MAX_HANDLES { Ok(()) } else { Err(StatusCode::Failure) }
+    }
+
     fn new_handle(&mut self, o: Open) -> String {
         let h = format!("h{}", self.next_handle);
         self.next_handle += 1;
@@ -161,9 +215,9 @@ impl Sftp {
         h
     }
 
-    fn file(&self, handle: &str) -> Result<&cap_std::fs::File, StatusCode> {
+    fn file(&self, handle: &str) -> Result<&Arc<cap_std::fs::File>, StatusCode> {
         match self.handles.get(handle) {
-            Some(Open::File(f)) => Ok(f),
+            Some(Open::File(f, _)) => Ok(f),
             _ => Err(StatusCode::Failure),
         }
     }
@@ -183,21 +237,34 @@ impl Sftp {
         }
     }
 
-    fn open_write_only(&mut self, p: String, pflags: OpenFlags) -> Result<cap_std::fs::File, StatusCode> {
+    /// Starts a drop-box upload to `p`, under a temporary name for now.
+    fn open_write_only(&mut self, p: String, pflags: OpenFlags) -> Result<Open, StatusCode> {
         allow(!pflags.contains(OpenFlags::READ) && pflags.contains(OpenFlags::WRITE | OpenFlags::CREATE))?;
         let flat = self.mode == Some(FileServeMode::WriteOnly);
         allow(!flat || (p != "." && !p.contains('/')))?;
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        let mut actual = if flat { unique_upload_path(&p) } else { p.clone() };
-        let mut r = self.root.open_with(&actual, &opts);
+        let temp = temp_upload_path(&p);
+        let f = self.root.open_with(&temp, OpenOptions::new().write(true).create_new(true)).map_err(io_code)?;
+        self.wrote.insert(p.clone(), temp.clone());
+        Ok(Open::File(Arc::new(f), Some(Upload { requested: p, temp })))
+    }
+
+    /// Finishes a drop-box upload, giving it its own name: in flat mode a
+    /// fresh one, in tree mode the requested one unless that's taken.
+    fn commit(&mut self, up: Upload) -> Result<(), StatusCode> {
+        let flat = self.mode == Some(FileServeMode::WriteOnly);
+        let mut actual = if flat { unique_upload_path(&up.requested) } else { up.requested.clone() };
+        let mut r = link_new(&self.root, &up.temp, &actual);
         if !flat && matches!(&r, Err(e) if e.kind() == io::ErrorKind::AlreadyExists) {
-            actual = unique_upload_path(&p);
-            r = self.root.open_with(&actual, &opts);
+            actual = unique_upload_path(&up.requested);
+            r = link_new(&self.root, &up.temp, &actual);
         }
-        let f = r.map_err(io_code)?;
-        self.wrote.insert(p, actual);
-        Ok(f)
+        let _ = self.root.remove_file(&up.temp);
+        if r.is_err() && self.wrote.get(&up.requested) == Some(&up.temp) {
+            self.wrote.remove(&up.requested);
+        }
+        r.map_err(io_code)?;
+        self.wrote.insert(up.requested, actual);
+        Ok(())
     }
 
     fn setstat_path(&self, p: &str, a: &FileAttributes) -> io::Result<()> {
@@ -222,6 +289,18 @@ impl Sftp {
     }
 }
 
+impl Drop for Sftp {
+    /// Discards unfinished uploads when the session ends: the drop box's
+    /// clients can't resume them.
+    fn drop(&mut self) {
+        for open in self.handles.values() {
+            if let Open::File(_, Some(up)) = open {
+                let _ = self.root.remove_file(&up.temp);
+            }
+        }
+    }
+}
+
 impl russh_sftp::server::Handler for Sftp {
     type Error = StatusCode;
 
@@ -236,8 +315,9 @@ impl russh_sftp::server::Handler for Sftp {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        self.handle_room()?;
         let p = self.rel(&filename);
-        let file = if self.write_only() {
+        let open = if self.write_only() {
             self.open_write_only(p, pflags)?
         } else {
             let wants_write =
@@ -251,28 +331,37 @@ impl russh_sftp::server::Handler for Sftp {
                 .truncate(pflags.contains(OpenFlags::TRUNCATE))
                 .create(create && !exclusive)
                 .create_new(create && exclusive);
-            self.root.open_with(&p, &o).map_err(io_code)?
+            Open::File(Arc::new(self.root.open_with(&p, &o).map_err(io_code)?), None)
         };
-        Ok(Handle { id, handle: self.new_handle(Open::File(file)) })
+        Ok(Handle { id, handle: self.new_handle(open) })
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-        self.handles.remove(&handle).ok_or(StatusCode::Failure)?;
+        if let Open::File(f, Some(up)) = self.handles.remove(&handle).ok_or(StatusCode::Failure)? {
+            drop(f);
+            self.commit(up)?;
+        }
         Ok(ok(id))
     }
 
     async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
-        let mut buf = vec![0u8; len.min(256 << 10) as usize];
-        let n = read_at(self.file(&handle)?, &mut buf, offset).map_err(io_code)?;
-        if n == 0 && len > 0 {
+        let f = self.file(&handle)?.clone();
+        let data = blocking(move || {
+            let mut buf = vec![0u8; len.min(MAX_READ) as usize];
+            let n = read_at(&f, &mut buf, offset)?;
+            buf.truncate(n);
+            Ok(buf)
+        })
+        .await?;
+        if data.is_empty() && len > 0 {
             return Err(StatusCode::Eof);
         }
-        buf.truncate(n);
-        Ok(Data { id, data: buf })
+        Ok(Data { id, data })
     }
 
     async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
-        write_all_at(self.file(&handle)?, &data, offset).map_err(io_code)?;
+        let f = self.file(&handle)?.clone();
+        blocking(move || write_all_at(&f, &data, offset)).await?;
         Ok(ok(id))
     }
 
@@ -312,27 +401,38 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         allow(!self.write_only())?;
-        let p = self.rel(&path);
-        let dir = if p == "." { self.root.try_clone() } else { self.root.open_dir(&p) }.map_err(io_code)?;
-        let files = dir
-            .entries()
-            .map_err(io_code)?
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let attrs = attrs(&e.metadata().ok()?);
-                let filename = e.file_name().to_string_lossy().into_owned();
-                Some(File { longname: longname(&filename, &attrs), filename, attrs })
-            })
-            .collect();
-        Ok(Handle { id, handle: self.new_handle(Open::Dir(Some(files))) })
+        self.handle_room()?;
+        let (root, p) = (self.root.clone(), self.rel(&path));
+        let entries = blocking(move || if p == "." { root.entries() } else { root.open_dir(&p)?.entries() }).await?;
+        Ok(Handle { id, handle: self.new_handle(Open::Dir(Some(entries))) })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        let Some(Open::Dir(files)) = self.handles.get_mut(&handle) else { return Err(StatusCode::Failure) };
-        match files.take() {
-            Some(files) if !files.is_empty() => Ok(Name { id, files }),
-            _ => Err(StatusCode::Eof),
+        let Some(Open::Dir(entries)) = self.handles.get_mut(&handle) else { return Err(StatusCode::Failure) };
+        let mut entries = entries.take().ok_or(StatusCode::Eof)?;
+        // A batch at a time: a whole large directory in one reply would be
+        // longer than clients accept.
+        let (entries, files) = blocking(move || {
+            let files: Vec<_> = entries
+                .by_ref()
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let attrs = attrs(&e.metadata().ok()?);
+                    let filename = e.file_name().to_string_lossy().into_owned();
+                    Some(File { longname: longname(&filename, &attrs), filename, attrs })
+                })
+                .take(READDIR_BATCH)
+                .collect();
+            Ok((entries, files))
+        })
+        .await?;
+        if files.is_empty() {
+            return Err(StatusCode::Eof);
         }
+        if let Some(Open::Dir(slot)) = self.handles.get_mut(&handle) {
+            *slot = Some(entries);
+        }
+        Ok(Name { id, files })
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
@@ -380,7 +480,7 @@ impl russh_sftp::server::Handler for Sftp {
         // OpenSSH's sftp sends (target, link) despite the spec's order.
         let link = self.rel(&targetpath);
         let target = if self.mode.is_some() { self.rel(&linkpath) } else { linkpath };
-        cap_fs_ext::DirExt::symlink(&self.root, target, link).map_err(io_code)?;
+        cap_fs_ext::DirExt::symlink(&*self.root, target, link).map_err(io_code)?;
         Ok(ok(id))
     }
 }
@@ -420,6 +520,9 @@ fn write_all_at(f: &cap_std::fs::File, mut data: &[u8], mut off: u64) -> io::Res
 }
 
 #[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
@@ -453,10 +556,10 @@ mod tests {
     }
 
     /// A scratch directory, removed on drop.
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub(super) PathBuf);
 
     impl TempDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let p = std::env::temp_dir().join(format!("tailcat-sftp-{}", hex::encode(rand::random::<[u8; 8]>())));
             std::fs::create_dir(&p).unwrap();
             TempDir(p)
@@ -645,5 +748,75 @@ mod tests {
         #[cfg(unix)]
         assert!(upload(&mut fs, "out/escaped", b"x").await.is_err());
         assert!(!t.0.join("escaped").exists());
+    }
+
+    /// An upload to a drop box is visible under its name only once it's
+    /// complete, and one cut off by the session ending leaves nothing.
+    #[tokio::test]
+    async fn drop_box_uploads_appear_when_closed() {
+        for mode in [FileServeMode::WriteOnly, FileServeMode::WriteOnlyTree] {
+            let (t, mut fs) = fixture(mode);
+            let root = t.0.join("root");
+            let before = names(&root);
+            let h = open(&mut fs, "new.bin", wc()).await.unwrap();
+            fs.write(0, h.clone(), 0, b"half".to_vec()).await.unwrap();
+            let during: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n)).collect();
+            assert!(during.len() == 1 && during[0].starts_with(".new.bin."), "{mode:?}: {during:?}");
+            assert_eq!(fs.stat(0, "new.bin".into()).await.unwrap().attrs.size, Some(4));
+            fs.write(0, h.clone(), 4, b" done".to_vec()).await.unwrap();
+            fs.close(0, h).await.unwrap();
+            let after: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n)).collect();
+            assert_eq!(after.len(), 1, "{mode:?}: {after:?}");
+            assert!(after[0].starts_with("new.") && after[0].ends_with(".bin"), "{after:?}");
+            assert_eq!(std::fs::read(root.join(&after[0])).unwrap(), b"half done");
+            assert_eq!(fs.stat(0, "new.bin".into()).await.unwrap().attrs.size, Some(9));
+
+            let h = open(&mut fs, "cut.bin", wc()).await.unwrap();
+            fs.write(0, h, 0, b"partial".to_vec()).await.unwrap();
+            drop(fs);
+            let left: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n) && *n != after[0]).collect();
+            assert!(left.is_empty(), "{mode:?}: {left:?}");
+        }
+    }
+
+    /// Listings come a batch at a time, small enough for any client.
+    #[tokio::test]
+    async fn listings_are_paged() {
+        let (t, mut fs) = fixture(FileServeMode::ReadOnly);
+        let dir = t.0.join("root/sub");
+        for i in 0..250 {
+            std::fs::write(dir.join(format!("f{i:03}")), "").unwrap();
+        }
+        let h = fs.opendir(0, "sub".into()).await.unwrap().handle;
+        let mut listed = Vec::new();
+        loop {
+            match fs.readdir(0, h.clone()).await {
+                Ok(n) => {
+                    assert!(n.files.len() <= READDIR_BATCH);
+                    listed.extend(n.files.into_iter().map(|f| f.filename));
+                }
+                Err(e) => {
+                    assert_eq!(e, StatusCode::Eof);
+                    break;
+                }
+            }
+        }
+        listed.sort();
+        assert_eq!(listed, names(&dir));
+        assert_eq!(fs.readdir(0, h).await.unwrap_err(), StatusCode::Eof);
+    }
+
+    /// A session can't hold unlimited handles (and descriptors) open.
+    #[tokio::test]
+    async fn open_handles_are_limited() {
+        let (_t, mut fs) = fixture(FileServeMode::ReadOnly);
+        let mut hs = Vec::new();
+        for _ in 0..MAX_HANDLES {
+            hs.push(open(&mut fs, "a.txt", R).await.unwrap());
+        }
+        assert_eq!(open(&mut fs, "a.txt", R).await.unwrap_err(), StatusCode::Failure);
+        assert_eq!(fs.opendir(0, "/".into()).await.unwrap_err(), StatusCode::Failure);
+        fs.close(0, hs.pop().unwrap()).await.unwrap();
+        fs.opendir(0, "/".into()).await.unwrap();
     }
 }

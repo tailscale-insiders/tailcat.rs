@@ -288,14 +288,31 @@ async fn finish(wr: &Writer, code: u32) {
     let _ = wr.close().await;
 }
 
+/// What the client sends next on a channel.
+enum Input {
+    Data(Bytes),
+    /// The client won't send more, but may still be reading.
+    Eof,
+    /// The channel closed, or the whole connection went away.
+    Closed,
+}
+
+async fn next_input(rd: &mut ChannelReadHalf) -> Input {
+    loop {
+        match rd.wait().await {
+            Some(ChannelMsg::Data { data }) => return Input::Data(data),
+            Some(ChannelMsg::Eof) => return Input::Eof,
+            Some(ChannelMsg::Close) | None => return Input::Closed,
+            Some(_) => {}
+        }
+    }
+}
+
 /// Returns the next data the client sends, or `None` at its EOF.
 async fn next_data(rd: &mut ChannelReadHalf) -> Option<Bytes> {
-    loop {
-        match rd.wait().await? {
-            ChannelMsg::Data { data } => return Some(data),
-            ChannelMsg::Eof | ChannelMsg::Close => return None,
-            _ => {}
-        }
+    match next_input(rd).await {
+        Input::Data(data) => Some(data),
+        Input::Eof | Input::Closed => None,
     }
 }
 
@@ -342,16 +359,21 @@ async fn serve_sftp(ch: Channel<Msg>, fs: Sftp) {
 /// Runs a command with pipes for stdio, returning its exit status.
 async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
     let mut cmd = plan.command();
-    let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             say(wr, format!("start: {e}\r\n")).await;
             return 1;
         }
     };
-    let mut stdin = child.stdin.take();
+    let stdin = child.stdin.take();
     let (stdout, stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
-    let input = async {
+    // The input goes to the command until the client's EOF or the command
+    // exits, even once its output is closed: `docker load >/dev/null 2>&1`
+    // still reads all of it.
+    let input = async move {
+        let mut stdin = stdin;
         while let Some(data) = next_data(rd).await {
             if let Some(s) = &mut stdin
                 && s.write_all(&data).await.is_err()
@@ -359,15 +381,14 @@ async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
                 stdin = None;
             }
         }
-        drop(stdin.take());
-    };
-    let outputs = async {
-        tokio::join!(pump(stdout, wr.make_writer()), pump(stderr, wr.make_writer_ext(Some(1))));
     };
     // Drain the output before waiting, so a fast command's output isn't
     // lost; the input side may still be waiting on the client.
-    drain(outputs, input).await;
-    exit_code(child.wait().await)
+    let exited = async {
+        tokio::join!(pump(stdout, wr.make_writer()), pump(stderr, wr.make_writer_ext(Some(1))));
+        child.wait().await
+    };
+    exit_code(drain(exited, input).await)
 }
 
 fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
@@ -384,6 +405,7 @@ mod pty {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use russh::{ChannelReadHalf, Pty};
@@ -392,7 +414,16 @@ mod pty {
     use tokio::io::unix::AsyncFd;
     use tokio::sync::mpsc;
 
-    use super::{INTERACTIVE_MOTD, Plan, PtyReq, Writer, drain, exit_code, next_data, say};
+    use super::{INTERACTIVE_MOTD, Input, Plan, PtyReq, Writer, drain, exit_code, next_input, say};
+
+    /// Once the command exits, output stops when the terminal has had
+    /// nothing to read for this long...
+    const DRAIN_IDLE: Duration = Duration::from_millis(100);
+    /// ...or after this much more, from background jobs still writing.
+    const DRAIN_MAX: usize = 256 << 10;
+    /// How long a command has to exit after the client hangs up before
+    /// it's killed.
+    const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
     fn winsize(cols: u32, rows: u32) -> libc::winsize {
         libc::winsize {
@@ -519,15 +550,18 @@ mod pty {
                 Ok(())
             });
         }
-        let child = cmd.spawn();
-        drop(slave);
-        let mut child = match child {
+        // We keep `slave` open until the output is drained: some systems
+        // (macOS) discard what's left in the terminal when the last slave
+        // descriptor closes, as it does when the command exits.
+        let mut child = match cmd.kill_on_drop(true).spawn() {
             Ok(c) => c,
             Err(e) => {
                 say(wr, format!("start: {e}\r\n")).await;
                 return 1;
             }
         };
+        // The session leader's pid, which is also its process group's.
+        let pid = child.id().expect("running") as libc::pid_t;
         unsafe {
             let fl = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
             libc::fcntl(master.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
@@ -545,52 +579,84 @@ mod pty {
         if motd {
             let _ = out_w.write_all(INTERACTIVE_MOTD.as_bytes()).await;
         }
+        // Set once the command is reaped, and its pid may be reused.
+        let reaped = AtomicBool::new(false);
+        // Copies the terminal's output to the client until the command
+        // exits and what it left is drained, returning its exit status.
         let output = async {
             let mut buf = vec![0u8; 16 << 10];
-            // Reads fail with EIO once the slave side is gone.
-            while let Ok(n @ 1..) = master.async_io(Interest::READABLE, |mut f| f.read(&mut buf)).await {
+            let (mut status, mut budget) = (None, DRAIN_MAX);
+            loop {
+                let read = master.async_io(Interest::READABLE, |mut f| f.read(&mut buf));
+                let r = if status.is_none() {
+                    tokio::select! {
+                        r = read => r,
+                        st = child.wait() => {
+                            reaped.store(true, Ordering::Relaxed);
+                            status = Some(st);
+                            continue;
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(DRAIN_IDLE, read).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    }
+                };
+                let Ok(n @ 1..) = r else { break };
                 if out_w.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
                 let _ = out_w.flush().await;
+                if status.is_some() {
+                    budget = budget.saturating_sub(n);
+                    if budget == 0 {
+                        break;
+                    }
+                }
             }
+            let st = match status {
+                Some(st) => st,
+                None => child.wait().await,
+            };
+            reaped.store(true, Ordering::Relaxed);
+            st
         };
         let input = async {
             loop {
                 tokio::select! {
-                    data = next_data(rd) => match data {
-                        Some(data) if write_all(&master, &data).await.is_ok() => {}
-                        _ => break,
+                    input = next_input(rd) => match input {
+                        Input::Data(data) => {
+                            let _ = write_all(&master, &data).await;
+                        }
+                        Input::Eof => {}
+                        Input::Closed => break,
                     },
                     Some(ws) = winch.recv() => {
                         resize(ws);
                     }
                 }
             }
-            // Keep handling resizes until the session ends.
-            while let Some(ws) = winch.recv().await {
-                resize(ws);
+            // The client is gone: hang up, as closing the terminal would,
+            // signalling the session and the terminal's foreground job.
+            if !reaped.load(Ordering::Relaxed) {
+                let fg = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+                for pg in [pid, fg] {
+                    if pg > 0 {
+                        unsafe { libc::kill(-pg, libc::SIGHUP) };
+                    }
+                }
+            }
+            // A session leader that outlives the hangup has nobody to talk
+            // to; its background jobs keep what they chose (as with nohup).
+            tokio::time::sleep(HANGUP_GRACE).await;
+            if !reaped.load(Ordering::Relaxed) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         };
-        tokio::pin!(output);
-        let exited = drain(
-            async {
-                tokio::select! {
-                    _ = &mut output => None,
-                    st = child.wait() => Some(st),
-                }
-            },
-            input,
-        )
-        .await;
-        match exited {
-            None => exit_code(child.wait().await),
-            Some(st) => {
-                // Collect what's left in the PTY buffer, briefly.
-                let _ = tokio::time::timeout(Duration::from_millis(200), &mut output).await;
-                exit_code(st)
-            }
-        }
+        let status = drain(output, input).await;
+        drop(slave);
+        exit_code(status)
     }
 }
 
@@ -673,18 +739,72 @@ mod tests {
     /// Serves `opts` on one end of an in-memory pipe, connecting a client
     /// to the other; the peer's tunnel identity is `NodePrivate([9; 32])`.
     async fn connect(opts: SshOptions) -> client::Handle<Client> {
+        connect_with(opts, client::Config::default()).await
+    }
+
+    async fn connect_with(opts: SshOptions, config: client::Config) -> client::Handle<Client> {
         let peer = NodePrivate::from_bytes([9; 32]).public();
         let shared = Arc::new(Shared::new(Arc::new(move |_| Some(peer)), opts, test_key(1)).unwrap());
         let (a, b) = tokio::io::duplex(1 << 16);
         let local = "[fd7a:115c:a1e0::1]:22".parse().unwrap();
         tokio::spawn(shared.serve(a, local, "[fd7a:115c:a1e0::2]:4242".parse().unwrap()));
-        client::connect_stream(Arc::new(client::Config::default()), b, Client).await.unwrap()
+        client::connect_stream(Arc::new(config), b, Client).await.unwrap()
     }
 
     async fn login(opts: SshOptions) -> client::Handle<Client> {
-        let mut h = connect(opts).await;
+        login_with(opts, client::Config::default()).await
+    }
+
+    async fn login_with(opts: SshOptions, config: client::Config) -> client::Handle<Client> {
+        let mut h = connect_with(opts, config).await;
         assert!(h.authenticate_none("u").await.unwrap().success());
         h
+    }
+
+    /// Options forcing every session to run `script` with /bin/sh, which
+    /// unlike the user's login shell every test machine has.
+    fn sh(script: &str) -> SshOptions {
+        SshOptions { exec: ["/bin/sh", "-c", script].map(String::from).to_vec(), ..Default::default() }
+    }
+
+    /// Reads a channel's output until it holds a line `pids <a> <b>…`.
+    #[cfg(unix)]
+    async fn read_pids(ch: &mut Channel<client::Msg>) -> Vec<libc::pid_t> {
+        let mut out = String::new();
+        loop {
+            match ch.wait().await {
+                Some(ChannelMsg::Data { data }) => out.push_str(&String::from_utf8_lossy(&data)),
+                Some(_) => continue,
+                None => panic!("no pids in {out:?}"),
+            }
+            if let Some(i) = out.find("pids ")
+                && let Some((line, _)) = out[i..].split_once('\n')
+            {
+                return line.split_whitespace().skip(1).map(|p| p.parse().unwrap()).collect();
+            }
+        }
+    }
+
+    /// Polls `cond` until it holds, reporting whether it did in time.
+    async fn wait_for(within: std::time::Duration, cond: impl Fn() -> bool) -> bool {
+        tokio::time::timeout(within, async {
+            while !cond() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Reports whether this machine (or sandbox) has PTYs.
+    #[cfg(unix)]
+    fn have_pty() -> bool {
+        let (mut m, mut s) = (-1, -1);
+        use std::ptr::null_mut;
+        if unsafe { libc::openpty(&mut m, &mut s, null_mut(), null_mut(), null_mut()) } != 0 {
+            return false;
+        }
+        unsafe { libc::close(m) + libc::close(s) == 0 }
     }
 
     #[derive(Debug, Default)]
@@ -695,10 +815,20 @@ mod tests {
     }
 
     /// Runs `cmd` on a prepared channel, sending `input` then EOF.
-    async fn run(mut ch: Channel<client::Msg>, cmd: &str, input: &[u8]) -> Output {
+    async fn run(ch: Channel<client::Msg>, cmd: &str, input: &[u8]) -> Output {
         ch.exec(true, cmd).await.unwrap();
+        run_started(ch, input).await
+    }
+
+    /// Sends `input` then EOF to a started session, and collects its output.
+    async fn run_started(ch: Channel<client::Msg>, input: &[u8]) -> Output {
         ch.data(input).await.unwrap();
         ch.eof().await.unwrap();
+        collect(ch).await
+    }
+
+    /// Collects a session's output until the channel closes.
+    async fn collect(mut ch: Channel<client::Msg>) -> Output {
         let (mut out, mut err, mut o) = (Vec::new(), Vec::new(), Output::default());
         while let Some(m) = ch.wait().await {
             match m {
@@ -781,6 +911,96 @@ mod tests {
         }
         assert_eq!(o.out, "50 100\r\nxterm\r\ntty\r\n");
         assert_eq!(o.code, Some(0));
+    }
+
+    /// A command that closes its output before reading its input still
+    /// gets all of it, and its exit status arrives.
+    #[tokio::test]
+    async fn pipes_feed_a_command_with_closed_output() {
+        let h = login(sh("exec >/dev/null 2>&1; test \"$(wc -c)\" -eq 100000")).await;
+        let ch = h.channel_open_session().await.unwrap();
+        ch.exec(true, "x").await.unwrap();
+        // Let the command close its output first.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let o = tokio::time::timeout(std::time::Duration::from_secs(10), run_started(ch, &[b'x'; 100_000])).await;
+        assert_eq!(o.expect("the session hung").code, Some(0));
+    }
+
+    /// Hanging up a PTY session, by closing its channel or by going away
+    /// altogether, ends the command (and its background jobs), even one
+    /// that ignores the hangup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_sessions_end_when_the_client_goes() {
+        use std::time::Duration;
+        if !have_pty() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tailcat-hup-{}", hex::encode(rand::random::<[u8; 8]>())));
+        std::fs::create_dir(&dir).unwrap();
+        // The background job notes its hangup in a file: once orphaned, it
+        // may linger as a zombie where nothing reaps orphans. It reports
+        // the shell's pid ($$ in a subshell) once it's ready.
+        let with_job = |name: &str| {
+            let marker = dir.join(name);
+            let trap = format!("trap 'echo > {}; exit' HUP", marker.display());
+            (format!("({trap}; echo pids $$; while :; do sleep 0.1; done) & wait"), Some(marker))
+        };
+        let cases = [
+            (with_job("close"), false),
+            (with_job("disconnect"), true),
+            (("trap '' HUP; echo pids $$; while :; do sleep 1; done".to_string(), None), false),
+        ];
+        for ((script, marker), disconnect) in cases {
+            let h = login(sh(&script)).await;
+            let mut ch = h.channel_open_session().await.unwrap();
+            ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+            ch.exec(true, "x").await.unwrap();
+            let pids = tokio::time::timeout(Duration::from_secs(10), read_pids(&mut ch)).await.unwrap();
+            if disconnect {
+                h.disconnect(russh::Disconnect::ByApplication, "", "").await.unwrap();
+            } else {
+                ch.close().await.unwrap();
+            }
+            // Gone means reaped, by the session.
+            let ended = wait_for(Duration::from_secs(10), || unsafe { libc::kill(pids[0], 0) != 0 }).await;
+            assert!(ended, "{script:?} (disconnect: {disconnect}): shell still running");
+            if let Some(m) = marker {
+                assert!(wait_for(Duration::from_secs(10), || m.exists()).await, "{script:?}: no hangup for the job");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Output still in the PTY when the command exits reaches a client
+    /// that's slow to take it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_output_outlasts_the_command() {
+        if !have_pty() {
+            return;
+        }
+        // How much of the output is still on its way when the command
+        // exits depends on the platform's PTY buffering, so try a few sizes.
+        let one = async |size: usize| {
+            let config = client::Config { window_size: 2048, channel_buffer_size: 1, ..Default::default() };
+            let script = format!("head -c {size} /dev/zero | tr '\\0' x; echo END");
+            let h = login_with(sh(&script), config).await;
+            let ch = h.channel_open_session().await.unwrap();
+            ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+            ch.exec(true, "x").await.unwrap();
+            // Take nothing while the command writes and exits.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let o = tokio::time::timeout(std::time::Duration::from_secs(10), collect(ch)).await.unwrap();
+            (size, o)
+        };
+        let runs = futures::future::join_all([500, 1000, 2000, 3000, 4000, 6000, 8000].map(one)).await;
+        for (size, o) in runs {
+            let tail = &o.out[o.out.len().saturating_sub(20)..];
+            assert_eq!(o.out.len(), size + "END\r\n".len(), "{size} bytes, got {} ending {tail:?}", o.out.len());
+            assert!(o.out.ends_with("xEND\r\n"), "{tail:?}");
+            assert_eq!(o.code, Some(0));
+        }
     }
 
     #[tokio::test]
