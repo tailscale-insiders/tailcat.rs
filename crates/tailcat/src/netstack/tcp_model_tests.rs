@@ -816,7 +816,7 @@ impl Net {
         let mut st = self.stack.shared.lock();
         let held: HashSet<SocketHandle> = self.conns.iter().filter_map(|c| Some(c.stream.as_ref()?.handle)).collect();
         let live: HashSet<SocketHandle> = st.sockets.iter().map(|(h, _)| h).collect();
-        let orphans: HashSet<SocketHandle> = st.orphans.iter().copied().collect();
+        let orphans: HashSet<SocketHandle> = st.orphans.iter().map(|&(h, _)| h).collect();
         assert_eq!(orphans.len(), st.orphans.len(), "a socket was orphaned twice");
         let dials = self.conns.iter().filter(|c| c.dial.is_some()).count();
         let mut unowned = 0;
@@ -839,7 +839,7 @@ impl Net {
         assert!(unowned <= dials, "{unowned} sockets belong to nobody");
         assert!(st.tuples.values().all(|h| live.contains(h)), "a flow's socket was removed");
         assert!(st.ends.keys().all(|h| live.contains(h)), "a removed socket's end is kept");
-        assert!(st.orphans.iter().all(|h| live.contains(h)), "a removed socket is an orphan");
+        assert!(st.orphans.iter().all(|(h, _)| live.contains(h)), "a removed socket is an orphan");
         let t = st.now();
         let State { iface, sockets, .. } = &mut *st;
         // Timers may have just come due, but nothing is overdue, and no
@@ -985,7 +985,6 @@ fn aborted_connection_is_drained() {
 /// A dropped connection whose peer acks our FIN but never sends its own
 /// is aborted after a while, instead of sitting in FIN-WAIT-2 forever.
 #[test]
-#[ignore = "known bug: a dropped connection can sit in FIN-WAIT-2 forever"]
 fn orphan_in_fin_wait_2_is_reaped() {
     let mut net = Net::new();
     let i = net.dial();

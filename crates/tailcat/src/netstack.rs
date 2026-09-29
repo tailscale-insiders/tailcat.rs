@@ -159,9 +159,9 @@ struct State {
     /// How connections ended, where the socket's state doesn't say: a
     /// closed socket may have had a FIN, a RST or an abort.
     ends: HashMap<SocketHandle, End>,
-    /// Sockets no longer referenced by a TcpStream; they're removed once
-    /// they finish closing.
-    orphans: Vec<SocketHandle>,
+    /// Sockets no longer referenced by a TcpStream, and since when;
+    /// they're removed once they finish closing.
+    orphans: Vec<(SocketHandle, tokio::time::Instant)>,
     udp: HashMap<FlowKey, mpsc::Sender<Vec<u8>>>,
     next_port: u16,
     closed: bool,
@@ -551,17 +551,22 @@ async fn poll_loop(shared: Weak<Shared>) {
                 });
             for (h, _) in dead {
                 st.sockets.get_mut::<tcp::Socket>(h).abort();
-                st.orphans.push(h);
+                st.orphans.push((h, tokio::time::Instant::now()));
             }
 
-            // Reap closed sockets nobody holds any more.
+            // Reap closed sockets nobody holds any more, and abort ones that
+            // take too long to close: a live peer that never sends its FIN
+            // would keep one in FIN-WAIT-2 forever.
             let State { sockets, tuples, ends, orphans, .. } = st;
-            orphans.retain(|&h| {
-                let done = matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Closed | tcp::State::TimeWait);
+            orphans.retain(|&(h, since)| {
+                let s = sockets.get_mut::<tcp::Socket>(h);
+                let done = matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait);
                 if done {
                     sockets.remove(h);
                     tuples.retain(|_, v| *v != h);
                     ends.remove(&h);
+                } else if since.elapsed() > TCP_TIMEOUT {
+                    s.abort();
                 }
                 !done
             });
@@ -578,7 +583,8 @@ async fn poll_loop(shared: Weak<Shared>) {
         if closed {
             return;
         }
-        let delay = delay.map_or(Duration::from_secs(1), Duration::from);
+        // Wake at least every second, for the timeouts smoltcp doesn't know.
+        let delay = delay.map_or(Duration::from_secs(1), |d| Duration::from(d).min(Duration::from_secs(1)));
         let wake = sh.wake.clone();
         drop(sh);
         if delay.is_zero() {
@@ -688,7 +694,7 @@ impl Drop for TcpStream {
         if s.is_open() {
             s.close();
         }
-        st.orphans.push(self.handle);
+        st.orphans.push((self.handle, tokio::time::Instant::now()));
         drop(st);
         self.shared.wake.notify_one();
     }
