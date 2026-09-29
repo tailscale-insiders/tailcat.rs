@@ -1,12 +1,32 @@
 [package]
 name = "tailcat-device"
-description = "A WireGuard mesh overlay on a real TUN device, built on tailcat's DERP and NAT traversal"
+description = "A WireGuard mesh overlay on a real TUN device, built on tailcat's DERP relays and NAT traversal, with peers from node records (files or GitHub Actions run artifacts)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "tailcat-device"
+path = "src/main.rs"
+
 [dependencies]
 tailcat.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tun-rs.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

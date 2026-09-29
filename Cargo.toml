@@ -10,7 +10,7 @@ license = "BSD-3-Clause"
 repository = "https://github.com/tailscale-insiders/tailcat.rs"
 
 [workspace.dependencies]
-tailcat = { path = "crates/tailcat", version = "0.1.0" }
+tailcat = { path = "crates/tailcat", version = "0.1.0", default-features = false }
 anyhow = "1"
 base64 = "0.22"
 boringtun = { version = "0.7.1", default-features = false }

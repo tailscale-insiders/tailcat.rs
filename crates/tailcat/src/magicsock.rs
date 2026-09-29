@@ -331,6 +331,19 @@ impl MagicSock {
         self.endpoints_tx.subscribe()
     }
 
+    /// Adds (or replaces) a DERP region that peers may be reached through.
+    pub fn add_region(&self, r: DerpRegion) {
+        let mut inner = self.inner.lock().unwrap();
+        if r.region_id != 0 && inner.derp_map.regions.get(&r.region_id) != Some(&r) {
+            // A changed non-home region reconnects with the new details on
+            // next use; the home connection is kept.
+            if r.region_id != self.home_region {
+                inner.derp.remove(&r.region_id);
+            }
+            inner.derp_map.regions.insert(r.region_id, r);
+        }
+    }
+
     /// Adds a peer or updates what we know about it.
     pub fn upsert_peer(&self, cfg: PeerConfig) {
         let mut inner = self.inner.lock().unwrap();
