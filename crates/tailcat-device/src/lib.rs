@@ -19,6 +19,7 @@
 
 pub mod github;
 pub mod overlay;
+pub mod reconcile;
 pub mod record;
 pub mod source;
 

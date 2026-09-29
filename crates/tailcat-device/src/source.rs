@@ -27,8 +27,9 @@ pub struct GithubSource {
     pub name_prefix: String,
     pub audience_prefix: String,
     verifier: Option<Verifier>,
-    /// Artifacts already fetched, by ID: their admitted record, if any.
-    seen: HashMap<u64, Option<NodeRecord>>,
+    /// Artifacts already fetched, by ID: their run, and their admitted
+    /// record, if any.
+    seen: HashMap<u64, (String, Option<NodeRecord>)>,
 }
 
 impl GithubSource {
@@ -47,8 +48,8 @@ impl GithubSource {
             Scope::Run => vec![self.env.run_id.clone()],
             s => github::sibling_runs(&self.env, s).await?,
         };
-        for run in runs {
-            for a in github::list_artifacts(&self.env, &run).await? {
+        for run in &runs {
+            for a in github::list_artifacts(&self.env, run).await? {
                 if !a.name.starts_with(&self.name_prefix) || self.seen.contains_key(&a.id) {
                     continue;
                 }
@@ -67,15 +68,24 @@ impl GithubSource {
                     self.verifier = Some(Verifier::fetch().await?);
                 }
                 let admitted = rec.and_then(|r| {
-                    github::admit(&r, &run, &self.env, self.scope, self.verifier.as_ref(), &self.audience_prefix)?;
+                    github::admit(&r, run, &self.env, self.scope, self.verifier.as_ref(), &self.audience_prefix)?;
                     Ok(r)
                 });
                 // Not retried: artifacts don't change.
                 let admitted = admitted.inspect_err(|e| warn!("not admitting artifact {}: {e:#}", a.name)).ok();
-                self.seen.insert(a.id, admitted);
+                self.seen.insert(a.id, (run.clone(), admitted));
             }
         }
-        Ok(self.seen.values().flatten().cloned().collect())
+        // Only runs still in progress: a finished run's nodes are gone.
+        // Oldest artifact first, so the result doesn't depend on hashing.
+        let mut live: Vec<(u64, &NodeRecord)> = self
+            .seen
+            .iter()
+            .filter(|(_, (run, _))| runs.contains(run))
+            .filter_map(|(id, (_, r))| Some((*id, r.as_ref()?)))
+            .collect();
+        live.sort_by_key(|(id, _)| *id);
+        Ok(live.into_iter().map(|(_, r)| r.clone()).collect())
     }
 }
 
@@ -250,9 +260,13 @@ mod tests {
             ("/dl/3", body(&untokened)),
             ("/dl/4", body(&misfiled)),
         ]);
-        let (base, _) = fake_github(Box::new(move |base, path, _| match path {
-            "/repos/o/r/actions/workflows/mesh.yml/runs?status=in_progress&per_page=50&branch=main" => {
+        let (base, _) = fake_github(Box::new(move |base, path, n| match path {
+            // Run 99 finishes after the first poll.
+            "/repos/o/r/actions/workflows/mesh.yml/runs?status=in_progress&per_page=50&branch=main" if n == 1 => {
                 (200, br#"{"workflow_runs": [{"id": 99}]}"#.to_vec())
+            }
+            "/repos/o/r/actions/workflows/mesh.yml/runs?status=in_progress&per_page=50&branch=main" => {
+                (200, br#"{"workflow_runs": []}"#.to_vec())
             }
             "/repos/o/r/actions/runs/100/artifacts?per_page=100&page=1" => {
                 (200, artifacts(base, &[(1, "node-1-0", false)]))
@@ -264,7 +278,8 @@ mod tests {
         }))
         .await;
         let mut src = Source::Github(Box::new(github(base, Scope::Branch, "node-").with_verifier(s.verifier())));
-        assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours, sibling]));
+        assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours.clone(), sibling]));
+        assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours]), "a finished run's records are dropped");
     }
 
     #[tokio::test]

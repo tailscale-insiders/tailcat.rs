@@ -2,6 +2,8 @@
 //! (for example as a GitHub Actions run artifact) so that every other
 //! node can add it as a peer. The private key never leaves the node.
 
+use std::ffi::OsString;
+use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
@@ -95,11 +97,12 @@ impl NodeRecord {
         self.derp.clone().or_else(|| dm.regions.get(&self.derp_region).cloned())
     }
 
-    /// Writes the record as pretty JSON.
+    /// Writes the record as pretty JSON, atomically: peers polling a
+    /// records directory never see it half-written.
     pub fn write(&self, path: &Path) -> Result<()> {
         let mut j = serde_json::to_vec_pretty(self)?;
         j.push(b'\n');
-        std::fs::write(path, j).with_context(|| format!("writing {}", path.display()))
+        write_atomic(path, &j)
     }
 }
 
@@ -129,23 +132,62 @@ impl DeviceKey {
         Ok(k)
     }
 
-    /// Saves the key file, readable only by its owner.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        use std::io::Write;
+    /// Saves the key file, readable only by its owner. An existing file
+    /// is an error unless `replace`; either way the file appears whole,
+    /// or not at all.
+    pub fn save(&self, path: &Path, replace: bool) -> Result<()> {
         let j = serde_json::to_vec_pretty(self)?;
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        o.open(path).and_then(|mut f| f.write_all(&j)).with_context(|| format!("writing {}", path.display()))
+        write_file(path, &j, 0o600, replace).map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => anyhow!("{} already exists; use --force to overwrite", path.display()),
+            _ => anyhow::Error::new(e).context(format!("writing {}", path.display())),
+        })
     }
+}
+
+/// Writes a file atomically, replacing any existing one: readers see the
+/// old content or the new, never a partial write.
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    write_file(path, data, 0o666, true).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Writes `data` to a temporary file created with `mode` (on Unix, less
+/// the umask) beside `path`, then moves it into place: renamed over any
+/// existing file if `replace`, else linked, which fails if `path` exists.
+/// The temporary file is hidden and doesn't end in `.json`, so it never
+/// shows up in a records directory.
+fn write_file(path: &Path, data: &[u8], mode: u32, replace: bool) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file name"))?;
+    let mut tmp = OsString::from(".");
+    tmp.push(name);
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp);
+    // A leftover from a crash might have other permissions.
+    let _ = std::fs::remove_file(&tmp);
+    let res = (|| {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, mode);
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = o.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        if replace { std::fs::rename(&tmp, path) } else { std::fs::hard_link(&tmp, path) }
+    })();
+    if res.is_err() || !replace {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// The default overlay address for a node: `base + attempt*256 + index`
 /// within an IPv4 prefix, so the default `100.64.0.0/16` gives
-/// `100.64.<attempt>.<index>`.
+/// `100.64.<attempt>.<index>`. The index must be below 256, or it would
+/// take another attempt's address.
 pub fn overlay_ip(prefix: &IpNet, attempt: u32, index: u32) -> Result<IpAddr> {
     let IpAddr::V4(base) = prefix.addr else { bail!("the overlay prefix must be IPv4") };
+    ensure!(index < 256, "index {index} is too large for a default overlay IP; pass --ip");
     let host_bits = 32 - prefix.prefix_len.min(32) as u32;
     let offset = attempt as u64 * 256 + index as u64;
     ensure!(offset < 1 << host_bits, "attempt {attempt} index {index} doesn't fit in {prefix}");
@@ -167,6 +209,8 @@ mod tests {
         assert_eq!(ip("0.0.0.0/0", 1, 1).unwrap(), "0.0.1.1");
         assert_eq!(ip("10.9.8.0/24", 0, 255).unwrap(), "10.9.8.255");
         assert!(ip("10.9.8.0/24", 1, 0).is_err());
+        // Index 256 would be attempt 2's index 0.
+        assert!(ip("100.64.0.0/16", 1, 256).is_err());
         assert!(ip("10.9.8.7/32", 0, 1).is_err());
         assert!(ip("fd00::/64", 1, 1).is_err());
     }
@@ -235,20 +279,74 @@ mod tests {
         let path = dir.path().join("key");
         let private = NodePrivate::generate();
         let k = DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private };
-        k.save(&path).unwrap();
+        k.save(&path, false).unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        assert_eq!(mode(&path), 0o600);
         let back = DeviceKey::load(&path).unwrap();
         assert_eq!(back.private, k.private);
         assert_eq!(back.record, k.record);
 
+        // An existing key is kept unless it's to be replaced.
+        let other = DeviceKey { private: NodePrivate::generate(), record: k.record.clone() };
+        let err = other.save(&path, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+        assert_eq!(DeviceKey::load(&path).unwrap().private, k.private);
+
         // A record that isn't the key's is refused.
-        let other = DeviceKey { private: NodePrivate::generate(), record: k.record };
-        other.save(&path).unwrap();
+        other.save(&path, true).unwrap();
         assert!(DeviceKey::load(&path).is_err());
         assert!(DeviceKey::load(&dir.path().join("missing")).is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["key"], "no temporary files left");
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Replacing a world-readable file doesn't leave the new private key
+    /// readable by others.
+    #[cfg(unix)]
+    #[test]
+    fn replaced_key_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let private = NodePrivate::generate();
+        let k = DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private };
+        k.save(&path, true).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(DeviceKey::load(&path).unwrap().private, k.private);
+    }
+
+    #[test]
+    fn records_are_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-1-0.json");
+        let r = NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap());
+        std::fs::write(&path, b"{\"index\": ").unwrap();
+        r.write(&path).unwrap();
+        assert_eq!(NodeRecord::from_json(&std::fs::read(&path).unwrap()).unwrap(), r);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["node-1-0.json"]);
+    }
+
+    /// Distinct attempts and indexes never share a default overlay IP.
+    #[hegel::test(test_cases = 500)]
+    fn default_overlay_ips_are_distinct(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let prefix_len = tc.draw(gs::integers::<u8>().min_value(8).max_value(24));
+        let prefix = IpNet::new([100, 64, 0, 0].into(), prefix_len);
+        let n = || gs::integers::<u32>().max_value(1000);
+        let (a, b) = ((tc.draw(n()), tc.draw(n())), (tc.draw(n()), tc.draw(n())));
+        tc.assume(a != b);
+        if let (Ok(x), Ok(y)) = (overlay_ip(&prefix, a.0, a.1), overlay_ip(&prefix, b.0, b.1)) {
+            assert_ne!(x, y, "{a:?} and {b:?} both get {x} in {prefix}");
+            assert!(prefix.contains(&x) && prefix.contains(&y));
+        }
     }
 }
