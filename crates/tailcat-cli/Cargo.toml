@@ -35,4 +35,5 @@ russh-sftp = { workspace = true, optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+hegeltest = { version = "0.48", features = ["static-engine"] }
 tempfile = "3"
