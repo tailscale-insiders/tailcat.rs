@@ -119,10 +119,10 @@ impl DerpNode {
         for (s, v4) in [(&self.ipv4, true), (&self.ipv6, false)] {
             if s.is_empty() {
                 need_dns = true;
-            } else if let Ok(ip) = s.parse::<IpAddr>() {
-                if ip.is_ipv4() == v4 {
-                    out.push(SocketAddr::new(ip, port));
-                }
+            } else if let Ok(ip) = s.parse::<IpAddr>()
+                && ip.is_ipv4() == v4
+            {
+                out.push(SocketAddr::new(ip, port));
             }
         }
         if need_dns && !self.host_name.is_empty() {
@@ -151,7 +151,7 @@ impl DerpNode {
 pub trait DerpMapCache: Send + Sync {
     /// Returns the stored response for `url`: body, ETag (or empty), and
     /// when it was stored.
-    fn get(&self, url: &str) -> Option<(Vec<u8>, String, SystemTime)>;
+    fn get(&self, url: &str) -> Option<CacheEntry>;
     /// Stores the response for `url`, marking it stored now.
     fn put(&self, url: &str, data: &[u8], etag: &str);
 }
@@ -160,18 +160,18 @@ pub trait DerpMapCache: Send + Sync {
 /// is given.
 #[derive(Default)]
 pub struct MemDerpMapCache {
-    m: Mutex<BTreeMap<String, (Vec<u8>, String, SystemTime)>>,
+    m: Mutex<BTreeMap<String, CacheEntry>>,
 }
 
+/// A cached response: body, ETag, and when it was stored.
+type CacheEntry = (Vec<u8>, String, SystemTime);
+
 impl DerpMapCache for MemDerpMapCache {
-    fn get(&self, url: &str) -> Option<(Vec<u8>, String, SystemTime)> {
+    fn get(&self, url: &str) -> Option<CacheEntry> {
         self.m.lock().unwrap().get(url).cloned()
     }
     fn put(&self, url: &str, data: &[u8], etag: &str) {
-        self.m
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), (data.to_vec(), etag.to_string(), SystemTime::now()));
+        self.m.lock().unwrap().insert(url.to_string(), (data.to_vec(), etag.to_string(), SystemTime::now()));
     }
 }
 
@@ -225,14 +225,14 @@ pub async fn fetch_derp_map(opts: FetchOptions<'_>) -> Result<DerpMap> {
         None => default_cache(),
     };
     let mut stale: Option<(Vec<u8>, String)> = None;
-    if let Some((data, etag, stored)) = cache.get(url) {
-        if let Some(dm) = decode(&data) {
-            let age = SystemTime::now().duration_since(stored).unwrap_or_default();
-            if age < DERP_MAP_CACHE_MAX_AGE {
-                return Ok(dm);
-            }
-            stale = Some((data, etag));
+    if let Some((data, etag, stored)) = cache.get(url)
+        && let Some(dm) = decode(&data)
+    {
+        let age = SystemTime::now().duration_since(stored).unwrap_or_default();
+        if age < DERP_MAP_CACHE_MAX_AGE {
+            return Ok(dm);
         }
+        stale = Some((data, etag));
     }
     let stale_or = |e: Error| -> Result<DerpMap> {
         if let Some(dm) = stale.as_ref().and_then(|(d, _)| decode(d)) {
@@ -242,36 +242,28 @@ pub async fn fetch_derp_map(opts: FetchOptions<'_>) -> Result<DerpMap> {
     };
 
     let client = crate::http::client();
-    let mut req = client
-        .get(url)
-        .header("Tailcat-Mode", opts.mode.header())
-        .timeout(Duration::from_secs(10));
-    if let Some((_, etag)) = &stale {
-        if !etag.is_empty() {
-            req = req.header("If-None-Match", etag.as_str());
-        }
+    let mut req = client.get(url).header("Tailcat-Mode", opts.mode.header()).timeout(Duration::from_secs(10));
+    if let Some((_, etag)) = &stale
+        && !etag.is_empty()
+    {
+        req = req.header("If-None-Match", etag.as_str());
     }
     let res = match req.send().await {
         Ok(r) => r,
         Err(e) => return stale_or(Error::other(format!("fetching {url}: {e}"))),
     };
-    if res.status() == reqwest::StatusCode::NOT_MODIFIED {
-        if let Some((data, etag)) = &stale {
-            cache.put(url, data, etag);
-            if let Some(dm) = decode(data) {
-                return Ok(dm);
-            }
+    if res.status() == reqwest::StatusCode::NOT_MODIFIED
+        && let Some((data, etag)) = &stale
+    {
+        cache.put(url, data, etag);
+        if let Some(dm) = decode(data) {
+            return Ok(dm);
         }
     }
     if !res.status().is_success() {
         return stale_or(Error::other(format!("fetching {url}: {}", res.status())));
     }
-    let etag = res
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let body = match res.bytes().await {
         Ok(b) if b.len() <= 8 << 20 => b,
         Ok(_) => return stale_or(Error::other(format!("DERP map from {url} is too large"))),
@@ -296,10 +288,7 @@ pub fn find_region(dm: &DerpMap, s: &str) -> Option<i32> {
         return Some(r.region_id);
     }
     let needle = s.to_lowercase();
-    dm.regions
-        .values()
-        .find(|r| r.region_name.to_lowercase().contains(&needle))
-        .map(|r| r.region_id)
+    dm.regions.values().find(|r| r.region_name.to_lowercase().contains(&needle)).map(|r| r.region_id)
 }
 
 #[cfg(test)]

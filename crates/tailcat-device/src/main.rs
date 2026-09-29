@@ -21,7 +21,11 @@ use tailcat_device::{Overlay, OverlayConfig};
 use tracing::{info, warn};
 
 #[derive(Parser)]
-#[command(name = "tailcat-device", version, about = "join a WireGuard mesh overlay on a TUN interface, using tailcat's DERP relays and NAT traversal")]
+#[command(
+    name = "tailcat-device",
+    version,
+    about = "join a WireGuard mesh overlay on a TUN interface, using tailcat's DERP relays and NAT traversal"
+)]
 struct Cli {
     /// Log verbosely.
     #[arg(long, global = true)]
@@ -172,7 +176,20 @@ async fn fetch_map(url: &str) -> Result<DerpMap> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Init { index, attempt, overlay_prefix, ip, routes, region, region_file, key, out, oidc, oidc_audience_prefix, force } => {
+        Cmd::Init {
+            index,
+            attempt,
+            overlay_prefix,
+            ip,
+            routes,
+            region,
+            region_file,
+            key,
+            out,
+            oidc,
+            oidc_audience_prefix,
+            force,
+        } => {
             if key.exists() && !force {
                 bail!("{} already exists; use --force to overwrite", key.display());
             }
@@ -183,7 +200,8 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let (derp_region, derp) = match region_file {
                 Some(f) => {
-                    let r: DerpRegion = serde_json::from_slice(&std::fs::read(&f)?).with_context(|| format!("parsing {}", f.display()))?;
+                    let r: DerpRegion = serde_json::from_slice(&std::fs::read(&f)?)
+                        .with_context(|| format!("parsing {}", f.display()))?;
                     (0, Some(r))
                 }
                 None => pick_region(&cli.derpmap_url, &region).await?,
@@ -245,7 +263,7 @@ async fn run(cli: Cli) -> Result<()> {
                     Scope::Run => format!("node-{}-", env.run_attempt),
                     _ => "node-".into(),
                 });
-                Source::Github(GithubSource::new(env, scope, prefix, oidc_audience_prefix))
+                Source::Github(Box::new(GithubSource::new(env, scope, prefix, oidc_audience_prefix)))
             } else if let Some(d) = records {
                 Source::Dir(d)
             } else if !record.is_empty() {
@@ -316,7 +334,11 @@ async fn run(cli: Cli) -> Result<()> {
                 if let Some(f) = &status_file {
                     let _ = std::fs::write(f, serde_json::to_vec_pretty(&overlay.status())?);
                 }
-                let pause = if expected.is_some_and(|n| have < n) || !ready { Duration::from_secs(2) } else { Duration::from_secs(15) };
+                let pause = if expected.is_some_and(|n| have < n) || !ready {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(15)
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(pause) => {}
                     _ = &mut signal => {
@@ -385,7 +407,8 @@ fn open_tun(name: Option<&str>, me: &NodeRecord, prefix: &IpNet, mtu: u16) -> Re
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
@@ -400,12 +423,15 @@ async fn shutdown_signal() {
 /// Picks the home region for `init`.
 async fn pick_region(url: &str, region: &str) -> Result<(i32, Option<DerpRegion>)> {
     if region.contains('.') {
-        let nodes = region.split(',').map(|h| DerpNode { name: h.into(), host_name: h.into(), ..Default::default() }).collect();
+        let nodes =
+            region.split(',').map(|h| DerpNode { name: h.into(), host_name: h.into(), ..Default::default() }).collect();
         return Ok((0, Some(DerpRegion { region_id: 900, region_code: "custom".into(), nodes, ..Default::default() })));
     }
     let dm = fetch_map(url).await?;
     if region == "auto" {
-        let id = tailcat::netcheck::pick_best_region(&dm).await?.ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?;
+        let id = tailcat::netcheck::pick_best_region(&dm)
+            .await?
+            .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?;
         return Ok((id, None));
     }
     if let Ok(id) = region.parse::<i32>() {

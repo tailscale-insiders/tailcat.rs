@@ -12,7 +12,7 @@
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # Only what cargo needs: manifests, the lock file, Rust sources,
-      # and the README that the CLI embeds with include_str!.
+      # the rustfmt config, and the README the CLI embeds.
       src = lib.cleanSourceWith {
         src = ./.;
         filter = path: type:
@@ -21,6 +21,7 @@
           || lib.hasSuffix ".rs" base
           || base == "Cargo.toml"
           || base == "Cargo.lock"
+          || base == "rustfmt.toml"
           || base == "README.md";
       };
 
@@ -31,9 +32,8 @@
         pname = "tailcat-rs";
         inherit version src;
         cargoLock.lockFile = ./Cargo.lock;
-        # Unit and loopback integration tests; tests that need the
-        # public internet or root skip themselves when this is set.
-        env.TAILCAT_TEST_OFFLINE = "1";
+        # Unit tests and in-process end-to-end tests over loopback relays;
+        # none need the internet or root.
         cargoTestFlags = [ "--workspace" ];
         # The netstack and relay tests bind loopback sockets.
         __darwinAllowLocalNetworking = true;
@@ -88,7 +88,7 @@
           # build sandbox against nixpkgs' build of upstream tailcat.
           interop = pkgs.runCommand "tailcat-rs-interop"
             {
-              nativeBuildInputs = [ tailcat pkgs.tailcat pkgs.coreutils pkgs.bash pkgs.gnugrep ];
+              nativeBuildInputs = [ tailcat pkgs.tailcat pkgs.openssh pkgs.coreutils pkgs.bash pkgs.gnugrep ];
               __darwinAllowLocalNetworking = true;
             } ''
             export HOME=$TMPDIR/home

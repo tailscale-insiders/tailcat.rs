@@ -159,10 +159,7 @@ async fn https_report(dm: &DerpMap) -> HashMap<i32, Duration> {
 async fn https_latency(n: &DerpNode) -> Option<Duration> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut tls = crate::derp::client::dial_tls(n).await.ok()?;
-    let req = format!(
-        "HEAD /derp/latency-check HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        n.host_name
-    );
+    let req = format!("HEAD /derp/latency-check HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", n.host_name);
     let t0 = Instant::now();
     tls.write_all(req.as_bytes()).await.ok()?;
     let mut buf = [0u8; 12];

@@ -68,7 +68,9 @@ impl GithubEnv {
             bail!("not running in GitHub Actions (GITHUB_REPOSITORY and GITHUB_RUN_ID are unset)");
         }
         if e.token.is_empty() {
-            bail!("GITHUB_TOKEN is unset; pass it with `env: {{ GITHUB_TOKEN: ${{{{ github.token }}}} }}` and grant `actions: read`");
+            bail!(
+                "GITHUB_TOKEN is unset; pass it with `env: {{ GITHUB_TOKEN: ${{{{ github.token }}}} }}` and grant `actions: read`"
+            );
         }
         Ok(e)
     }
@@ -119,7 +121,8 @@ struct Run {
 pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>> {
     let mut out = Vec::new();
     for page in 1..=10 {
-        let url = format!("{}/repos/{}/actions/runs/{run_id}/artifacts?per_page=100&page={page}", e.api_url, e.repository);
+        let url =
+            format!("{}/repos/{}/actions/runs/{run_id}/artifacts?per_page=100&page={page}", e.api_url, e.repository);
         let res = e.get(&url).send().await.with_context(|| format!("listing artifacts of run {run_id}"))?;
         if !res.status().is_success() {
             bail!("listing artifacts of run {run_id}: {}", res.status());
@@ -167,7 +170,8 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
 /// Downloads an artifact's content: the single file inside its zip, or
 /// the raw file for single-file (unarchived) uploads.
 pub async fn download(e: &GithubEnv, a: &Artifact) -> Result<Vec<u8>> {
-    let res = e.get(&a.archive_download_url).send().await.with_context(|| format!("downloading artifact {}", a.name))?;
+    let res =
+        e.get(&a.archive_download_url).send().await.with_context(|| format!("downloading artifact {}", a.name))?;
     if !res.status().is_success() {
         bail!("downloading artifact {}: {}", a.name, res.status());
     }

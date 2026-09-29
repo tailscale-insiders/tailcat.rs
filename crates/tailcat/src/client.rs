@@ -153,7 +153,8 @@ impl Client {
             self.inner.derp_map.as_ref(),
         )
         .await?;
-        let region = ci.region.first().cloned().ok_or_else(|| Error::Addr("no DERP regions in tailcat address".into()))?;
+        let region =
+            ci.region.first().cloned().ok_or_else(|| Error::Addr("no DERP regions in tailcat address".into()))?;
         let server_key = ci.server_public;
         let server_ip = server_key.tailcat_ip();
 
@@ -277,9 +278,15 @@ impl Client {
         r.ms.send_call_me_maybe(&server);
         let res = r.ms.ping(&server, timeout).await?;
         Ok(match res.via {
-            PathAddr::Udp(a) => DiscoPingResult { latency: res.latency, endpoint: Some(a), derp_region_id: 0, derp_region_code: String::new() },
+            PathAddr::Udp(a) => DiscoPingResult {
+                latency: res.latency,
+                endpoint: Some(a),
+                derp_region_id: 0,
+                derp_region_code: String::new(),
+            },
             PathAddr::Derp(rid) => {
-                let code = r.ci.region.iter().find(|x| x.region_id == rid).map(|x| x.region_code.clone()).unwrap_or_default();
+                let code =
+                    r.ci.region.iter().find(|x| x.region_id == rid).map(|x| x.region_code.clone()).unwrap_or_default();
                 DiscoPingResult { latency: res.latency, endpoint: None, derp_region_id: rid, derp_region_code: code }
             }
         })
@@ -303,7 +310,8 @@ impl Client {
     /// Opens a UDP flow to a port on the server.
     pub async fn dial_udp_port(&self, port: u16) -> std::io::Result<UdpConn> {
         let r = self.up().await?;
-        r.stack.dial_udp(IpAddr::V6(self.inner.key.public().tailcat_ip()), SocketAddr::new(IpAddr::V6(r.server_ip), port))
+        r.stack
+            .dial_udp(IpAddr::V6(self.inner.key.public().tailcat_ip()), SocketAddr::new(IpAddr::V6(r.server_ip), port))
     }
 
     /// Opens a UDP flow to any address through the server (which must

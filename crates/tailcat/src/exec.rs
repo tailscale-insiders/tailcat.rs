@@ -65,50 +65,50 @@ async fn run_conn_command(s: &Server, c: TcpStream, argv: &[String]) -> std::io:
     let mut stdout = child.stdout.take().expect("piped");
     let (mut rd, mut wr) = tokio::io::split(c);
     let status = {
-    let to_child = async {
-        let mut buf = vec![0u8; 32 << 10];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin.write_all(&buf[..n]).await.is_err() {
-                        break;
+        let to_child = async {
+            let mut buf = vec![0u8; 32 << 10];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdin.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-        }
-        drop(stdin);
-    };
-    let from_child = async {
-        let mut buf = vec![0u8; 32 << 10];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if wr.write_all(&buf[..n]).await.is_err() {
-                        break;
+            drop(stdin);
+        };
+        let from_child = async {
+            let mut buf = vec![0u8; 32 << 10];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if wr.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
+            let _ = wr.shutdown().await;
+        };
+        // Finish once the command's output is flushed and it has exited. The
+        // stdin copy may still be blocked reading from a client that hasn't
+        // half-closed; its input no longer matters then.
+        let finished = async {
+            from_child.await;
+            child.wait().await
+        };
+        tokio::pin!(to_child, finished);
+        let mut to_done = false;
+
+        loop {
+            tokio::select! {
+                _ = &mut to_child, if !to_done => to_done = true,
+                st = &mut finished => break st?,
+            }
         }
-        let _ = wr.shutdown().await;
-    };
-    // Finish once the command's output is flushed and it has exited. The
-    // stdin copy may still be blocked reading from a client that hasn't
-    // half-closed; its input no longer matters then.
-    let finished = async {
-        from_child.await;
-        child.wait().await
-    };
-    tokio::pin!(to_child, finished);
-    let mut to_done = false;
-    let status = loop {
-        tokio::select! {
-            _ = &mut to_child, if !to_done => to_done = true,
-            st = &mut finished => break st?,
-        }
-    };
-    status
     };
     let c = rd.unsplit(wr);
     c.drain(Duration::from_secs(5)).await;

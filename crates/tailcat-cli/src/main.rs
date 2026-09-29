@@ -254,7 +254,8 @@ pub fn version_string() -> String {
 
 fn init_logging(verbose: bool) {
     let default = if verbose { "info,tailcat=debug,tailcat_cli=debug" } else { "off" };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
     tailcat::set_verbose(verbose);
 }
@@ -350,7 +351,9 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         #[cfg(feature = "ssh")]
-        Some(Cmd::Ssh { port, skip_dns_safety_check, args }) => ssh::ssh_mode(&g, &port, skip_dns_safety_check, args).await,
+        Some(Cmd::Ssh { port, skip_dns_safety_check, args }) => {
+            ssh::ssh_mode(&g, &port, skip_dns_safety_check, args).await
+        }
         #[cfg(feature = "ssh")]
         Some(Cmd::Cp { recursive, preserve, port, args }) => ssh::cp_mode(&g, recursive, preserve, &port, args).await,
         #[cfg(feature = "ssh")]
@@ -374,7 +377,11 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
         Some(Cmd::Resolve { addr }) => {
             let a = addrarg::tailcat_addr_arg(&addr).await?;
             let cache = cache::DiskDerpMapCache;
-            let opts = tailcat::FetchOptions { url: Some(&g.derpmap_url), mode: tailcat::FetchMode::Client, cache: Some(&cache) };
+            let opts = tailcat::FetchOptions {
+                url: Some(&g.derpmap_url),
+                mode: tailcat::FetchMode::Client,
+                cache: Some(&cache),
+            };
             let r = tokio::time::timeout(std::time::Duration::from_secs(10), a.resolve(opts))
                 .await
                 .map_err(|_| anyhow::anyhow!("timed out resolving the DERP region"))??;

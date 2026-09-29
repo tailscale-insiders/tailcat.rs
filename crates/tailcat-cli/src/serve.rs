@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
-    Addr, ConnInfo, DerpRegion, FetchMode, FetchOptions, KeySet, NodePublic, PortRange, PresharedKey, PrivateKey, Server,
-    TcpStream, UdpConn, handler, udp_handler,
+    Addr, ConnInfo, DerpRegion, FetchMode, FetchOptions, KeySet, NodePublic, PortRange, PresharedKey, PrivateKey,
+    Server, TcpStream, UdpConn, handler, udp_handler,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -74,10 +74,10 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
         }
         if let Some((port, target)) = r.split_once(':') {
             let (port, target) = parse_port_target(port, target)?;
-            if let Some(prev) = ps.targets.get(&port) {
-                if *prev != target {
-                    bail!("port {port} is mapped to both {prev} and {target}");
-                }
+            if let Some(prev) = ps.targets.get(&port)
+                && *prev != target
+            {
+                bail!("port {port} is mapped to both {prev} and {target}");
             }
             ps.ports.insert(port);
             ps.targets.insert(port, target);
@@ -99,7 +99,11 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
 /// Parses the halves of a "port:target" mapping.
 pub fn parse_port_target(port: &str, target: &str) -> Result<(u16, String)> {
     let mapping = format!("{port}:{target}");
-    let p: u16 = port.parse().ok().filter(|p| *p != 0).ok_or_else(|| anyhow!("{port:?} is not a valid port in mapping {mapping:?}"))?;
+    let p: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| anyhow!("{port:?} is not a valid port in mapping {mapping:?}"))?;
     if is_num(target) {
         let _: u16 = target.parse().map_err(|_| anyhow!("{target:?} is not a valid port in mapping {mapping:?}"))?;
         return Ok((p, format!("localhost:{target}")));
@@ -239,7 +243,11 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     // Which key.
     let key_name = match g.key.as_deref() {
         None | Some("") => {
-            if crate::keys::key_path("default")?.exists() { "default".to_string() } else { "new".to_string() }
+            if crate::keys::key_path("default")?.exists() {
+                "default".to_string()
+            } else {
+                "new".to_string()
+            }
         }
         Some(k) => k.to_string(),
     };
@@ -289,14 +297,12 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
             (reg, print)
         }
     };
-    let print_ci = ConnInfo {
-        server_public: private.public(),
-        server_disco_public: private.disco_private().public(),
-        ..print_ci
-    };
+    let print_ci =
+        ConnInfo { server_public: private.public(), server_disco_public: private.disco_private().public(), ..print_ci };
     let conn_str = print_ci.addr();
 
-    let mut b = Server::builder().key(private.clone()).preshared_key(psk).disable_preshared_key(!use_psk).region(region);
+    let mut b =
+        Server::builder().key(private.clone()).preshared_key(psk).disable_preshared_key(!use_psk).region(region);
 
     let ssh_services = services.contains("ssh") || services.contains("no-auth-ssh") || services.contains("files");
     // Outside the accept-one-connection mode (and exit-node and exec,
@@ -343,11 +349,11 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
             authorized_keys,
             ..Default::default()
         };
-        if opts.shell {
-            if let Some(a) = &exec_args {
-                opts.exec = a.clone();
-                eprintln!("# SSH sessions run only {}", a.join(" "));
-            }
+        if opts.shell
+            && let Some(a) = &exec_args
+        {
+            opts.exec = a.clone();
+            eprintln!("# SSH sessions run only {}", a.join(" "));
         }
         if services.contains("files") {
             let (fs, mode_name) = parse_files_flag(flags.files.as_deref().unwrap_or(""))?;
@@ -402,19 +408,19 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     let exec_h: Arc<OnceLock<tailcat::TcpHandler>> = Arc::new(OnceLock::new());
     let exec_h2 = exec_h.clone();
     b = b.on_tcp(move |port| {
-        if port == 22 {
-            if let Some(h) = &ssh_handler {
-                return Some(h.clone());
-            }
+        if port == 22
+            && let Some(h) = &ssh_handler
+        {
+            return Some(h.clone());
         }
-        if port == crate::perf::PORT {
-            if let Some(p) = &perf_srv {
+        if port == crate::perf::PORT
+            && let Some(p) = &perf_srv
+        {
+            let p = p.clone();
+            return Some(handler(move |c| {
                 let p = p.clone();
-                return Some(handler(move |c| {
-                    let p = p.clone();
-                    async move { p.handle_tcp(c).await }
-                }));
-            }
+                async move { p.handle_tcp(c).await }
+            }));
         }
         if ps.contains(port) {
             let t = ps.targets.get(&port).cloned().unwrap_or_else(|| format!("localhost:{port}"));
@@ -448,15 +454,19 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     }
     if ssh_noauth && flags.allow.is_none() {
         if exec_args.is_some() {
-            eprintln!("# ⚠️ WARNING: no-auth-ssh runs the command for anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow");
+            eprintln!(
+                "# ⚠️ WARNING: no-auth-ssh runs the command for anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow"
+            );
         } else {
-            eprintln!("# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow");
+            eprintln!(
+                "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow"
+            );
         }
     }
-    if let Some(d) = &dev_derp {
-        if !d.wait_for_client(&private.public(), Duration::from_secs(30)).await {
-            bail!("timeout waiting for connection to local dev DERP");
-        }
+    if let Some(d) = &dev_derp
+        && !d.wait_for_client(&private.public(), Duration::from_secs(30)).await
+    {
+        bail!("timeout waiting for connection to local dev DERP");
     }
     announce(g, &key_name, &conn_str).await?;
 
@@ -483,15 +493,17 @@ async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
     if g.json {
         println!("{}", serde_json::json!({ "listenAddr": conn_str.as_str() }));
     }
-    if let Ok(v) = std::env::var("TAILCAT_ADDR_FILE") {
-        if !v.is_empty() {
-            if let Some(tcp) = v.strip_prefix("tcp:") {
-                let mut c = tokio::net::TcpStream::connect(tcp).await.map_err(|e| anyhow!("TAILCAT_ADDR_FILE tcp dial {tcp:?}: {e}"))?;
-                c.write_all(format!("{conn_str}\n").as_bytes()).await?;
-                c.shutdown().await?;
-            } else {
-                write_private(&v, conn_str.as_str().as_bytes())?;
-            }
+    if let Ok(v) = std::env::var("TAILCAT_ADDR_FILE")
+        && !v.is_empty()
+    {
+        if let Some(tcp) = v.strip_prefix("tcp:") {
+            let mut c = tokio::net::TcpStream::connect(tcp)
+                .await
+                .map_err(|e| anyhow!("TAILCAT_ADDR_FILE tcp dial {tcp:?}: {e}"))?;
+            c.write_all(format!("{conn_str}\n").as_bytes()).await?;
+            c.shutdown().await?;
+        } else {
+            write_private(&v, conn_str.as_str().as_bytes())?;
         }
     }
     Ok(())

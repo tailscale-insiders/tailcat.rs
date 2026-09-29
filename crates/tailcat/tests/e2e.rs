@@ -81,7 +81,10 @@ async fn tcp_and_udp_over_local_derp() {
     let st = server.status();
     assert_eq!(st.peers.len(), 1);
     assert_eq!(st.peers[0].key, client.public_key());
-    assert_eq!(server.peer_key(std::net::SocketAddr::new(client.public_key().tailcat_ip().into(), 1)), Some(client.public_key()));
+    assert_eq!(
+        server.peer_key(std::net::SocketAddr::new(client.public_key().tailcat_ip().into(), 1)),
+        Some(client.public_key())
+    );
     server.close();
 }
 
@@ -95,9 +98,11 @@ async fn allowlist_rejects_strangers() {
     let server = Server::builder()
         .region(dev.region.clone())
         .allow_client(allow.checker())
-        .on_tcp(|_| Some(handler(|mut c: TcpStream| async move {
-            let _ = c.write_all(b"hi").await;
-        })))
+        .on_tcp(|_| {
+            Some(handler(|mut c: TcpStream| async move {
+                let _ = c.write_all(b"hi").await;
+            }))
+        })
         .start()
         .await
         .unwrap();

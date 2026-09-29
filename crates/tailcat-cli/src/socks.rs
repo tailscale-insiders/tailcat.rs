@@ -68,7 +68,9 @@ struct Dialer {
 impl Dialer {
     fn client_for(&self, a: &Addr) -> Client {
         let mut m = self.clients.lock().unwrap();
-        m.entry(a.as_str().to_string()).or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone())).clone()
+        m.entry(a.as_str().to_string())
+            .or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone()))
+            .clone()
     }
 
     fn default_client(&self) -> Result<&Client> {
@@ -285,13 +287,16 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     }
 }
 
+/// Tunnel UDP flows by destination (host, port).
+type Flows = HashMap<(String, u16), Arc<tailcat::UdpConn>>;
+
 /// Relays datagrams between the client and tunnel UDP flows for as long
 /// as the control connection stays open.
 async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     let local_ip = c.local_addr()?.ip();
     let sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     reply(&mut c, REP_SUCCESS, sock.local_addr()?).await?;
-    let flows: Arc<Mutex<HashMap<(String, u16), Arc<tailcat::UdpConn>>>> = Arc::default();
+    let flows: Arc<Mutex<Flows>> = Arc::default();
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
     let relay = {
         let sock = sock.clone();

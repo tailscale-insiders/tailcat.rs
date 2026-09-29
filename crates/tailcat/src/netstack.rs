@@ -352,10 +352,11 @@ impl Stack {
             let port = Self::alloc_port(&mut st, local_ip);
             let mut sock = new_tcp_socket();
             let State { iface, .. } = &mut *st;
-            sock.connect(iface.context(), IpEndpoint::new(from_ip(remote.ip()), remote.port()), IpListenEndpoint {
-                addr: Some(from_ip(local_ip)),
-                port,
-            })
+            sock.connect(
+                iface.context(),
+                IpEndpoint::new(from_ip(remote.ip()), remote.port()),
+                IpListenEndpoint { addr: Some(from_ip(local_ip)), port },
+            )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
             let h = st.sockets.add(sock);
             st.tuples.insert((SocketAddr::new(local_ip, port), remote), h);
@@ -423,7 +424,8 @@ impl Stack {
 }
 
 fn new_tcp_socket() -> tcp::Socket<'static> {
-    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUFFER]), tcp::SocketBuffer::new(vec![0; TCP_BUFFER]));
+    let mut s =
+        tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUFFER]), tcp::SocketBuffer::new(vec![0; TCP_BUFFER]));
     s.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_TIMEOUT.as_secs())));
     s.set_nagle_enabled(false);
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(5)));
@@ -793,21 +795,47 @@ pub fn build_udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec
     let caps = smoltcp::phy::ChecksumCapabilities::default();
     match (src.ip(), dst.ip()) {
         (IpAddr::V6(s), IpAddr::V6(d)) => {
-            let ip = Ipv6Repr { src_addr: s, dst_addr: d, next_header: IpProtocol::Udp, payload_len: udp_len, hop_limit: 64 };
+            let ip = Ipv6Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; 40 + udp_len];
             let mut pkt = Ipv6Packet::new_unchecked(&mut buf[..]);
             ip.emit(&mut pkt);
             let mut u = UdpPacket::new_unchecked(&mut buf[40..]);
-            udp.emit(&mut u, &IpAddress::Ipv6(s), &IpAddress::Ipv6(d), payload.len(), |b| b.copy_from_slice(payload), &caps);
+            udp.emit(
+                &mut u,
+                &IpAddress::Ipv6(s),
+                &IpAddress::Ipv6(d),
+                payload.len(),
+                |b| b.copy_from_slice(payload),
+                &caps,
+            );
             Some(buf)
         }
         (IpAddr::V4(s), IpAddr::V4(d)) => {
-            let ip = Ipv4Repr { src_addr: s, dst_addr: d, next_header: IpProtocol::Udp, payload_len: udp_len, hop_limit: 64 };
+            let ip = Ipv4Repr {
+                src_addr: s,
+                dst_addr: d,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_len,
+                hop_limit: 64,
+            };
             let mut buf = vec![0u8; 20 + udp_len];
             let mut pkt = Ipv4Packet::new_unchecked(&mut buf[..]);
             ip.emit(&mut pkt, &caps);
             let mut u = UdpPacket::new_unchecked(&mut buf[20..]);
-            udp.emit(&mut u, &IpAddress::Ipv4(s), &IpAddress::Ipv4(d), payload.len(), |b| b.copy_from_slice(payload), &caps);
+            udp.emit(
+                &mut u,
+                &IpAddress::Ipv4(s),
+                &IpAddress::Ipv4(d),
+                payload.len(),
+                |b| b.copy_from_slice(payload),
+                &caps,
+            );
             Some(buf)
         }
         _ => None,

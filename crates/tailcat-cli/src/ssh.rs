@@ -57,7 +57,8 @@ pub async fn load_authorized_keys(list: &str) -> Result<Vec<String>> {
                 }
             }
         };
-        tailcat::ssh::validate_authorized_keys(std::slice::from_ref(&text)).map_err(|e| anyhow!("source {n} ({source}): {e}"))?;
+        tailcat::ssh::validate_authorized_keys(std::slice::from_ref(&text))
+            .map_err(|e| anyhow!("source {n} ({source}): {e}"))?;
         texts.push(text);
     }
     tailcat::ssh::validate_authorized_keys(&texts)?;
@@ -91,18 +92,18 @@ async fn fetch_github_keys(user: &str) -> Result<String> {
 
 /// Validates the -p value: a port, an IP (meaning port 22), or IP:port.
 fn validated_ssh_port(v: &str) -> Result<String> {
-    if let Ok(p) = v.parse::<u16>() {
-        if p != 0 {
-            return Ok(p.to_string());
-        }
+    if let Ok(p) = v.parse::<u16>()
+        && p != 0
+    {
+        return Ok(p.to_string());
     }
     if let Ok(ip) = v.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, 22).to_string());
     }
-    if let Ok(a) = v.parse::<SocketAddr>() {
-        if a.port() != 0 {
-            return Ok(a.to_string());
-        }
+    if let Ok(a) = v.parse::<SocketAddr>()
+        && a.port() != 0
+    {
+        return Ok(a.to_string());
     }
     Err(usagef!("invalid port or IP:port {v:?}"))
 }
@@ -241,10 +242,10 @@ pub async fn cp_mode(g: &Global, recursive: bool, preserve: bool, port: &str, ar
     let mut addr: Option<String> = None;
     for a in &args {
         if let Some((host, _)) = split_remote_arg(a) {
-            if let Some(prev) = &addr {
-                if prev != host {
-                    return Err(usagef!("all remote paths must name the same server ({prev:?} and {host:?} differ)"));
-                }
+            if let Some(prev) = &addr
+                && prev != host
+            {
+                return Err(usagef!("all remote paths must name the same server ({prev:?} and {host:?} differ)"));
             }
             addr = Some(host.to_string());
         }
@@ -370,14 +371,20 @@ pub async fn ls_mode(g: &Global, long: bool, target: &str) -> Result<ExitCode> {
     }
     let ch = h.channel_open_session().await.map_err(|e| anyhow!("opening SFTP session: {e}"))?;
     ch.request_subsystem(true, "sftp").await.map_err(|e| anyhow!("opening SFTP session: {e}"))?;
-    let sf = russh_sftp::client::SftpSession::new(ch.into_stream()).await.map_err(|e| anyhow!("opening SFTP session: {e}"))?;
+    let sf = russh_sftp::client::SftpSession::new(ch.into_stream())
+        .await
+        .map_err(|e| anyhow!("opening SFTP session: {e}"))?;
     let md = sf.metadata(path.clone()).await.map_err(|e| anyhow!("{path}: {e}"))?;
     if !md.is_dir() {
         print_entry(long, &md, path.trim_start_matches("./"));
         return Ok(ExitCode::SUCCESS);
     }
-    let mut entries: Vec<(String, russh_sftp::protocol::FileAttributes)> =
-        sf.read_dir(path.clone()).await.map_err(|e| anyhow!("{path}: {e}"))?.map(|e| (e.file_name(), e.metadata())).collect();
+    let mut entries: Vec<(String, russh_sftp::protocol::FileAttributes)> = sf
+        .read_dir(path.clone())
+        .await
+        .map_err(|e| anyhow!("{path}: {e}"))?
+        .map(|e| (e.file_name(), e.metadata()))
+        .collect();
     entries.retain(|(n, _)| n != "." && n != "..");
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, md) in entries {
@@ -427,7 +434,8 @@ fn fmt_mtime(t: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + if mo <= 2 { 1 } else { 0 };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let month = MONTHS[(mo - 1) as usize];
     if now - t > 180 * 86400 {
         format!("{month} {d:>2}  {y}")
@@ -450,7 +458,10 @@ mod tests {
 
     #[test]
     fn quoting() {
-        assert_eq!(proxy_command_join_unix(&["a b".into(), "it's".into(), "50%".into()]).unwrap(), "'a b' 'it'\"'\"'s' '50%%'");
+        assert_eq!(
+            proxy_command_join_unix(&["a b".into(), "it's".into(), "50%".into()]).unwrap(),
+            "'a b' 'it'\"'\"'s' '50%%'"
+        );
         assert!(proxy_command_join_unix(&["a\nb".into()]).is_err());
         assert_eq!(proxy_command_join_windows(&["C:\\x\\".into()]).unwrap(), "\"C:\\x\\\\\"");
     }

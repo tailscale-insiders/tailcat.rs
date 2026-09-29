@@ -178,12 +178,20 @@ impl Server {
                         match dst_tx {
                             Some(dtx) => {
                                 let mut f = Vec::with_capacity(5 + payload.len());
-                                super::encode_frame(&mut f, FrameType::RecvPacket, &[client.as_bytes(), &payload[32..]]);
+                                super::encode_frame(
+                                    &mut f,
+                                    FrameType::RecvPacket,
+                                    &[client.as_bytes(), &payload[32..]],
+                                );
                                 let _ = dtx.try_send(f); // drop if the recipient is slow
                             }
                             None => {
                                 let mut f = Vec::new();
-                                super::encode_frame(&mut f, FrameType::PeerGone, &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]]);
+                                super::encode_frame(
+                                    &mut f,
+                                    FrameType::PeerGone,
+                                    &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]],
+                                );
                                 let _ = tx.try_send(f);
                             }
                         }
@@ -277,10 +285,7 @@ impl DevDerp {
         let stun_port = udp.local_addr()?.port();
         let ip = advertise.unwrap_or_else(|| ln.local_addr().map(|a| a.ip()).unwrap_or(derp_addr.ip()));
         let tls = Arc::new(crate::tls::self_signed_server_config(&["T", "localhost"])?);
-        let tasks = vec![
-            tokio::spawn(server.clone().serve_tls(ln, tls)),
-            tokio::spawn(serve_stun(udp)),
-        ];
+        let tasks = vec![tokio::spawn(server.clone().serve_tls(ln, tls)), tokio::spawn(serve_stun(udp))];
         let (ipv4, ipv6) = match ip {
             IpAddr::V4(v4) => (v4.to_string(), "none".to_string()),
             IpAddr::V6(v6) => ("none".to_string(), v6.to_string()),

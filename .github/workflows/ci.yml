@@ -1,0 +1,127 @@
+# Builds and tests everything with Nix, then runs the tests that need
+# more than the Nix sandbox allows: real TUN devices (root), Tailscale's
+# public relays (the internet), and a mesh across a matrix of runners
+# that finds its peers through this run's artifacts.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # nix flake check: the workspace build and its tests, clippy, rustfmt,
+  # and Rust <-> Go interop over a loopback relay.
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+          gc-max-store-size-macos: 6G
+      - run: nix flake check --print-build-logs --keep-going
+      - run: nix build --print-build-logs .#tailcat
+      - run: ./result/bin/tailcat version && ./result/bin/tailcat-device --version
+
+  # tailcat-device on real TUN interfaces, in network namespaces.
+  device:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          save: false
+      - run: nix build --print-build-logs .#tailcat
+      - run: sudo tests/device-netns.sh "$PWD/result/bin/tailcat" "$PWD/result/bin/tailcat-device"
+
+  # Rust <-> Go over Tailscale's public tailcat relays, to a direct path.
+  live:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          save: false
+      - run: nix build --print-build-logs .#tailcat
+      - run: nix build --out-link go-tailcat --inputs-from . nixpkgs#tailcat
+      - run: tests/live.sh "$PWD/result/bin/tailcat" "$PWD/go-tailcat/bin/tailcat"
+
+  # A tailcat-device mesh across a matrix of runners: each node makes its
+  # key, publishes its record (with an OIDC token) as a run artifact,
+  # and finds its peers in the others' artifacts.
+  mesh:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [0, 1, 2]
+    env:
+      NODES: 3
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          save: false
+      - run: nix build --print-build-logs .#tailcat
+      - name: make the node key and record
+        run: ./result/bin/tailcat-device init --index ${{ matrix.index }} --oidc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: node-${{ github.run_attempt }}-${{ matrix.index }}.json
+          archive: false
+          retention-days: 1
+      - name: bring up the overlay
+        run: tests/gha-mesh.sh start "$PWD/result/bin/tailcat-device" "$NODES"
+      - name: ping every other node
+        run: tests/gha-mesh.sh check ${{ matrix.index }} "$NODES"
+      - run: touch done-${{ github.run_attempt }}-${{ matrix.index }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: done-${{ github.run_attempt }}-${{ matrix.index }}
+          archive: false
+          retention-days: 1
+      - name: wait for every node to finish
+        run: tests/gha-mesh.sh wait-done "$NODES"
+      - name: logs
+        if: always()
+        run: tests/gha-mesh.sh stop

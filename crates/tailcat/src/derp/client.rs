@@ -216,7 +216,8 @@ async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &str) 
         let attempt = async {
             let tls = dial_tls(n).await?;
             let mut s = BufReader::new(tls);
-            let host = if n.derp_port() == 443 { n.host_name.clone() } else { format!("{}:{}", n.host_name, n.derp_port()) };
+            let host =
+                if n.derp_port() == 443 { n.host_name.clone() } else { format!("{}:{}", n.host_name, n.derp_port()) };
             login(&mut s, &host, key, app_name).await?;
             Ok::<_, Error>(s)
         };

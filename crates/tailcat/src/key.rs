@@ -44,15 +44,10 @@ pub struct KeyParseError {
 }
 
 fn parse_hex_key(s: &str, prefix: &str, kind: &'static str) -> Result<[u8; KEY_LEN], KeyParseError> {
-    let hexpart = s.strip_prefix(prefix).ok_or_else(|| KeyParseError {
-        kind,
-        msg: format!("missing {prefix:?} prefix"),
-    })?;
+    let hexpart =
+        s.strip_prefix(prefix).ok_or_else(|| KeyParseError { kind, msg: format!("missing {prefix:?} prefix") })?;
     let mut out = [0u8; KEY_LEN];
-    hex::decode_to_slice(hexpart, &mut out).map_err(|e| KeyParseError {
-        kind,
-        msg: e.to_string(),
-    })?;
+    hex::decode_to_slice(hexpart, &mut out).map_err(|e| KeyParseError { kind, msg: e.to_string() })?;
     Ok(out)
 }
 
@@ -423,11 +418,7 @@ impl fmt::Display for PresharedKey {
 
 impl fmt::Debug for PresharedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_zero() {
-            f.write_str("PresharedKey(none)")
-        } else {
-            f.write_str("PresharedKey(..)")
-        }
+        if self.is_zero() { f.write_str("PresharedKey(none)") } else { f.write_str("PresharedKey(..)") }
     }
 }
 
@@ -471,13 +462,7 @@ fn nacl_open(b: &crypto_box::SalsaBox, sealed: &[u8]) -> Option<Vec<u8>> {
     let (nonce, rest) = sealed.split_at(NONCE_LEN);
     let (tag, ct) = rest.split_at(BOX_OVERHEAD);
     let mut pt = ct.to_vec();
-    b.decrypt_in_place_detached(
-        GenericArray::from_slice(nonce),
-        b"",
-        &mut pt,
-        GenericArray::from_slice(tag),
-    )
-    .ok()?;
+    b.decrypt_in_place_detached(GenericArray::from_slice(nonce), b"", &mut pt, GenericArray::from_slice(tag)).ok()?;
     Some(pt)
 }
 
@@ -536,10 +521,7 @@ mod tests {
     #[test]
     fn tailcat_ip_uses_ula_prefix() {
         let p = NodePublic::from_bytes([0xab; 32]);
-        assert_eq!(
-            p.tailcat_ip().to_string(),
-            "fd7a:115c:a1e0:abab:abab:abab:abab:abab"
-        );
+        assert_eq!(p.tailcat_ip().to_string(), "fd7a:115c:a1e0:abab:abab:abab:abab:abab");
     }
 
     /// The disco derivation is a fixed function of the private key; this

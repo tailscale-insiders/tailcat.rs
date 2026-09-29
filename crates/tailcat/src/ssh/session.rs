@@ -198,7 +198,13 @@ impl russh::server::Handler for ConnHandler {
         Ok(())
     }
 
-    async fn env_request(&mut self, channel: ChannelId, k: &str, v: &str, session: &mut Session) -> Result<(), Self::Error> {
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        k: &str,
+        v: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         if accept_env(k) {
             if let Some(st) = self.channels.get_mut(&channel) {
                 st.env.push((k.to_string(), v.to_string()));
@@ -239,11 +245,21 @@ impl russh::server::Handler for ConnHandler {
         self.start(channel, None, session)
     }
 
-    async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.start(channel, Some(String::from_utf8_lossy(data).into_owned()), session)
     }
 
-    async fn subsystem_request(&mut self, channel: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         let opts = &self.shared.opts;
         let enabled = opts.exec.is_empty() && (opts.files.is_some() || opts.shell);
         if name != "sftp" || !enabled {
@@ -335,10 +351,10 @@ async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
         while let Some(m) = rd.wait().await {
             match m {
                 ChannelMsg::Data { data } => {
-                    if let Some(s) = stdin.as_mut() {
-                        if s.write_all(&data).await.is_err() {
-                            stdin = None;
-                        }
+                    if let Some(s) = stdin.as_mut()
+                        && s.write_all(&data).await.is_err()
+                    {
+                        stdin = None;
                     }
                 }
                 ChannelMsg::Eof | ChannelMsg::Close => break,
@@ -405,7 +421,12 @@ mod pty {
     use super::{INTERACTIVE_MOTD, Plan, PtyReq, Writer, exit_code};
 
     fn winsize(cols: u32, rows: u32) -> libc::winsize {
-        libc::winsize { ws_row: rows.min(u16::MAX as u32) as u16, ws_col: cols.min(u16::MAX as u32) as u16, ws_xpixel: 0, ws_ypixel: 0 }
+        libc::winsize {
+            ws_row: rows.min(u16::MAX as u32) as u16,
+            ws_col: cols.min(u16::MAX as u32) as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
     }
 
     /// Applies the client's terminal modes to the PTY.
@@ -663,13 +684,12 @@ fn login_shell(u: &User) -> String {
     if cfg!(windows) {
         return "powershell.exe".into();
     }
-    if cfg!(target_os = "macos") {
-        if let Ok(out) = std::process::Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
-        {
-            if let Some(s) = String::from_utf8_lossy(&out.stdout).strip_prefix("UserShell: ") {
-                return s.trim().to_string();
-            }
-        }
+    if cfg!(target_os = "macos")
+        && let Ok(out) =
+            std::process::Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
+        && let Some(s) = String::from_utf8_lossy(&out.stdout).strip_prefix("UserShell: ")
+    {
+        return s.trim().to_string();
     }
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }

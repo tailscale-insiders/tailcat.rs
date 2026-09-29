@@ -16,7 +16,7 @@ pub enum Source {
     /// Specific files.
     Files(Vec<PathBuf>),
     /// GitHub Actions run artifacts.
-    Github(GithubSource),
+    Github(Box<GithubSource>),
 }
 
 /// Polls GitHub Actions artifacts for node records.

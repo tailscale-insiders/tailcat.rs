@@ -183,7 +183,12 @@ impl Engine {
         )
     }
 
-    fn insert_new_locked(&self, peers: &mut HashMap<NodePublic, Arc<WgPeer>>, key: NodePublic, cfg: PeerConfig) -> Arc<WgPeer> {
+    fn insert_new_locked(
+        &self,
+        peers: &mut HashMap<NodePublic, Arc<WgPeer>>,
+        key: NodePublic,
+        cfg: PeerConfig,
+    ) -> Arc<WgPeer> {
         let index = self.next_index.fetch_add(1, Ordering::Relaxed) & 0xff_ffff;
         let p = Arc::new(WgPeer { tunn: Mutex::new(self.new_tunn(&key, &cfg, index)), cfg: Mutex::new(cfg), index });
         if let Some(old) = peers.insert(key, p.clone()) {
@@ -260,21 +265,21 @@ impl Engine {
     }
 
     fn identify(&self, pkt: &WireguardPacket) -> Option<(NodePublic, Arc<WgPeer>)> {
-        if let Some(k) = pkt.peer {
-            if let Some(p) = self.peers.lock().unwrap().get(&k).cloned() {
-                return Some((k, p));
-            }
-            // A known sender but not (yet) a WireGuard peer: only a
-            // handshake initiation can make it one.
+        if let Some(k) = pkt.peer
+            && let Some(p) = self.peers.lock().unwrap().get(&k).cloned()
+        {
+            return Some((k, p));
         }
+        // A known sender but not (yet) a WireGuard peer: only a
+        // handshake initiation can make it one.
         match Tunn::parse_incoming_packet(&pkt.data).ok()? {
             Packet::HandshakeInit(init) => {
                 let hh = parse_handshake_anon(&self.private, &self.public, &init).ok()?;
                 let k = NodePublic::from_bytes(hh.peer_static_public);
-                if let Some(expected) = pkt.peer {
-                    if expected != k {
-                        return None;
-                    }
+                if let Some(expected) = pkt.peer
+                    && expected != k
+                {
+                    return None;
                 }
                 if let Some(p) = self.peers.lock().unwrap().get(&k).cloned() {
                     return Some((k, p));
@@ -343,10 +348,10 @@ impl Engine {
         for b in out {
             let _ = self.ms.send_wireguard(&key, &b);
         }
-        if let Some(data) = inbound {
-            if !data.is_empty() {
-                let _ = self.inbound.send(InboundPacket { peer: key, data }).await;
-            }
+        if let Some(data) = inbound
+            && !data.is_empty()
+        {
+            let _ = self.inbound.send(InboundPacket { peer: key, data }).await;
         }
     }
 

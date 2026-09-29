@@ -111,7 +111,11 @@ impl Params {
             return Err("a duration or byte count is required".into());
         }
         if max_duration > Duration::ZERO && self.bytes == 0 && self.duration > max_duration {
-            return Err(format!("duration {} exceeds the server's limit of {}", go_duration(self.duration), go_duration(max_duration)));
+            return Err(format!(
+                "duration {} exceeds the server's limit of {}",
+                go_duration(self.duration),
+                go_duration(max_duration)
+            ));
         }
         if self.streams < 1 {
             return Err("at least one stream is required".into());
@@ -123,18 +127,26 @@ impl Params {
             return Err("a positive length is required".into());
         }
         match self.proto {
-            Proto::Tcp if self.length > MAX_LENGTH => return Err(format!("TCP length {} exceeds {MAX_LENGTH}", self.length)),
+            Proto::Tcp if self.length > MAX_LENGTH => {
+                return Err(format!("TCP length {} exceeds {MAX_LENGTH}", self.length));
+            }
             Proto::Udp if self.length < UDP_HEADER_LEN => {
                 return Err(format!("UDP length {} is smaller than the {UDP_HEADER_LEN}-byte header", self.length));
             }
-            Proto::Udp if self.length > MAX_UDP_SIZE => return Err(format!("UDP length {} exceeds {MAX_UDP_SIZE}", self.length)),
+            Proto::Udp if self.length > MAX_UDP_SIZE => {
+                return Err(format!("UDP length {} exceeds {MAX_UDP_SIZE}", self.length));
+            }
             _ => {}
         }
         if self.bitrate < 0 {
             return Err("negative bitrate".into());
         }
         if !self.interval.is_zero() && self.interval < MIN_INTERVAL {
-            return Err(format!("interval {} is shorter than {}", go_duration(self.interval), go_duration(MIN_INTERVAL)));
+            return Err(format!(
+                "interval {} is shorter than {}",
+                go_duration(self.interval),
+                go_duration(MIN_INTERVAL)
+            ));
         }
         Ok(())
     }
@@ -288,7 +300,8 @@ async fn read_message<R: AsyncRead + Unpin>(br: &mut BufReader<R>) -> std::io::R
     if !line.ends_with(b"\n") {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control line too long"));
     }
-    serde_json::from_slice(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad control message: {e}")))
+    serde_json::from_slice(&line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad control message: {e}")))
 }
 
 /// One stream's connection.
@@ -617,9 +630,23 @@ impl Test {
         let (sent, received) = (self.sent.lock().unwrap().clone(), self.received.lock().unwrap().clone());
         let rtt = self.rtt.lock().unwrap().as_ref().map(|r| r.0.clone());
         Ok(if self.is_server {
-            PerfResult { params: self.p.clone(), server_sent: sent, server_received: received, client_sent: peer_sent, client_received: peer_received, rtt: None }
+            PerfResult {
+                params: self.p.clone(),
+                server_sent: sent,
+                server_received: received,
+                client_sent: peer_sent,
+                client_received: peer_received,
+                rtt: None,
+            }
         } else {
-            PerfResult { params: self.p.clone(), client_sent: sent, client_received: received, server_sent: peer_sent, server_received: peer_received, rtt }
+            PerfResult {
+                params: self.p.clone(),
+                client_sent: sent,
+                client_received: received,
+                server_sent: peer_sent,
+                server_received: peer_received,
+                rtt,
+            }
         })
     }
 
@@ -632,8 +659,14 @@ impl Test {
                 _ = stop.wait() => return,
                 _ = self.done.wait() => return,
             }
-            let sent = Interval { bytes: self.send_bytes.load(Ordering::Relaxed), datagrams: self.send_datagrams.load(Ordering::Relaxed) };
-            let recv = Interval { bytes: self.recv_bytes.load(Ordering::Relaxed), datagrams: self.recv_datagrams.load(Ordering::Relaxed) };
+            let sent = Interval {
+                bytes: self.send_bytes.load(Ordering::Relaxed),
+                datagrams: self.send_datagrams.load(Ordering::Relaxed),
+            };
+            let recv = Interval {
+                bytes: self.recv_bytes.load(Ordering::Relaxed),
+                datagrams: self.recv_datagrams.load(Ordering::Relaxed),
+            };
             let ds = Interval { bytes: sent.bytes - last_sent.bytes, datagrams: sent.datagrams - last_sent.datagrams };
             let dr = Interval { bytes: recv.bytes - last_recv.bytes, datagrams: recv.datagrams - last_recv.datagrams };
             last_sent = sent;
@@ -694,7 +727,8 @@ impl Test {
                 SendSide::Tcp(None) => Ok(()),
                 SendSide::Udp(c) => {
                     let mut buf = [0u8; UDP_HEADER_LEN];
-                    UdpHeader { id, stream: i as u16, flags: FLAG_FIN, send_time: unix_nanos(), ..Default::default() }.put(&mut buf);
+                    UdpHeader { id, stream: i as u16, flags: FLAG_FIN, send_time: unix_nanos(), ..Default::default() }
+                        .put(&mut buf);
                     let mut r = Ok(());
                     for _ in 0..FIN_REPEAT {
                         if let Err(e) = c.send(&buf).await {
@@ -718,8 +752,8 @@ impl Test {
 
     async fn send_stream(&self, i: usize, mut side: SendSide, start: Instant) -> SendSide {
         let mut buf: Vec<u8> = (0..self.p.length).map(|i| i as u8).collect();
-        let step = (self.p.bitrate > 0)
-            .then(|| Duration::from_secs_f64(self.p.length as f64 * 8.0 / self.p.bitrate as f64));
+        let step =
+            (self.p.bitrate > 0).then(|| Duration::from_secs_f64(self.p.length as f64 * 8.0 / self.p.bitrate as f64));
         let mut next: Option<tokio::time::Instant> = None;
         let mut sent: i64 = 0;
         let mut seq: u64 = 0;
@@ -746,7 +780,8 @@ impl Test {
             let mut n = buf.len();
             let r = match &mut side {
                 SendSide::Udp(c) => {
-                    UdpHeader { id, stream: i as u16, seq, send_time: unix_nanos(), ..Default::default() }.put(&mut buf);
+                    UdpHeader { id, stream: i as u16, seq, send_time: unix_nanos(), ..Default::default() }
+                        .put(&mut buf);
                     seq += 1;
                     c.send(&buf).await.map(|_| ())
                 }
@@ -845,10 +880,10 @@ impl Test {
             }
             RecvSide::Tcp(None) => st,
             RecvSide::Udp(conn, pending) => {
-                if let Some(p) = pending {
-                    if self.process_datagram(&mut st, &p) {
-                        return st;
-                    }
+                if let Some(p) = pending
+                    && self.process_datagram(&mut st, &p)
+                {
+                    return st;
                 }
                 let mut buf = vec![0u8; MAX_UDP_SIZE];
                 loop {
@@ -1017,7 +1052,10 @@ impl Server {
             tests.is_empty() && tests.insert(id, t.clone()).is_none()
         };
         if !registered {
-            let _ = t.ctrl.send(&Message { error: "the server is busy with another test".into(), ..Message::new("error") }).await;
+            let _ = t
+                .ctrl
+                .send(&Message { error: "the server is busy with another test".into(), ..Message::new("error") })
+                .await;
             return;
         }
         let res = async {
@@ -1039,14 +1077,21 @@ impl Server {
 }
 
 /// Runs one test against a server.
-async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>) -> Result<PerfResult> {
+async fn run_client(
+    cl: &tailcat::Client,
+    p: Params,
+    on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>,
+) -> Result<PerfResult> {
     p.validate(0, Duration::ZERO).map_err(|e| anyhow!(e))?;
     let cc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing control connection: {e}"))?;
     let (rd, wr) = tokio::io::split(cc);
     let ctrl = Ctrl::new(BufReader::with_capacity(CTRL_BUF_SIZE, Box::new(rd)), Box::new(wr));
     let mut t = Test::new(p.clone(), false, ctrl);
     Arc::get_mut(&mut t).expect("unshared").on_progress = on_progress;
-    t.ctrl.send(&Message { params: Some(p.clone()), ..Message::new("hello") }).await.map_err(|e| anyhow!("sending hello: {e}"))?;
+    t.ctrl
+        .send(&Message { params: Some(p.clone()), ..Message::new("hello") })
+        .await
+        .map_err(|e| anyhow!("sending hello: {e}"))?;
     let m = tokio::time::timeout(HANDSHAKE_TIMEOUT, t.ctrl.recv())
         .await
         .map_err(|_| anyhow!("reading hello reply: timed out"))?
@@ -1056,7 +1101,10 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<Box<dyn
         "ok" => {}
         other => bail!("unexpected reply {other:?} to hello"),
     }
-    let id: [u8; 8] = hex::decode(&m.id).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
+    let id: [u8; 8] = hex::decode(&m.id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
     *t.id.lock().unwrap() = id;
     for i in 0..p.streams {
         let sc = match p.proto {
@@ -1231,7 +1279,8 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
         p.duration = Duration::ZERO;
     }
     if let Some(b) = &a.bitrate {
-        p.bitrate = parse_si(b).ok().filter(|n| *n >= 0).ok_or_else(|| crate::usagef!("invalid --bitrate value {b:?}"))?;
+        p.bitrate =
+            parse_si(b).ok().filter(|n| *n >= 0).ok_or_else(|| crate::usagef!("invalid --bitrate value {b:?}"))?;
     }
     if p.length == 0 {
         p.length = if a.udp { tailcat::MAX_UDP_PAYLOAD } else { DEFAULT_TCP_LENGTH };
@@ -1255,7 +1304,9 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
             );
         }
         if let Some(host) = cl.derp_region().as_ref().and_then(shared_tailscale_derp) {
-            bail!("perf: refusing to run a throughput test through Tailscale's shared DERP relay {host}; --via-derp is only for relays you run yourself");
+            bail!(
+                "perf: refusing to run a throughput test through Tailscale's shared DERP relay {host}; --via-derp is only for relays you run yourself"
+            );
         }
     }
     if p.proto == Proto::Udp && p.length > tailcat::MAX_UDP_PAYLOAD {
@@ -1278,7 +1329,10 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
         r = run_client(&cl, p, progress) => r.map_err(|e| anyhow!("perf: {e}"))?,
         _ = crate::forward::shutdown_signal() => bail!("perf: interrupted"),
     };
-    let after = tokio::time::timeout(Duration::from_secs(3), probe_path(&cl, Duration::from_secs(3))).await.ok().and_then(|r| r.ok());
+    let after = tokio::time::timeout(Duration::from_secs(3), probe_path(&cl, Duration::from_secs(3)))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
     if g.json {
         let mut v = serde_json::json!({ "path": before });
         if let Some(a) = &after {
@@ -1299,10 +1353,10 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<ExitCode> {
     for l in result_lines(&res) {
         println!("{l}");
     }
-    if let Some(a) = after {
-        if a.direct != before.direct {
-            eprintln!("# path changed during the test, now: {a}");
-        }
+    if let Some(a) = after
+        && a.direct != before.direct
+    {
+        eprintln!("# path changed during the test, now: {a}");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1406,10 +1460,10 @@ fn perf_summary(res: &PerfResult) -> String {
     let rate = |sent: &Option<Stats>, recv: &Option<Stats>| {
         let Some(recv) = recv else { return "?".to_string() };
         let mut s = fmt_rate(recv.bytes, recv.duration);
-        if let (true, Some(sent)) = (udp, sent) {
-            if sent.datagrams > 0 {
-                s += &format!(" ({:.1}% lost)", (sent.datagrams - recv.datagrams) as f64 / sent.datagrams as f64 * 100.0);
-            }
+        if let (true, Some(sent)) = (udp, sent)
+            && sent.datagrams > 0
+        {
+            s += &format!(" ({:.1}% lost)", (sent.datagrams - recv.datagrams) as f64 / sent.datagrams as f64 * 100.0);
         }
         s
     };
@@ -1463,7 +1517,7 @@ fn fmt_rtt(d: Duration) -> String {
 
 /// Formats a duration like Go's `time.Duration.String`.
 pub fn go_duration(d: Duration) -> String {
-    let n = d.as_nanos() as u128;
+    let n = d.as_nanos();
     if n == 0 {
         return "0s".into();
     }

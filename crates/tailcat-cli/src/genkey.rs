@@ -77,7 +77,9 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
     }
     if a.delete {
         if key.is_empty() {
-            return Err(usagef!("genkey --delete requires saying which key to delete with --key=<name> (see genkey --list)"));
+            return Err(usagef!(
+                "genkey --delete requires saying which key to delete with --key=<name> (see genkey --list)"
+            ));
         }
         if crate::keys::is_path(&key) {
             return Err(usagef!("can't delete key {key:?}; it's a path"));
@@ -87,19 +89,27 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
     }
     if key.is_empty() && region != "list" {
         if a.client {
-            return Err(usagef!("genkey requires a --key=<name>; client modes automatically load the key named \"client-default\" when it exists, making it the usual choice"));
+            return Err(usagef!(
+                "genkey requires a --key=<name>; client modes automatically load the key named \"client-default\" when it exists, making it the usual choice"
+            ));
         }
-        return Err(usagef!("genkey requires a --key=<name>; server mode automatically loads the key named \"default\" when it exists, making it the usual choice"));
+        return Err(usagef!(
+            "genkey requires a --key=<name>; server mode automatically loads the key named \"default\" when it exists, making it the usual choice"
+        ));
     }
     if a.client {
         if region_set || a.fixed_region || a.embed_derp_map {
-            return Err(usagef!("genkey --client does not take --region, --fixed-region or --embed-derp-map; client keys have no DERP region"));
+            return Err(usagef!(
+                "genkey --client does not take --region, --fixed-region or --embed-derp-map; client keys have no DERP region"
+            ));
         }
         if a.psk.is_some() {
             return Err(usagef!("genkey --client does not take --psk; pre-shared keys belong to server addresses"));
         }
         if key == "default" {
-            return Err(usagef!("genkey --client with --key=default is probably a mistake: \"default\" is the name server mode loads automatically, and client modes load \"client-default\", so you likely want --key=client-default"));
+            return Err(usagef!(
+                "genkey --client with --key=default is probably a mistake: \"default\" is the name server mode loads automatically, and client modes load \"client-default\", so you likely want --key=client-default"
+            ));
         }
     }
     if a.fixed_region {
@@ -110,10 +120,14 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
     }
     if a.embed_derp_map {
         if region_set && region == "auto" {
-            return Err(usagef!("genkey --embed-derp-map and --region=auto are mutually exclusive; embedding needs a region chosen now, so use --fixed-region or name a region with --region"));
+            return Err(usagef!(
+                "genkey --embed-derp-map and --region=auto are mutually exclusive; embedding needs a region chosen now, so use --fixed-region or name a region with --region"
+            ));
         }
         if region.contains('.') {
-            return Err(usagef!("genkey --embed-derp-map does not take DERP hostnames in --region; naming hosts already embeds them in the address"));
+            return Err(usagef!(
+                "genkey --embed-derp-map does not take DERP hostnames in --region; naming hosts already embeds them in the address"
+            ));
         }
         if !region_set {
             region.clear();
@@ -157,14 +171,20 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
         let cache = DiskDerpMapCache;
         dm = tokio::time::timeout(
             Duration::from_secs(10),
-            tailcat::derpmap::fetch_derp_map(FetchOptions { url: Some(&g.derpmap_url), mode: FetchMode::Server, cache: Some(&cache) }),
+            tailcat::derpmap::fetch_derp_map(FetchOptions {
+                url: Some(&g.derpmap_url),
+                mode: FetchMode::Server,
+                cache: Some(&cache),
+            }),
         )
         .await
         .map_err(|_| anyhow!("derpmap fetch: timeout"))?
         .map_err(|e| anyhow!("derpmap fetch: {e}"))?;
     }
     if region.is_empty() {
-        let id = tailcat::netcheck::pick_best_region(&dm).await?.ok_or_else(|| anyhow!("couldn't determine the closest DERP region; specify --region"))?;
+        let id = tailcat::netcheck::pick_best_region(&dm)
+            .await?
+            .ok_or_else(|| anyhow!("couldn't determine the closest DERP region; specify --region"))?;
         priv_key.public.region_id = id;
     }
     let ci = &mut priv_key.public;
@@ -183,7 +203,11 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
         }
     }
     if a.embed_derp_map {
-        let mut reg = dm.regions.get(&ci.region_id).cloned().ok_or_else(|| anyhow!("no DERP region {} in the DERP map; can't embed its nodes", ci.region_id))?;
+        let mut reg = dm
+            .regions
+            .get(&ci.region_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no DERP region {} in the DERP map; can't embed its nodes", ci.region_id))?;
         reg.nodes.truncate(2);
         for n in &mut reg.nodes {
             n.ipv6.clear();

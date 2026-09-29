@@ -322,13 +322,22 @@ impl Server {
 
     async fn start(b: ServerBuilder) -> Result<Server> {
         let key = b.key.unwrap_or_else(NodePrivate::generate);
-        let psk = if b.disable_psk { PresharedKey::default() } else { b.psk.filter(|p| !p.is_zero()).unwrap_or_else(PresharedKey::generate) };
+        let psk = if b.disable_psk {
+            PresharedKey::default()
+        } else {
+            b.psk.filter(|p| !p.is_zero()).unwrap_or_else(PresharedKey::generate)
+        };
         let region = match b.region {
             Some(r) => r,
             None => {
-                let mut ci = ConnInfo { region_id: if b.region_id != 0 { b.region_id } else { -1 }, ..Default::default() };
+                let mut ci =
+                    ConnInfo { region_id: if b.region_id != 0 { b.region_id } else { -1 }, ..Default::default() };
                 ci.expand(
-                    FetchOptions { url: b.derp_map_url.as_deref(), mode: FetchMode::Server, cache: b.derp_map_cache.as_deref() },
+                    FetchOptions {
+                        url: b.derp_map_url.as_deref(),
+                        mode: FetchMode::Server,
+                        cache: b.derp_map_cache.as_deref(),
+                    },
                     None,
                 )
                 .await?;
@@ -350,17 +359,17 @@ impl Server {
             if meow::is_meowed(pkt) {
                 return true; // servers ignore acks
             }
-            if let Some((_, disco)) = meow::parse_ping(pkt) {
-                if let Some(inner) = hook_me.get().and_then(Weak::upgrade) {
-                    tokio::spawn(async move {
-                        // Ack only once the client is fully added: "meowed"
-                        // tells it to start dialing. Disallowed clients get
-                        // no reply.
-                        if (Server { inner: inner.clone() }).on_meow(src, disco).await {
-                            inner.ms.send_derp(&src, region_id, &meow::encode_meowed());
-                        }
-                    });
-                }
+            if let Some((_, disco)) = meow::parse_ping(pkt)
+                && let Some(inner) = hook_me.get().and_then(Weak::upgrade)
+            {
+                tokio::spawn(async move {
+                    // Ack only once the client is fully added: "meowed"
+                    // tells it to start dialing. Disallowed clients get
+                    // no reply.
+                    if (Server { inner: inner.clone() }).on_meow(src, disco).await {
+                        inner.ms.send_derp(&src, region_id, &meow::encode_meowed());
+                    }
+                });
             }
             true
         });
@@ -546,7 +555,13 @@ impl Server {
         let port = pick_port(port, |p| l.tcp.contains_key(&p))?;
         let (tx, rx) = mpsc::channel(64);
         l.tcp.insert(port, tx);
-        Ok(Listener { server: Arc::downgrade(&self.inner), udp: false, port, addr: SocketAddr::new(IpAddr::V6(self.inner.addr), port), rx })
+        Ok(Listener {
+            server: Arc::downgrade(&self.inner),
+            udp: false,
+            port,
+            addr: SocketAddr::new(IpAddr::V6(self.inner.addr), port),
+            rx,
+        })
     }
 
     /// Listens on a UDP port; each accepted item is one client flow.
@@ -555,7 +570,13 @@ impl Server {
         let port = pick_port(port, |p| l.udp.contains_key(&p))?;
         let (tx, rx) = mpsc::channel(64);
         l.udp.insert(port, tx);
-        Ok(Listener { server: Arc::downgrade(&self.inner), udp: true, port, addr: SocketAddr::new(IpAddr::V6(self.inner.addr), port), rx })
+        Ok(Listener {
+            server: Arc::downgrade(&self.inner),
+            udp: true,
+            port,
+            addr: SocketAddr::new(IpAddr::V6(self.inner.addr), port),
+            rx,
+        })
     }
 
     /// Shuts the server down.
@@ -627,10 +648,10 @@ impl Server {
                     });
                 }));
             }
-            if let Some(ports) = &cfg.served_tcp_ports {
-                if !ports.iter().any(|r| r.contains(port)) {
-                    return TcpDecision::Drop;
-                }
+            if let Some(ports) = &cfg.served_tcp_ports
+                && !ports.iter().any(|r| r.contains(port))
+            {
+                return TcpDecision::Drop;
             }
             let Some(on_tcp) = &cfg.on_tcp else { return TcpDecision::Reset };
             return match on_tcp(port) {
@@ -664,10 +685,10 @@ impl Server {
                 }));
             }
             let on_udp = cfg.on_udp.as_ref()?;
-            if let Some(ports) = &cfg.served_udp_ports {
-                if !ports.iter().any(|r| r.contains(port)) {
-                    return None;
-                }
+            if let Some(ports) = &cfg.served_udp_ports
+                && !ports.iter().any(|r| r.contains(port))
+            {
+                return None;
             }
             on_udp(port)?
         } else {

@@ -45,11 +45,7 @@ pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfi
         let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots()), provider())
             .build()
             .map_err(|e| Error::Derp(e.to_string()))?;
-        if n.cert_name.is_empty() {
-            inner
-        } else {
-            Arc::new(NameOverride { inner, name: server_name(&n.cert_name)? })
-        }
+        if n.cert_name.is_empty() { inner } else { Arc::new(NameOverride { inner, name: server_name(&n.cert_name)? }) }
     };
     Ok(builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth())
 }

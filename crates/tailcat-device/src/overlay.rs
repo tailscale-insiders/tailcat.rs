@@ -86,7 +86,9 @@ impl Overlay {
     /// and packets flow once [`Overlay::run`] is given a device.
     pub async fn start(cfg: OverlayConfig) -> Result<Arc<Overlay>> {
         let me = cfg.key.record.clone();
-        let home = me.home_region(&cfg.derp_map).ok_or_else(|| anyhow!("home DERP region {} is not in the DERP map", me.derp_region))?;
+        let home = me
+            .home_region(&cfg.derp_map)
+            .ok_or_else(|| anyhow!("home DERP region {} is not in the DERP map", me.derp_region))?;
         let mut dm = cfg.derp_map.clone();
         dm.regions.insert(home.region_id, home.clone());
         let prefix = cfg.overlay_prefix;
@@ -129,7 +131,9 @@ impl Overlay {
         if r.nodekey == self.me.nodekey {
             return Ok(false);
         }
-        let region = r.home_region(dm).ok_or_else(|| anyhow!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region))?;
+        let region = r
+            .home_region(dm)
+            .ok_or_else(|| anyhow!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region))?;
         self.ms.add_region(region.clone());
         let new = {
             let mut peers = self.peers.lock().unwrap();
@@ -153,7 +157,11 @@ impl Overlay {
         });
         self.engine.upsert_peer(
             r.nodekey,
-            wg::PeerConfig { allowed_ips: r.allowed_ips(), preshared_key: PresharedKey::default(), persistent_keepalive: None },
+            wg::PeerConfig {
+                allowed_ips: r.allowed_ips(),
+                preshared_key: PresharedKey::default(),
+                persistent_keepalive: None,
+            },
         );
         if new {
             info!(peer = r.index, overlay_ip = %r.overlay_ip, "overlay: added peer {}", r.nodekey.short_string());

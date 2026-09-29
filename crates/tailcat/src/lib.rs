@@ -65,14 +65,14 @@ pub use addr::{Addr, ConnInfo, PrivateKey};
 pub use client::{Client, ClientOptions, DiscoPingResult, PingResult};
 pub use derpmap::{DEFAULT_DERP_MAP_URL, DerpMap, DerpMapCache, DerpNode, DerpRegion, FetchMode, FetchOptions};
 pub use exec::peer_env;
-pub use key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 pub use http::shared_client;
+pub use key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 pub use keyset::KeySet;
 pub use netstack::{TcpStream, UdpConn};
 pub use proxy::{proxy_conns, proxy_packet_conns};
 pub use server::{
-    DEFAULT_UDP_IDLE_TIMEOUT, Listener, PeerStatus, PortRange, Server, ServerBuilder, ServerStatus, TcpHandler, UdpHandler,
-    handler, udp_handler,
+    DEFAULT_UDP_IDLE_TIMEOUT, Listener, PeerStatus, PortRange, Server, ServerBuilder, ServerStatus, TcpHandler,
+    UdpHandler, handler, udp_handler,
 };
 
 /// The largest UDP payload that fits the tunnel's 1280-byte IPv6 MTU

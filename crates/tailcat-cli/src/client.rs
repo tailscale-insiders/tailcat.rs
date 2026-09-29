@@ -104,7 +104,11 @@ pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_a
             Some(ep) => ep.to_string(),
             None => format!(
                 "DERP({})",
-                if res.derp_region_code.is_empty() { res.derp_region_id.to_string() } else { res.derp_region_code.clone() }
+                if res.derp_region_code.is_empty() {
+                    res.derp_region_id.to_string()
+                } else {
+                    res.derp_region_code.clone()
+                }
             ),
         };
         println!("pong in {} via {via}", crate::util::fmt_duration(res.latency));

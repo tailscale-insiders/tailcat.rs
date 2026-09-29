@@ -211,9 +211,9 @@ impl ConnInfo {
         let (dm, src) = match dm {
             Some(dm) => (dm, "provided DERP map".to_string()),
             None => {
-                fetched = crate::derpmap::fetch_derp_map(opts).await.map_err(|e| {
-                    Error::other(format!("fetching DERPMap for region {}: {e}", self.region_id))
-                })?;
+                fetched = crate::derpmap::fetch_derp_map(opts)
+                    .await
+                    .map_err(|e| Error::other(format!("fetching DERPMap for region {}: {e}", self.region_id)))?;
                 (&fetched, opts.url.unwrap_or(crate::DEFAULT_DERP_MAP_URL).to_string())
             }
         };
@@ -367,8 +367,9 @@ fn as_text(v: Value, what: &str) -> Result<String> {
 
 fn as_bytes32(v: Value, what: &str) -> Result<[u8; 32]> {
     match v {
-        Value::Bytes(b) => <[u8; 32]>::try_from(b.as_slice())
-            .map_err(|_| bad(format!("invalid {what} length {}, want 32", b.len()))),
+        Value::Bytes(b) => {
+            <[u8; 32]>::try_from(b.as_slice()).map_err(|_| bad(format!("invalid {what} length {}, want 32", b.len())))
+        }
         _ => Err(bad(format!("{what} is not a byte string"))),
     }
 }
@@ -418,12 +419,9 @@ impl WireNode {
         if self.region_id != 0 {
             m.insert("RegionID".into(), self.region_id.into());
         }
-        for (k, v) in [
-            ("HostName", &self.host_name),
-            ("CertName", &self.cert_name),
-            ("IPv4", &self.ipv4),
-            ("IPv6", &self.ipv6),
-        ] {
+        for (k, v) in
+            [("HostName", &self.host_name), ("CertName", &self.cert_name), ("IPv4", &self.ipv4), ("IPv6", &self.ipv6)]
+        {
             if !v.is_empty() {
                 m.insert(k.into(), v.as_str().into());
             }
@@ -563,10 +561,7 @@ impl WireConnInfo {
     }
 
     fn decode(addr: &Addr) -> Result<Self> {
-        let rest = addr
-            .0
-            .strip_prefix("tc")
-            .ok_or_else(|| bad("tailcat address doesn't start with \"tc\""))?;
+        let rest = addr.0.strip_prefix("tc").ok_or_else(|| bad("tailcat address doesn't start with \"tc\""))?;
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(rest)
             .map_err(|e| bad(format!("base64 decode: {e}")))?;
@@ -730,10 +725,7 @@ mod tests {
         // A null region must be rejected, not dereferenced.
         let mut buf = Vec::new();
         ciborium::into_writer(
-            &Value::Map(vec![
-                (text("p"), Value::Bytes(vec![1; 32])),
-                (text("r"), Value::Array(vec![Value::Null])),
-            ]),
+            &Value::Map(vec![(text("p"), Value::Bytes(vec![1; 32])), (text("r"), Value::Array(vec![Value::Null]))]),
             &mut buf,
         )
         .unwrap();

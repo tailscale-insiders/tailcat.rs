@@ -91,7 +91,11 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
                 .parse()
                 .map_err(|e| Error::other(format!("authorized keys entry {}, line {}: {e}", ti + 1, li + 1)))?;
             if !entry.config_opts().is_empty() {
-                return Err(Error::other(format!("authorized keys entry {}, line {}: options are not supported", ti + 1, li + 1)));
+                return Err(Error::other(format!(
+                    "authorized keys entry {}, line {}: options are not supported",
+                    ti + 1,
+                    li + 1
+                )));
             }
             let wire = entry
                 .public_key()
@@ -147,7 +151,9 @@ pub fn host_key() -> Result<PrivateKey> {
     let _g = HOST_KEY_LOCK.lock().unwrap();
     let path = ssh_key_dir()?.join("ssh_host_ed25519_key");
     match std::fs::read_to_string(&path) {
-        Ok(pem) => russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}"))),
+        Ok(pem) => {
+            russh::keys::decode_secret_key(&pem, None).map_err(|e| Error::other(format!("parsing host key: {e}")))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
@@ -185,7 +191,8 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
 /// address to the tunnel-authenticated node key, exported to served
 /// processes as `TAILCAT_PEER_KEY`.
 pub fn conn_handler_with_lookup(peer_lookup: PeerLookup, mut opts: SshOptions) -> Result<TcpHandler> {
-    let allowed = if opts.authorized_keys.is_empty() { None } else { Some(parse_authorized_keys(&opts.authorized_keys)?) };
+    let allowed =
+        if opts.authorized_keys.is_empty() { None } else { Some(parse_authorized_keys(&opts.authorized_keys)?) };
     if !opts.exec.is_empty() {
         opts.shell = false;
         opts.files = None;

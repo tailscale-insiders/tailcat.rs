@@ -104,12 +104,7 @@ fn longname(name: &str, a: &FileAttributes) -> String {
         perms.push(if bits & 2 != 0 { 'w' } else { '-' });
         perms.push(if bits & 1 != 0 { 'x' } else { '-' });
     }
-    format!(
-        "{kind}{perms}    1 {:<8} {:<8} {:>8} {name}",
-        a.uid.unwrap_or(0),
-        a.gid.unwrap_or(0),
-        a.size.unwrap_or(0)
-    )
+    format!("{kind}{perms}    1 {:<8} {:<8} {:>8} {name}", a.uid.unwrap_or(0), a.gid.unwrap_or(0), a.size.unwrap_or(0))
 }
 
 /// A unique name for a drop-box upload: stem.YYYYMMDDhhmmss.<random>.ext.
@@ -134,7 +129,8 @@ fn unique_upload_path(requested: &str) -> String {
 
 /// The current UTC time as YYYYMMDDhhmmss.
 fn chrono_like_utc() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -217,7 +213,8 @@ impl Sftp {
     }
 
     fn open_write_only(&mut self, p: String, pflags: OpenFlags) -> Result<cap_std::fs::File, StatusCode> {
-        if pflags.contains(OpenFlags::READ) || !pflags.contains(OpenFlags::WRITE) || !pflags.contains(OpenFlags::CREATE) {
+        if pflags.contains(OpenFlags::READ) || !pflags.contains(OpenFlags::WRITE) || !pflags.contains(OpenFlags::CREATE)
+        {
             return Err(StatusCode::PermissionDenied);
         }
         let flat = self.mode == Some(FileServeMode::WriteOnly);
@@ -245,7 +242,11 @@ impl Sftp {
         }
         if let (Some(at), Some(mt)) = (a.atime, a.mtime) {
             use cap_fs_ext::{DirExt, SystemTimeSpec};
-            let t = |s: u32| SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s as u64)));
+            let t = |s: u32| {
+                SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(s as u64),
+                ))
+            };
             self.root.set_times(p, Some(t(at)), Some(t(mt)))?;
         }
         if let Some(size) = a.size {
@@ -267,12 +268,19 @@ impl russh_sftp::server::Handler for Sftp {
         Ok(Version::new())
     }
 
-    async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, _attrs: FileAttributes) -> Result<Handle, Self::Error> {
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
         let p = self.rel(&filename);
         let file = if self.write_only() {
             self.open_write_only(p, pflags)?
         } else {
-            let wants_write = pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE);
+            let wants_write =
+                pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE);
             if self.read_only() && wants_write {
                 return Err(StatusCode::PermissionDenied);
             }

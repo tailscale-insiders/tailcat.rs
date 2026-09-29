@@ -96,13 +96,14 @@ fn home() -> Option<PathBuf> {
 /// asking DNS, so services bound to either answer.
 pub async fn dial_local(target: &str) -> std::io::Result<tokio::net::TcpStream> {
     let (host, port) = split_host_port(target)?;
-    let addrs: Vec<SocketAddr> = if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
-        vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))]
-    } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        tokio::net::lookup_host((host.as_str(), port)).await?.collect()
-    };
+    let addrs: Vec<SocketAddr> =
+        if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+            vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))]
+        } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            vec![SocketAddr::new(ip, port)]
+        } else {
+            tokio::net::lookup_host((host.as_str(), port)).await?.collect()
+        };
     let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("no addresses for {target}"));
     for a in addrs {
         match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(a)).await {

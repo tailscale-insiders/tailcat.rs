@@ -44,12 +44,17 @@ pub fn parse_forward_spec(bind: &str, spec: &str) -> Result<ForwardSpec> {
     };
     let listen_addr = crate::util::join_host_port(bind, local_port);
     if !has_colon {
-        return Ok(ForwardSpec { listen_addr, target: None, port: parse_port(target).map_err(|e| anyhow!("remote port: {e}"))? });
+        return Ok(ForwardSpec {
+            listen_addr,
+            target: None,
+            port: parse_port(target).map_err(|e| anyhow!("remote port: {e}"))?,
+        });
     }
     if let Ok(p) = parse_port(target) {
         return Ok(ForwardSpec { listen_addr, target: None, port: p });
     }
-    let t: SocketAddr = target.parse().map_err(|_| anyhow!("remote target {target:?} is not a port or address:port"))?;
+    let t: SocketAddr =
+        target.parse().map_err(|_| anyhow!("remote target {target:?} is not a port or address:port"))?;
     Ok(ForwardSpec { listen_addr, target: Some(t), port: 0 })
 }
 
@@ -80,7 +85,8 @@ pub async fn run_forward(g: &Global, bind: &str, addr_arg: &str, mappings: &[Str
     let mut listeners = Vec::new();
     for m in mappings {
         let spec = parse_forward_spec(bind, m).map_err(|e| usagef!("mapping {m:?} is invalid: {e}"))?;
-        let ln = TcpListener::bind(&spec.listen_addr).await.map_err(|e| anyhow!("listen on {}: {e}", spec.listen_addr))?;
+        let ln =
+            TcpListener::bind(&spec.listen_addr).await.map_err(|e| anyhow!("listen on {}: {e}", spec.listen_addr))?;
         let la = ln.local_addr()?;
         // Always print: with a local port of 0 it's the only way to learn it.
         eprintln!("# forwarding {la} -> remote {}", spec.remote_target());
@@ -129,7 +135,8 @@ async fn forward_listener(cl: Client, ln: TcpListener, spec: ForwardSpec) {
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}

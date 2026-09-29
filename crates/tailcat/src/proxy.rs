@@ -64,14 +64,9 @@ pub async fn proxy_packet_conns(a: &UdpConn, b: &tokio::net::UdpSocket, idle: Du
     };
     let b_to_a = async {
         let mut buf = vec![0u8; 65535];
-        loop {
-            match tokio::time::timeout(idle, b.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
-                    if a.send(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
+        while let Ok(Ok(n)) = tokio::time::timeout(idle, b.recv(&mut buf)).await {
+            if a.send(&buf[..n]).await.is_err() {
+                break;
             }
         }
     };

@@ -351,11 +351,11 @@ impl MagicSock {
             self.ensure_derp_locked(&mut inner, cfg.home_region);
         }
         let key = cfg.node_key;
-        if let Some(p) = inner.peers.get(&key) {
-            if p.cfg.disco_key != cfg.disco_key {
-                let old = p.cfg.disco_key;
-                inner.by_disco.remove(&old);
-            }
+        if let Some(p) = inner.peers.get(&key)
+            && p.cfg.disco_key != cfg.disco_key
+        {
+            let old = p.cfg.disco_key;
+            inner.by_disco.remove(&old);
         }
         inner.by_disco.insert(cfg.disco_key, key);
         for ep in &cfg.endpoints {
@@ -549,16 +549,22 @@ impl MagicSock {
             return;
         }
         let Some(r) = inner.derp_map.regions.get(&region).cloned() else { return };
-        let c = DerpClient::spawn(r, self.private_key.clone(), &self.app_name, region == self.home_region, self.derp_tx.clone());
+        let c = DerpClient::spawn(
+            r,
+            self.private_key.clone(),
+            &self.app_name,
+            region == self.home_region,
+            self.derp_tx.clone(),
+        );
         inner.derp.insert(region, c);
     }
 
     fn send_udp(&self, a: SocketAddr, pkt: &[u8]) {
         let sock = if a.is_ipv4() { &self.udp4 } else { &self.udp6 };
-        if let Some(s) = sock {
-            if let Err(e) = s.try_send_to(pkt, a) {
-                trace!("magicsock: send to {a}: {e}");
-            }
+        if let Some(s) = sock
+            && let Err(e) = s.try_send_to(pkt, a)
+        {
+            trace!("magicsock: send to {a}: {e}");
         }
     }
 
@@ -640,11 +646,11 @@ impl MagicSock {
             trace!(disco = %sender.short_string(), "magicsock: disco from unknown key");
             return;
         };
-        if let Some(d) = derp_src {
-            if d != peer_key {
-                trace!("magicsock: disco key/node key mismatch over DERP");
-                return;
-            }
+        if let Some(d) = derp_src
+            && d != peer_key
+        {
+            trace!("magicsock: disco key/node key mismatch over DERP");
+            return;
         }
         let shared = inner.peers[&peer_key].shared.clone();
         let Some(msg) = disco::open(&shared, pkt) else {
@@ -684,10 +690,10 @@ impl MagicSock {
                     return;
                 }
                 let latency = now - pp.sent;
-                if let Some(w) = &pp.waiter {
-                    if let Some(tx) = w.lock().unwrap().take() {
-                        let _ = tx.send(PingResult { latency, via: src });
-                    }
+                if let Some(w) = &pp.waiter
+                    && let Some(tx) = w.lock().unwrap().take()
+                {
+                    let _ = tx.send(PingResult { latency, via: src });
                 }
                 if let (PathAddr::Udp(from), PathAddr::Udp(to)) = (src, pp.to) {
                     inner.by_addr.insert(from, peer_key);
@@ -743,10 +749,10 @@ impl MagicSock {
         let peer = {
             let mut inner = self.inner.lock().unwrap();
             let peer = inner.by_addr.get(&src).copied();
-            if let Some(k) = peer {
-                if let Some(p) = inner.peers.get_mut(&k) {
-                    p.last_recv = Some(Instant::now());
-                }
+            if let Some(k) = peer
+                && let Some(p) = inner.peers.get_mut(&k)
+            {
+                p.last_recv = Some(Instant::now());
             }
             peer
         };
@@ -758,10 +764,10 @@ impl MagicSock {
             self.handle_disco(&rp.data, PathAddr::Derp(rp.region_id), Some(rp.src));
             return;
         }
-        if let Some(h) = &self.on_derp_recv {
-            if h(rp.region_id, rp.src, &rp.data) {
-                return;
-            }
+        if let Some(h) = &self.on_derp_recv
+            && h(rp.region_id, rp.src, &rp.data)
+        {
+            return;
         }
         {
             let mut inner = self.inner.lock().unwrap();
@@ -796,7 +802,8 @@ impl MagicSock {
     }
 
     fn recompute_endpoints_locked(&self, inner: &mut Inner) {
-        let mut eps: Vec<SocketAddr> = inner.stun_endpoints.iter().chain(inner.local_endpoints.iter()).copied().collect();
+        let mut eps: Vec<SocketAddr> =
+            inner.stun_endpoints.iter().chain(inner.local_endpoints.iter()).copied().collect();
         eps.sort();
         eps.dedup();
         if eps != inner.endpoints {
@@ -824,10 +831,10 @@ impl MagicSock {
                     continue;
                 }
                 let ip = i.ip();
-                if let Some(f) = &self.endpoint_filter {
-                    if !f(ip) {
-                        continue;
-                    }
+                if let Some(f) = &self.endpoint_filter
+                    && !f(ip)
+                {
+                    continue;
                 }
                 match ip {
                     IpAddr::V4(v4) if !v4.is_link_local() => {
@@ -881,7 +888,8 @@ impl MagicSock {
                 continue;
             }
             if let Some((best, lat)) = p.best {
-                let needs_upgrade = lat > GOOD_ENOUGH_LATENCY && p.last_upgrade.is_none_or(|t| now - t > UPGRADE_INTERVAL);
+                let needs_upgrade =
+                    lat > GOOD_ENOUGH_LATENCY && p.last_upgrade.is_none_or(|t| now - t > UPGRADE_INTERVAL);
                 if p.trusted(now) {
                     // Heartbeat the path in use to keep it trusted.
                     self.send_ping_locked(&mut inner, &k, PathAddr::Udp(best), now, None);
