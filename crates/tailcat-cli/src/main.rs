@@ -20,7 +20,7 @@ mod util;
 
 use std::process::ExitCode;
 
-use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 
 /// Flags accepted by every subcommand.
 #[derive(Args, Debug, Clone)]
@@ -248,9 +248,11 @@ macro_rules! usagef {
     ($($t:tt)*) => { anyhow::Error::new($crate::UsageError(format!($($t)*))) };
 }
 
-pub fn version_string() -> String {
-    option_env!("TAILCAT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")).to_string()
-}
+/// The version: $TAILCAT_VERSION at build time, else the crate's.
+const VERSION: &str = match option_env!("TAILCAT_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 fn init_logging(verbose: bool) {
     let default = if verbose { "info,tailcat=debug,tailcat_cli=debug" } else { "off" };
@@ -265,152 +267,123 @@ fn main() -> ExitCode {
     // The command after "--", like Go's splitExecArgs: None without a
     // separator, empty with one followed by nothing.
     let has_separator = argv.iter().skip(1).any(|a| a == "--");
-    let mut cmd = Cli::command();
-    let matches = match cmd.try_get_matches_from_mut(&argv) {
-        Ok(m) => m,
+    let cli = match Cli::try_parse_from(&argv) {
+        Ok(c) => c,
+        // --version anywhere, even where it's not otherwise valid.
+        Err(_) if argv.iter().any(|a| a == "--version") => {
+            println!("{VERSION}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
-            if argv.iter().any(|a| a == "--version") {
-                println!("{}", version_string());
-                return ExitCode::SUCCESS;
-            }
             let _ = e.print();
             return if e.use_stderr() { ExitCode::from(2) } else { ExitCode::SUCCESS };
         }
     };
-    let cli = match Cli::from_arg_matches(&matches) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = e.print();
-            return ExitCode::from(2);
-        }
-    };
     if cli.version {
-        println!("{}", version_string());
+        println!("{VERSION}");
         return ExitCode::SUCCESS;
     }
     init_logging(cli.global.verbose);
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let res = rt.block_on(run(cli, has_separator));
-    match res {
-        Ok(code) => code,
-        Err(e) => {
-            if e.downcast_ref::<UsageError>().is_some() {
-                let _ = Cli::command().print_help();
-                eprintln!();
-            }
-            eprintln!("{e:#}");
-            ExitCode::FAILURE
+    rt.block_on(run(cli, has_separator)).unwrap_or_else(|e| {
+        if e.is::<UsageError>() {
+            let _ = Cli::command().print_help();
+            eprintln!();
         }
-    }
+        eprintln!("{e:#}");
+        ExitCode::FAILURE
+    })
 }
 
+/// Runs the command. Those that don't exit with a child's status succeed
+/// unless they return an error.
 async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
-    let g = cli.global.clone();
-    let exec = |v: Vec<String>| if has_separator { Some(v) } else { None };
+    let g = &cli.global;
+    let exec = |v: Vec<String>| has_separator.then_some(v);
     match cli.cmd {
-        None => {
-            if cli.args.first().map(String::as_str) == Some("help") {
-                let _ = Cli::command().print_long_help();
-                return Ok(ExitCode::SUCCESS);
-            }
-            let server_mode = cli.args.is_empty() || cli.serve.is_some();
-            if !cli.args.is_empty() && server_mode {
+        None if cli.args.first().is_some_and(|a| a == "help") => {
+            let _ = Cli::command().print_long_help();
+        }
+        None if cli.args.is_empty() || cli.serve.is_some() => {
+            if !cli.args.is_empty() {
                 return Err(usagef!("no positional arguments are valid along with --serve"));
             }
-            if server_mode {
-                serve::server(&g, &cli.serve_flags, cli.serve.unwrap_or_default(), exec(cli.exec)).await?;
-                return Ok(ExitCode::SUCCESS);
-            }
+            serve::server(g, &cli.serve_flags, cli.serve.unwrap_or_default(), exec(cli.exec)).await?;
+        }
+        None => {
             if has_separator {
                 return Err(usagef!("a -- command is only valid in server mode"));
             }
             if cli.args.len() > 2 {
                 return Err(usagef!("too many arguments; client mode takes <tc-addr> [<port>]"));
             }
-            client::client_mode(&g, &cli.args[0], cli.args.get(1).map(String::as_str)).await
+            client::client_mode(g, &cli.args[0], cli.args.get(1).map(String::as_str)).await?;
         }
         Some(Cmd::Serve { flags, specs, exec: ex }) => {
-            if cli.serve.is_some() && !specs.is_empty() {
-                return Err(usagef!("use either --serve or positional port/service arguments, not both"));
-            }
-            let spec = if specs.is_empty() { cli.serve.unwrap_or_default() } else { specs.join(",") };
-            serve::server(&g, &flags, spec, exec(ex)).await?;
-            Ok(ExitCode::SUCCESS)
+            let spec = match (cli.serve, specs.is_empty()) {
+                (Some(_), false) => {
+                    return Err(usagef!("use either --serve or positional port/service arguments, not both"));
+                }
+                (serve, true) => serve.unwrap_or_default(),
+                (None, false) => specs.join(","),
+            };
+            serve::server(g, &flags, spec, exec(ex)).await?;
         }
-        Some(Cmd::Ping { until_direct, timeout, addr }) => client::ping_mode(&g, until_direct, timeout, &addr).await,
-        Some(Cmd::Perf(a)) => perf::run(&g, a).await,
-        Some(Cmd::Socks { listen, args }) => socks::socks_mode(&g, &listen, args).await,
+        Some(Cmd::Ping { until_direct, timeout, addr }) => client::ping_mode(g, until_direct, timeout, &addr).await?,
+        Some(Cmd::Perf(a)) => perf::run(g, a).await?,
+        Some(Cmd::Socks { listen, args }) => return socks::socks_mode(g, &listen, args).await,
         Some(Cmd::Recv { mut flags, accept_dirs, dir }) => {
             if flags.files.is_some() {
                 return Err(usagef!("recv takes the directory as an argument, not --files"));
             }
-            let dir = dir.unwrap_or_else(|| ".".into());
+            let dir = dir.as_deref().unwrap_or(".");
             flags.files = Some(format!("{dir}{}", if accept_dirs { ":wo+" } else { ":wo" }));
-            serve::server(&g, &flags, String::new(), None).await?;
-            Ok(ExitCode::SUCCESS)
+            serve::server(g, &flags, String::new(), None).await?;
         }
         #[cfg(feature = "ssh")]
         Some(Cmd::Ssh { port, skip_dns_safety_check, args }) => {
-            ssh::ssh_mode(&g, &port, skip_dns_safety_check, args).await
+            return ssh::ssh_mode(g, &port, skip_dns_safety_check, args).await;
         }
         #[cfg(feature = "ssh")]
-        Some(Cmd::Cp { recursive, preserve, port, args }) => ssh::cp_mode(&g, recursive, preserve, &port, args).await,
+        Some(Cmd::Cp { recursive, preserve, port, args }) => {
+            return ssh::cp_mode(g, recursive, preserve, &port, args).await;
+        }
         #[cfg(feature = "ssh")]
-        Some(Cmd::Ls { long, target }) => ssh::ls_mode(&g, long, &target).await,
+        Some(Cmd::Ls { long, target }) => return ssh::ls_mode(g, long, &target).await,
         Some(Cmd::Forward { bind, open_browser, addr, mappings }) => {
             if open_browser && mappings.len() != 1 {
                 return Err(usagef!("--open-browser requires exactly one port mapping"));
             }
-            forward::run_forward(&g, &bind, &addr, &mappings, open_browser).await?;
-            Ok(ExitCode::SUCCESS)
+            forward::run_forward(g, &bind, &addr, &mappings, open_browser).await?;
         }
-        Some(Cmd::Browse { addr }) => {
-            forward::run_forward(&g, "127.0.0.1", &addr, &["0:80".to_string()], true).await?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Cmd::Browse { addr }) => forward::run_forward(g, "127.0.0.1", &addr, &["0:80".into()], true).await?,
         Some(Cmd::Parse { addr }) => {
             let v = tailcat::Addr::new(addr).parse_raw_json()?;
             print!("{}", tailcat::addr::to_go_indented_json(&v));
-            Ok(ExitCode::SUCCESS)
         }
         Some(Cmd::Resolve { addr }) => {
             let a = addrarg::tailcat_addr_arg(&addr).await?;
-            let cache = cache::DiskDerpMapCache;
-            let opts = tailcat::FetchOptions {
-                url: Some(&g.derpmap_url),
-                mode: tailcat::FetchMode::Client,
-                cache: Some(&cache),
-            };
+            let opts = cache::fetch_options(g, tailcat::FetchMode::Client);
             let r = tokio::time::timeout(std::time::Duration::from_secs(10), a.resolve(opts))
                 .await
                 .map_err(|_| anyhow::anyhow!("timed out resolving the DERP region"))??;
             println!("{r}");
-            Ok(ExitCode::SUCCESS)
         }
-        Some(Cmd::Genkey(a)) => genkey::genkey(&g, a).await,
-        Some(Cmd::Printpub) => {
-            println!("{}", keys::client_key(&g)?.public());
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Cmd::Version) => {
-            println!("{}", version_string());
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Cmd::Readme) => {
-            print!("{}", help::README);
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Cmd::Genkey(a)) => genkey::genkey(g, a).await?,
+        Some(Cmd::Printpub) => println!("{}", keys::client_key(g)?.public()),
+        Some(Cmd::Version) => println!("{VERSION}"),
+        Some(Cmd::Readme) => print!("{}", help::README),
         Some(Cmd::DevDerp { derp, stun, advertise, region_file }) => {
             let d = tailcat::derp::server::DevDerp::start(derp.parse()?, stun.parse()?, advertise).await?;
             let j = serde_json::to_string_pretty(&d.region)?;
             if let Some(f) = region_file {
-                std::fs::write(&f, &j)?;
+                std::fs::write(f, &j)?;
             }
             println!("{j}");
             eprintln!("# dev DERP relay running; press Ctrl-C to stop");
             tokio::signal::ctrl_c().await?;
-            Ok(ExitCode::SUCCESS)
         }
     }
+    Ok(ExitCode::SUCCESS)
 }

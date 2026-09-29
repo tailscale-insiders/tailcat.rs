@@ -33,25 +33,15 @@ fn parse_port(s: &str) -> Result<u16> {
 
 /// Parses a mapping: `port`, `local:remote`, or `local:ip:port`.
 pub fn parse_forward_spec(bind: &str, spec: &str) -> Result<ForwardSpec> {
-    let (local, target, has_colon) = match spec.split_once(':') {
-        Some((l, t)) => (l, t, true),
-        None => (spec, spec, false),
+    let local_port = |s| parse_port(s).map_err(|e| anyhow!("local port: {e}"));
+    let Some((local, target)) = spec.split_once(':') else {
+        let port = local_port(spec)?;
+        return Ok(ForwardSpec { listen_addr: crate::util::join_host_port(bind, port), target: None, port });
     };
-    let local_port = if has_colon && local == "0" {
-        0 // ask the OS for a free port
-    } else {
-        parse_port(local).map_err(|e| anyhow!("local port: {e}"))?
-    };
-    let listen_addr = crate::util::join_host_port(bind, local_port);
-    if !has_colon {
-        return Ok(ForwardSpec {
-            listen_addr,
-            target: None,
-            port: parse_port(target).map_err(|e| anyhow!("remote port: {e}"))?,
-        });
-    }
-    if let Ok(p) = parse_port(target) {
-        return Ok(ForwardSpec { listen_addr, target: None, port: p });
+    // A local port of 0 asks the OS for a free port.
+    let listen_addr = crate::util::join_host_port(bind, if local == "0" { 0 } else { local_port(local)? });
+    if let Ok(port) = parse_port(target) {
+        return Ok(ForwardSpec { listen_addr, target: None, port });
     }
     let t: SocketAddr =
         target.parse().map_err(|_| anyhow!("remote target {target:?} is not a port or address:port"))?;
@@ -76,12 +66,12 @@ pub fn open_browser(url: &str) {
     });
 }
 
+/// Forwards each mapping until Ctrl-C or SIGTERM. `mappings` must not be
+/// empty.
 pub async fn run_forward(g: &Global, bind: &str, addr_arg: &str, mappings: &[String], open: bool) -> Result<()> {
-    if mappings.is_empty() {
-        return Err(usagef!("forward takes a <tc-addr> and at least one port mapping"));
-    }
     let addr = crate::addrarg::tailcat_addr_arg(addr_arg).await?;
     let cl = crate::client::new_client(g, addr, crate::keys::client_key(g)?);
+    // Listen on every mapping before forwarding any.
     let mut listeners = Vec::new();
     for m in mappings {
         let spec = parse_forward_spec(bind, m).map_err(|e| usagef!("mapping {m:?} is invalid: {e}"))?;
@@ -96,24 +86,18 @@ pub async fn run_forward(g: &Global, bind: &str, addr_arg: &str, mappings: &[Str
         }
         listeners.push((ln, spec));
     }
-    let mut tasks = Vec::new();
     for (ln, spec) in listeners {
-        tasks.push(tokio::spawn(forward_listener(cl.clone(), ln, spec)));
+        tokio::spawn(forward_listener(cl.clone(), ln, spec));
     }
     shutdown_signal().await;
-    for t in tasks {
-        t.abort();
-    }
     Ok(())
 }
 
 async fn forward_listener(cl: Client, ln: TcpListener, spec: ForwardSpec) {
     let spec = std::sync::Arc::new(spec);
-    loop {
-        let Ok((conn, _)) = ln.accept().await else { return };
+    while let Ok((mut conn, _)) = ln.accept().await {
         let _ = conn.set_nodelay(true);
-        let cl = cl.clone();
-        let spec = spec.clone();
+        let (cl, spec) = (cl.clone(), spec.clone());
         tokio::spawn(async move {
             let remote = match spec.target {
                 Some(t) => cl.dial_tcp(t).await,
@@ -123,7 +107,6 @@ async fn forward_listener(cl: Client, ln: TcpListener, spec: ForwardSpec) {
                 Ok(r) => crate::serve::proxy_and_drain(r, conn).await,
                 Err(e) => {
                     tracing::debug!("dial remote target {}: {e}", spec.remote_target());
-                    let mut conn = conn;
                     let _ = conn.shutdown().await;
                 }
             }
@@ -165,5 +148,12 @@ mod tests {
         assert_eq!(s.target, Some("192.168.1.10:3306".parse().unwrap()));
         assert!(parse_forward_spec("127.0.0.1", "0").is_err());
         assert!(parse_forward_spec("127.0.0.1", "80:nope").is_err());
+        let s = parse_forward_spec("::1", "8080:[fd7a::1]:80").unwrap();
+        assert_eq!(s.listen_addr, "[::1]:8080");
+        assert_eq!(s.remote_target(), "[fd7a::1]:80");
+        assert_eq!(parse_forward_spec("127.0.0.1", "1:2").unwrap().remote_target(), "localhost:2");
+        for bad in ["", ":80", "x:80", "65536", "80:0", "80:65536", "80:host:22", "00:80"] {
+            assert!(parse_forward_spec("127.0.0.1", bad).is_err(), "{bad:?} parsed");
+        }
     }
 }

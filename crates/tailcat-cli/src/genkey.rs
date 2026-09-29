@@ -1,13 +1,11 @@
 //! `tailcat genkey`: generate, list, or delete saved keys.
 
-use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args};
-use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, PresharedKey, PrivateKey};
+use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, PresharedKey, PrivateKey};
 
-use crate::cache::DiskDerpMapCache;
 use crate::{Global, usagef};
 
 #[derive(Args, Debug)]
@@ -41,30 +39,15 @@ pub struct GenkeyArgs {
     psk: Option<bool>,
 }
 
-fn write_key(path: &std::path::Path, data: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(data.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, data)?;
-    Ok(())
-}
-
-pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
-    let key = g.key.clone().unwrap_or_default();
+pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
+    let key = g.key.as_deref().unwrap_or("");
     let region_set = a.region.is_some();
-    let mut region = a.region.clone().unwrap_or_else(|| "auto".into());
+    let mut region = a.region.unwrap_or_else(|| "auto".into());
 
     if a.list {
-        let dir = crate::keys::keys_dir()?;
-        let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        let mut names: Vec<String> = match std::fs::read_dir(crate::keys::keys_dir()?) {
             Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".private.json")).map(String::from))
+                .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".private.json").map(String::from))
                 .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
@@ -73,7 +56,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
         for n in names {
             println!("{n}");
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(());
     }
     if a.delete {
         if key.is_empty() {
@@ -81,20 +64,20 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
                 "genkey --delete requires saying which key to delete with --key=<name> (see genkey --list)"
             ));
         }
-        if crate::keys::is_path(&key) {
+        if crate::keys::is_path(key) {
             return Err(usagef!("can't delete key {key:?}; it's a path"));
         }
-        std::fs::remove_file(crate::keys::key_path(&key)?)?;
-        return Ok(ExitCode::SUCCESS);
+        std::fs::remove_file(crate::keys::key_path(key)?)?;
+        return Ok(());
     }
     if key.is_empty() && region != "list" {
-        if a.client {
-            return Err(usagef!(
-                "genkey requires a --key=<name>; client modes automatically load the key named \"client-default\" when it exists, making it the usual choice"
-            ));
-        }
+        let (modes, default) = if a.client {
+            ("client modes automatically load", "client-default")
+        } else {
+            ("server mode automatically loads", "default")
+        };
         return Err(usagef!(
-            "genkey requires a --key=<name>; server mode automatically loads the key named \"default\" when it exists, making it the usual choice"
+            "genkey requires a --key=<name>; {modes} the key named {default:?} when it exists, making it the usual choice"
         ));
     }
     if a.client {
@@ -133,7 +116,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
             region.clear();
         }
     }
-    let path = crate::keys::key_path(if key.is_empty() { "unused" } else { &key })?;
+    let path = crate::keys::key_path(if key.is_empty() { "unused" } else { key })?;
     if !key.is_empty() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -147,56 +130,54 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
     if a.psk == Some(false) {
         priv_key.public.preshared_key = PresharedKey::default();
     }
-    if a.client {
-        write_key(&path, &priv_key.to_json_pretty())?;
+    let write = |k: &PrivateKey| -> Result<()> {
+        crate::util::write_private(&path, k.to_json_pretty().as_bytes())?;
         eprintln!("# wrote file to {}", path.display());
+        Ok(())
+    };
+    if a.client {
+        write(&priv_key)?;
         println!("{}", priv_key.private.public());
-        return Ok(ExitCode::SUCCESS);
+        return Ok(());
     }
 
-    let mut matched = String::new();
+    let ci = &mut priv_key.public;
+    // A region to find by name or code in the DERP map.
+    let mut matched = "";
     if region == "auto" {
-        priv_key.public.region_id = -1;
-    } else if let Ok(n) = region.parse::<i32>() {
-        priv_key.public.region_id = n;
+        ci.region_id = -1;
+    } else if let Ok(n) = region.parse() {
+        ci.region_id = n;
     } else if region.contains('.') {
         let nodes = region.split(',').map(|h| DerpNode { host_name: h.to_string(), ..Default::default() }).collect();
-        priv_key.public.region.push(DerpRegion { nodes, ..Default::default() });
+        ci.region.push(DerpRegion { nodes, ..Default::default() });
     } else {
-        matched = region.clone();
+        matched = &region;
     }
 
-    let mut dm = DerpMap::default();
-    if !matched.is_empty() || region.is_empty() || a.embed_derp_map {
-        let cache = DiskDerpMapCache;
-        dm = tokio::time::timeout(
-            Duration::from_secs(10),
-            tailcat::derpmap::fetch_derp_map(FetchOptions {
-                url: Some(&g.derpmap_url),
-                mode: FetchMode::Server,
-                cache: Some(&cache),
-            }),
-        )
-        .await
-        .map_err(|_| anyhow!("derpmap fetch: timeout"))?
-        .map_err(|e| anyhow!("derpmap fetch: {e}"))?;
-    }
+    let dm = if !matched.is_empty() || region.is_empty() || a.embed_derp_map {
+        let fetch = tailcat::derpmap::fetch_derp_map(crate::cache::fetch_options(g, FetchMode::Server));
+        tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .map_err(|_| anyhow!("derpmap fetch: timeout"))?
+            .map_err(|e| anyhow!("derpmap fetch: {e}"))?
+    } else {
+        DerpMap::default()
+    };
     if region.is_empty() {
-        let id = tailcat::netcheck::pick_best_region(&dm)
+        ci.region_id = tailcat::netcheck::pick_best_region(&dm)
             .await?
             .ok_or_else(|| anyhow!("couldn't determine the closest DERP region; specify --region"))?;
-        priv_key.public.region_id = id;
     }
-    let ci = &mut priv_key.public;
     if !matched.is_empty() {
-        match tailcat::derpmap::find_region(&dm, &matched) {
+        match tailcat::derpmap::find_region(&dm, matched) {
             Some(id) => ci.region_id = id,
             None => {
                 for r in dm.regions.values() {
                     eprintln!("  {:3} {} {}", r.region_id, r.region_code, r.region_name);
                 }
                 if matched == "list" {
-                    return Ok(ExitCode::SUCCESS);
+                    return Ok(());
                 }
                 bail!("\nno region found matching {matched:?}");
             }
@@ -215,8 +196,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<ExitCode> {
         ci.region.push(reg);
         ci.region_id = 0;
     }
-    write_key(&path, &priv_key.to_json_pretty())?;
-    eprintln!("# wrote file to {}", path.display());
+    write(&priv_key)?;
     println!("{}", priv_key.public.addr());
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }

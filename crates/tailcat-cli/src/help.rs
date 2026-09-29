@@ -251,6 +251,7 @@ the <tc-addr> argument. Any other hostname or IP is reached through
 the <tc-addr> server acting as an exit node, which works only if the
 server runs with --serve=exit-node."#;
 
+#[cfg(feature = "ssh")]
 pub const SSH: &str = r#"Examples:
 
 	tailcat ssh <tc-addr>
@@ -266,6 +267,7 @@ stranger would connect (a fresh client key and no SSH credentials);
 if the server lets that stranger log in, tailcat refuses to connect.
 --skip-dns-safety-check skips the probe."#;
 
+#[cfg(feature = "ssh")]
 pub const CP: &str = r#"Remote paths are written <tc-addr>:[path], like scp's host:path.
 Paths are relative to the server's served directory ("tailcat serve
 files"), or to the remote home directory for a full SSH server.
@@ -277,6 +279,7 @@ files"), or to the remote home directory for a full SSH server.
 The copying is done by the system scp, with the connection routed
 through tailcat."#;
 
+#[cfg(feature = "ssh")]
 pub const LS: &str = r#"List the files a tailcat server offers, speaking SFTP directly (no ssh
 or sftp binary is involved):
 
