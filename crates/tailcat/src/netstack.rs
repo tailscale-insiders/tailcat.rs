@@ -366,6 +366,9 @@ impl Stack {
                     drop(st);
                     let decision = self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d));
                     st = self.shared.lock();
+                    if st.closed {
+                        return;
+                    }
                     match decision {
                         TcpDecision::Drop => return,
                         TcpDecision::Reset => {} // smoltcp answers unmatched SYNs with RST
@@ -429,6 +432,9 @@ impl Stack {
     pub async fn dial_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
         let (h, local) = {
             let mut st = self.shared.lock();
+            if st.closed {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed"));
+            }
             let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
             let mut sock = new_tcp_socket();
             sock.connect(st.iface.context(), remote, local)

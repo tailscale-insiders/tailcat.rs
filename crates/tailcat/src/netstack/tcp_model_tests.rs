@@ -893,7 +893,6 @@ fn tcp_lifecycle_state_machine(tc: TestCase) {
 /// A dial on a closed stack fails at once: its poll loop has returned,
 /// so nothing would ever send the SYN.
 #[test]
-#[ignore = "known bug: a dial on a closed stack hangs"]
 fn dial_after_close_fails() {
     let net = Net::new();
     net.stack.close();
@@ -906,7 +905,6 @@ fn dial_after_close_fails() {
 /// A SYN whose policy decision races with closing the stack opens no
 /// connection on the closed stack.
 #[test]
-#[ignore = "known bug: a SYN racing Stack::close opens a socket on the closed stack"]
 fn syn_racing_close_opens_nothing() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
     let _guard = rt.enter();
