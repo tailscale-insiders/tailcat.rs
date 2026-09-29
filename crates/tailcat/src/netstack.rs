@@ -157,7 +157,8 @@ struct State {
     device: QueueDevice,
     /// Inbound connections still completing their handshake.
     accepting: HashMap<SocketHandle, PendingAccept>,
-    /// Every TCP socket's 4-tuple, to route SYN retransmits correctly.
+    /// Every TCP socket's 4-tuple, to route SYN retransmits correctly. A
+    /// closed socket a stream still holds gives its up to a new connection.
     tuples: HashMap<FlowKey, SocketHandle>,
     /// How connections ended, where the socket's state doesn't say: a
     /// closed socket may have had a FIN, a RST or an abort.
@@ -357,6 +358,21 @@ impl Stack {
         if proto == IpProtocol::Tcp {
             let Ok(tcp) = TcpPacket::new_checked(body) else { return };
             let (s, d) = (SocketAddr::new(src, tcp.src_port()), SocketAddr::new(dst, tcp.dst_port()));
+            // A SYN on the 4-tuple of a connection that's over starts a new
+            // one; the old socket stays with its stream until it's dropped.
+            // In TIME-WAIT it would swallow the SYN, so it's aborted: the
+            // peer ignores its RST, which has the old connection's numbers.
+            if let Some(&h) = st.tuples.get(&(d, s))
+                && tcp.syn()
+                && !tcp.ack()
+                && !st.accepting.contains_key(&h)
+            {
+                let old = st.sockets.get_mut::<tcp::Socket>(h);
+                if matches!(old.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                    old.abort();
+                    st.tuples.remove(&(d, s));
+                }
+            }
             if !st.tuples.contains_key(&(d, s)) {
                 if !tcp.syn() || tcp.ack() {
                     // Not part of any connection we know; let smoltcp RST it

@@ -885,7 +885,6 @@ impl Net {
 }
 
 #[hegel::test(test_cases = 300)]
-#[ignore = "known bugs, fixed in the commits that follow"]
 fn tcp_lifecycle_state_machine(tc: TestCase) {
     hegel::stateful::machine(Net::new()).steps(30).run(tc);
 }
@@ -951,7 +950,6 @@ fn idle_connection_stays_up() {
 /// stream for the old connection is still held: the new SYN went to the
 /// old, closed socket, bypassing the policy, and was refused.
 #[test]
-#[ignore = "known bug: a SYN on a finished connection's 4-tuple is refused"]
 fn reused_tuple_reaches_the_policy() {
     let mut net = Net::new();
     let first = net.open(SOURCE_PORTS[0]);
@@ -1011,7 +1009,6 @@ fn stalled_handshake_is_reset() {
 /// A remote may reuse a 4-tuple as soon as both sides have closed, while
 /// our socket for it is in TIME-WAIT and its stream still held.
 #[test]
-#[ignore = "known bug: a SYN on a finished connection's 4-tuple is refused"]
 fn tuple_reused_after_time_wait() {
     let mut net = Net::new();
     let first = net.open(SOURCE_PORTS[0]);

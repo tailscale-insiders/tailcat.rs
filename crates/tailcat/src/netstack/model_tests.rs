@@ -371,8 +371,9 @@ impl Net {
         }
     }
 
-    /// Every socket has exactly one flow, and sockets that finished
-    /// closing are removed once nobody holds them.
+    /// Every socket has exactly one flow (or, closed, gave it up to a new
+    /// connection), and sockets that finished closing are removed once
+    /// nobody holds them.
     #[invariant(always_run)]
     fn sockets_are_reaped(&self, _: TestCase) {
         let st = self.stack.shared.lock();
@@ -380,8 +381,10 @@ impl Net {
         let live: HashSet<SocketHandle> = st.sockets.iter().map(|(h, _)| h).collect();
         for (h, s) in st.sockets.iter() {
             let flows: Vec<_> = st.tuples.iter().filter(|&(_, &v)| v == h).map(|(k, _)| k).collect();
-            assert_eq!(flows.len(), 1, "socket {h} has flows {flows:?}");
             let state = tcp::Socket::downcast(s).unwrap().state();
+            // A closed socket a stream holds may have given its flow up.
+            let flowless = flows.is_empty() && state == tcp::State::Closed && held.contains(&h);
+            assert!(flows.len() == 1 || flowless, "{state} socket {h} has flows {flows:?}");
             if matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
                 assert!(
                     held.contains(&h) || st.accepting.contains_key(&h),
