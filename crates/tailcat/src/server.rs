@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use crate::addr::{Addr, ConnInfo};
 use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
-use crate::magicsock::{self, MagicSock};
+use crate::magicsock::{self, MagicSock, PeerPath};
 use crate::netstack::{BoxFuture, Stack, StackConfig, TcpDecision, TcpPolicy, TcpStream, UdpConn, UdpPolicy};
 use crate::wg::{self, Engine, IpNet};
 use crate::{Error, Result, meow};
@@ -515,7 +515,7 @@ impl Server {
             .map(|k| {
                 let path = self.inner.ms.peer_path(&k);
                 let (hs, tx, rx) = self.inner.engine.peer_stats(&k).unwrap_or((None, 0, 0));
-                let direct = path.as_ref().filter(|p| p.direct_trusted).and_then(|p| p.best.map(|b| b.0));
+                let direct = path.as_ref().and_then(PeerPath::direct);
                 PeerStatus {
                     key: k,
                     tailcat_ip: k.tailcat_ip(),

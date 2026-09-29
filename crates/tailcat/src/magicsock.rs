@@ -131,6 +131,13 @@ pub struct PeerPath {
     pub last_recv: Option<Instant>,
 }
 
+impl PeerPath {
+    /// The direct UDP address in use, if the direct path is trusted.
+    pub fn direct(&self) -> Option<SocketAddr> {
+        self.best.filter(|_| self.direct_trusted).map(|(a, _)| a)
+    }
+}
+
 struct Peer {
     cfg: PeerConfig,
     shared: Arc<DiscoShared>,

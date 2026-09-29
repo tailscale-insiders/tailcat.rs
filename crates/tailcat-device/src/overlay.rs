@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use tailcat::magicsock::{self, MagicSock};
+use tailcat::magicsock::{self, MagicSock, PeerPath};
 use tailcat::wg::{self, Engine, InboundPacket, IpNet};
 use tailcat::{DerpMap, NodePublic, PresharedKey};
 use tokio::sync::mpsc;
@@ -232,7 +232,7 @@ impl Overlay {
                     index: r.index,
                     nodekey: r.nodekey,
                     overlay_ip: r.overlay_ip,
-                    direct: path.as_ref().filter(|p| p.direct_trusted).and_then(|p| p.best.map(|b| b.0)),
+                    direct: path.as_ref().and_then(PeerPath::direct),
                     derp_region: path.map_or(0, |p| p.home_region),
                     handshake_age_secs: hs.map(|d| d.as_secs()),
                     tx_bytes,

@@ -113,7 +113,7 @@ async fn peer_updates() {
     let b = NodeRecord { index: 2, ..record(1, &NodePrivate::generate(), &dev) };
     assert!(o.add_peer(&b, &dm).unwrap());
     assert_eq!(o.peer_count(), 1);
-    assert!(!o.magicsock().has_peer(&a.nodekey));
+    assert!(o.magicsock().peer_path(&a.nodekey).is_none());
     assert_eq!(o.status()[0].nodekey, b.nodekey);
 
     // A peer whose home region isn't known is refused.
@@ -123,7 +123,7 @@ async fn peer_updates() {
     assert!(o.remove_peer(&b.nodekey));
     assert!(!o.remove_peer(&b.nodekey));
     assert_eq!(o.peer_count(), 0);
-    assert!(!o.magicsock().has_peer(&b.nodekey));
+    assert!(o.magicsock().peer_path(&b.nodekey).is_none());
 
     // The packet loop is already running.
     tokio::task::yield_now().await;
