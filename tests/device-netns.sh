@@ -11,24 +11,37 @@ set -euo pipefail
 TC=${1:?usage: device-netns.sh <tailcat> <tailcat-device>}
 DEV=${2:?usage: device-netns.sh <tailcat> <tailcat-device>}
 N=3
+nodes=$(seq 0 $((N - 1)))
 work=$(mktemp -d)
 pids=()
 
 cleanup() {
 	for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
 	wait 2>/dev/null || true
-	for i in $(seq 0 $((N - 1))); do ip netns del "tcd$i" 2>/dev/null || true; done
+	for i in $nodes; do ip netns del "tcd$i" 2>/dev/null || true; done
 	ip link del tcd-br 2>/dev/null || true
 	iptables -D FORWARD -i tcd-br -o tcd-br -j ACCEPT 2>/dev/null || true
 	if [ "${keep:-}" != 1 ]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
 
-dump_logs() {
+# die <message>: fails the test, showing the logs.
+die() {
+	echo "FAIL $*"
 	for f in "$work"/*.log; do
 		echo "=== $f"
 		tail -40 "$f"
 	done
+	exit 1
+}
+
+# wait_for <file> <tenths of a second>: waits for a non-empty file.
+wait_for() {
+	for _ in $(seq "$2"); do
+		[ -s "$1" ] && return
+		sleep 0.1
+	done
+	return 1
 }
 
 ip link add tcd-br type bridge
@@ -39,7 +52,7 @@ ip link set tcd-br up
 # namespaces: exactly the direct paths this test wants to see.
 sysctl -qw net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
 iptables -I FORWARD -i tcd-br -o tcd-br -j ACCEPT 2>/dev/null || true
-for i in $(seq 0 $((N - 1))); do
+for i in $nodes; do
 	ns=tcd$i
 	ip netns add "$ns"
 	ip link add "tcdv$i" type veth peer name "tcdp$i"
@@ -53,43 +66,32 @@ done
 # The relay: DERP over TLS and STUN, reachable from every namespace.
 "$TC" dev-derp --derp 10.99.0.1:0 --stun 10.99.0.1:3478 --region-file "$work/region.json" >/dev/null 2>"$work/derp.log" &
 pids+=($!)
-for _ in $(seq 100); do [ -s "$work/region.json" ] && break; sleep 0.1; done
-[ -s "$work/region.json" ] || { echo "relay didn't start"; cat "$work/derp.log"; exit 1; }
+wait_for "$work/region.json" 100 || die "relay didn't start"
 
 mkdir -p "$work/records"
-for i in $(seq 0 $((N - 1))); do
+for i in $nodes; do
 	ip netns exec "tcd$i" "$DEV" init --index "$i" --attempt 1 --region-file "$work/region.json" \
 		--key "$work/key$i" --out "$work/records/node-1-$i.json" >/dev/null
 done
 
-for i in $(seq 0 $((N - 1))); do
+for i in $nodes; do
 	ip netns exec "tcd$i" "$DEV" up --key "$work/key$i" --records "$work/records" --nodes "$N" --wait 60s \
 		--tun tcd0 --status-file "$work/status$i.json" --ready-file "$work/ready$i" --status-interval 5s \
 		2>"$work/node$i.log" &
 	pids+=($!)
 done
 
-for i in $(seq 0 $((N - 1))); do
-	for _ in $(seq 600); do [ -e "$work/ready$i" ] && break; sleep 0.1; done
-	if [ ! -e "$work/ready$i" ]; then
-		echo "node $i never became ready"
-		dump_logs
-		exit 1
-	fi
+for i in $nodes; do
+	wait_for "$work/ready$i" 600 || die "node $i never became ready"
 done
 echo "ok   all $N nodes ready"
 
 # Every node pings every other over the overlay.
-for i in $(seq 0 $((N - 1))); do
-	for j in $(seq 0 $((N - 1))); do
+for i in $nodes; do
+	for j in $nodes; do
 		[ "$i" = "$j" ] && continue
-		if ip netns exec "tcd$i" ping -c 3 -i 0.2 -W 2 "100.64.1.$j" >/dev/null; then
-			echo "ok   ping node $i -> 100.64.1.$j"
-		else
-			echo "FAIL ping node $i -> 100.64.1.$j"
-			dump_logs
-			exit 1
-		fi
+		ip netns exec "tcd$i" ping -c 3 -i 0.2 -W 2 "100.64.1.$j" >/dev/null || die "ping node $i -> 100.64.1.$j"
+		echo "ok   ping node $i -> 100.64.1.$j"
 	done
 done
 
@@ -115,28 +117,16 @@ s.sendall(open("'"$work"'/payload", "rb").read()); s.close()
 '
 wait "$listener"
 want="4000000 $(sha256sum "$work/payload" | cut -d" " -f1)"
-if [ "$(cat "$work/received")" = "$want" ]; then
-	echo "ok   4 MB TCP transfer node 0 -> node 1"
-else
-	echo "FAIL TCP transfer: got '$(cat "$work/received")', want '$want'"
-	dump_logs
-	exit 1
-fi
+got=$(cat "$work/received")
+[ "$got" = "$want" ] || die "TCP transfer: got '$got', want '$want'"
+echo "ok   4 MB TCP transfer node 0 -> node 1"
 
 # The namespaces share a LAN, so the nodes should find direct paths.
 sleep 6
 direct=$(python3 -c '
-import json, sys
-n = 0
-for i in range('"$N"'):
-    for p in json.load(open("'"$work"'/status%d.json" % i)):
-        n += p["direct"] is not None
-print(n)')
+import json
+print(sum(p["direct"] is not None for i in range('"$N"') for p in json.load(open("'"$work"'/status%d.json" % i))))')
 echo "     $direct of $((N * (N - 1))) peer paths are direct"
-if [ "$direct" -lt 1 ]; then
-	echo "FAIL no direct paths formed"
-	dump_logs
-	exit 1
-fi
+[ "$direct" -ge 1 ] || die "no direct paths formed"
 echo "ok   direct paths formed"
 echo "all device tests passed"

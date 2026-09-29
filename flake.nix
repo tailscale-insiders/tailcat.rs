@@ -5,7 +5,7 @@
   # the upstream Go tailcat used by the interop check all come from it.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-  outputs = { self, nixpkgs }:
+  outputs = { nixpkgs, ... }:
     let
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
@@ -67,15 +67,8 @@
         default = tailcat;
       });
 
-      apps = forAllSystems (pkgs: {
-        default = {
-          type = "app";
-          program = "${self.packages.${pkgs.system}.tailcat}/bin/tailcat";
-        };
-      });
-
       checks = forAllSystems (pkgs:
-        let tailcat = self.packages.${pkgs.system}.tailcat; in
+        let tailcat = mkWorkspace pkgs; in
         {
           inherit tailcat;
 
@@ -91,9 +84,7 @@
               nativeBuildInputs = [ tailcat pkgs.tailcat pkgs.openssh pkgs.coreutils pkgs.bash pkgs.gnugrep ];
               __darwinAllowLocalNetworking = true;
             } ''
-            export HOME=$TMPDIR/home
-            mkdir -p "$HOME"
-            bash ${./tests/interop.sh} ${tailcat}/bin/tailcat ${pkgs.tailcat}/bin/tailcat
+            bash ${./tests}/interop.sh ${tailcat}/bin/tailcat ${pkgs.tailcat}/bin/tailcat
             touch $out
           '';
         });

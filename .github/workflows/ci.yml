@@ -30,17 +30,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - uses: ./.github/actions/nix
         with:
-          nix_conf: |
-            keep-env-derivations = true
-            keep-outputs = true
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 6G
-          gc-max-store-size-macos: 6G
+          save: true
       - run: nix flake check --print-build-logs --keep-going
       - run: nix build --print-build-logs .#tailcat
       - run: ./result/bin/tailcat version && ./result/bin/tailcat-device --version
@@ -51,12 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          save: false
+      - uses: ./.github/actions/nix
       - run: nix build --print-build-logs .#tailcat
       - run: sudo tests/device-netns.sh "$PWD/result/bin/tailcat" "$PWD/result/bin/tailcat-device"
 
@@ -66,12 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          save: false
+      - uses: ./.github/actions/nix
       - run: nix build --print-build-logs .#tailcat
       - run: nix build --out-link go-tailcat --inputs-from . nixpkgs#tailcat
       - run: tests/live.sh "$PWD/result/bin/tailcat" "$PWD/go-tailcat/bin/tailcat"
@@ -92,32 +74,27 @@ jobs:
         index: [0, 1, 2]
     env:
       NODES: 3
-      GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
+      NODE: ${{ github.run_attempt }}-${{ matrix.index }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          save: false
+      - uses: ./.github/actions/nix
       - run: nix build --print-build-logs .#tailcat
       - name: make the node key and record
         run: ./result/bin/tailcat-device init --index ${{ matrix.index }} --oidc
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: node-${{ github.run_attempt }}-${{ matrix.index }}.json
+          path: node-${{ env.NODE }}.json
           archive: false
           retention-days: 1
       - name: bring up the overlay
         run: tests/gha-mesh.sh start "$PWD/result/bin/tailcat-device" "$NODES"
       - name: ping every other node
         run: tests/gha-mesh.sh check ${{ matrix.index }} "$NODES"
-      - run: touch done-${{ github.run_attempt }}-${{ matrix.index }}
+      - run: touch "done-$NODE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: done-${{ github.run_attempt }}-${{ matrix.index }}
+          path: done-${{ env.NODE }}
           archive: false
           retention-days: 1
       - name: wait for every node to finish

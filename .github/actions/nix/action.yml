@@ -1,0 +1,24 @@
+# Installs Nix and restores the Nix store cached by this OS's check job
+# (which alone saves it, with `save: true`).
+
+name: Nix
+description: Install Nix with a cached store
+inputs:
+  save:
+    description: Whether to save the store to the cache at the end of the job.
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      with:
+        nix_conf: |
+          keep-env-derivations = true
+          keep-outputs = true
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        gc-max-store-size-linux: 6G
+        gc-max-store-size-macos: 6G
+        save: ${{ inputs.save }}

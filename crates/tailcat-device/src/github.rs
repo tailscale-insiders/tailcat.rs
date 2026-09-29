@@ -11,7 +11,8 @@
 use std::io::Read;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use reqwest::{IntoUrl, RequestBuilder, Response, Url};
 use serde::Deserialize;
 
 use crate::record::{NodeRecord, audience_for};
@@ -45,13 +46,10 @@ pub struct GithubEnv {
     pub token: String,
 }
 
-fn env(k: &str) -> String {
-    std::env::var(k).unwrap_or_default()
-}
-
 impl GithubEnv {
     /// Reads the environment GitHub Actions sets for every step.
     pub fn from_env() -> Result<GithubEnv> {
+        let env = |k| std::env::var(k).unwrap_or_default();
         let e = GithubEnv {
             api_url: std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
             repository: env("GITHUB_REPOSITORY"),
@@ -64,18 +62,18 @@ impl GithubEnv {
             workflow_ref: env("GITHUB_WORKFLOW_REF"),
             token: env("GITHUB_TOKEN"),
         };
-        if e.repository.is_empty() || e.run_id.is_empty() {
-            bail!("not running in GitHub Actions (GITHUB_REPOSITORY and GITHUB_RUN_ID are unset)");
-        }
-        if e.token.is_empty() {
-            bail!(
-                "GITHUB_TOKEN is unset; pass it with `env: {{ GITHUB_TOKEN: ${{{{ github.token }}}} }}` and grant `actions: read`"
-            );
-        }
+        ensure!(
+            !e.repository.is_empty() && !e.run_id.is_empty(),
+            "not running in GitHub Actions (GITHUB_REPOSITORY and GITHUB_RUN_ID are unset)"
+        );
+        ensure!(
+            !e.token.is_empty(),
+            "GITHUB_TOKEN is unset; pass it with `env: {{ GITHUB_TOKEN: ${{{{ github.token }}}} }}` and grant `actions: read`"
+        );
         Ok(e)
     }
 
-    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+    fn get(&self, url: impl IntoUrl) -> RequestBuilder {
         tailcat::shared_client()
             .get(url)
             .bearer_auth(&self.token)
@@ -83,6 +81,11 @@ impl GithubEnv {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .timeout(Duration::from_secs(30))
     }
+}
+
+/// Sends a request, failing unless the response is a success.
+async fn send(req: RequestBuilder, what: impl FnOnce() -> String) -> Result<Response> {
+    req.send().await.and_then(Response::error_for_status).with_context(what)
 }
 
 /// A run artifact.
@@ -102,32 +105,21 @@ pub struct ArtifactRun {
     pub id: u64,
 }
 
-#[derive(Deserialize)]
-struct ArtifactList {
-    artifacts: Vec<Artifact>,
-}
-
-#[derive(Deserialize)]
-struct RunList {
-    workflow_runs: Vec<Run>,
-}
-
-#[derive(Deserialize)]
-struct Run {
-    id: u64,
-}
-
 /// Lists a run's artifacts.
 pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>> {
+    #[derive(Deserialize)]
+    struct List {
+        artifacts: Vec<Artifact>,
+    }
     let mut out = Vec::new();
     for page in 1..=10 {
         let url =
             format!("{}/repos/{}/actions/runs/{run_id}/artifacts?per_page=100&page={page}", e.api_url, e.repository);
-        let res = e.get(&url).send().await.with_context(|| format!("listing artifacts of run {run_id}"))?;
-        if !res.status().is_success() {
-            bail!("listing artifacts of run {run_id}: {}", res.status());
-        }
-        let l: ArtifactList = res.json().await.context("decoding the artifact list")?;
+        let l: List = send(e.get(url), || format!("listing artifacts of run {run_id}"))
+            .await?
+            .json()
+            .await
+            .context("decoding the artifact list")?;
         let n = l.artifacts.len();
         out.extend(l.artifacts.into_iter().filter(|a| !a.expired));
         if n < 100 {
@@ -140,6 +132,14 @@ pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>
 /// Lists the in-progress runs of this workflow sharing our branch (or,
 /// for a pull request, its head branch).
 pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct List {
+        workflow_runs: Vec<Run>,
+    }
+    #[derive(Deserialize)]
+    struct Run {
+        id: u64,
+    }
     let workflow = e
         .workflow_ref
         .split('@')
@@ -147,19 +147,13 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
         .and_then(|p| p.rsplit('/').next())
         .filter(|w| !w.is_empty())
         .ok_or_else(|| anyhow!("GITHUB_WORKFLOW_REF is unset"))?;
-    let branch = match scope {
-        Scope::Pr => &e.head_ref,
-        _ => &e.ref_name,
-    };
-    let url = format!(
-        "{}/repos/{}/actions/workflows/{workflow}/runs?status=in_progress&per_page=50&branch={branch}",
-        e.api_url, e.repository
-    );
-    let res = e.get(&url).send().await.context("listing workflow runs")?;
-    if !res.status().is_success() {
-        bail!("listing workflow runs: {}", res.status());
-    }
-    let l: RunList = res.json().await.context("decoding the run list")?;
+    let branch = if scope == Scope::Pr { &e.head_ref } else { &e.ref_name };
+    let url = Url::parse_with_params(
+        &format!("{}/repos/{}/actions/workflows/{workflow}/runs", e.api_url, e.repository),
+        [("status", "in_progress"), ("per_page", "50"), ("branch", branch)],
+    )?;
+    let l: List =
+        send(e.get(url), || "listing workflow runs".into()).await?.json().await.context("decoding the run list")?;
     let mut ids: Vec<String> = l.workflow_runs.into_iter().map(|r| r.id.to_string()).collect();
     if !ids.contains(&e.run_id) {
         ids.push(e.run_id.clone());
@@ -170,74 +164,48 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
 /// Downloads an artifact's content: the single file inside its zip, or
 /// the raw file for single-file (unarchived) uploads.
 pub async fn download(e: &GithubEnv, a: &Artifact) -> Result<Vec<u8>> {
-    let res =
-        e.get(&a.archive_download_url).send().await.with_context(|| format!("downloading artifact {}", a.name))?;
-    if !res.status().is_success() {
-        bail!("downloading artifact {}: {}", a.name, res.status());
+    let body =
+        send(e.get(&a.archive_download_url), || format!("downloading artifact {}", a.name)).await?.bytes().await?;
+    if !body.starts_with(b"PK\x03\x04") {
+        return Ok(body.into());
     }
-    let body = res.bytes().await?.to_vec();
-    if body.starts_with(b"PK\x03\x04") {
-        let mut z = zip::ZipArchive::new(std::io::Cursor::new(body)).context("opening the artifact zip")?;
-        if z.is_empty() {
-            bail!("artifact {} is an empty zip", a.name);
-        }
-        let mut f = z.by_index(0)?;
-        let mut out = Vec::new();
-        f.by_ref().take(1 << 20).read_to_end(&mut out)?;
-        return Ok(out);
-    }
-    Ok(body)
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(body)).context("opening the artifact zip")?;
+    ensure!(!z.is_empty(), "artifact {} is an empty zip", a.name);
+    let mut out = Vec::new();
+    z.by_index(0)?.take(1 << 20).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// Mints a GitHub OIDC token for `audience`. The job needs
 /// `permissions: id-token: write`.
 pub async fn mint_oidc(audience: &str) -> Result<String> {
-    let url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
-        anyhow!("ACTIONS_ID_TOKEN_REQUEST_URL is unset; the job needs `permissions: id-token: write` (and fork PRs can't mint tokens)")
-    })?;
-    let tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is unset")?;
     #[derive(Deserialize)]
     struct Resp {
         value: String,
     }
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let full = format!("{url}{sep}audience={}", urlencode(audience));
-    let res = tailcat::shared_client().get(full).bearer_auth(tok).timeout(Duration::from_secs(15)).send().await?;
-    if !res.status().is_success() {
-        bail!("minting an OIDC token: {}", res.status());
-    }
-    Ok(res.json::<Resp>().await?.value)
-}
-
-fn urlencode(s: &str) -> String {
-    let mut o = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
-            _ => o.push_str(&format!("%{b:02X}")),
-        }
-    }
-    o
+    let url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
+        anyhow!("ACTIONS_ID_TOKEN_REQUEST_URL is unset; the job needs `permissions: id-token: write` (and fork PRs can't mint tokens)")
+    })?;
+    let tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is unset")?;
+    let mut url = Url::parse(&url).context("parsing ACTIONS_ID_TOKEN_REQUEST_URL")?;
+    url.query_pairs_mut().append_pair("audience", audience);
+    let req = tailcat::shared_client().get(url).bearer_auth(tok).timeout(Duration::from_secs(15));
+    Ok(send(req, || "minting an OIDC token".into()).await?.json::<Resp>().await?.value)
 }
 
 /// The claims of a GitHub Actions OIDC token that admission checks.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Claims {
     pub iss: String,
     pub exp: u64,
-    #[serde(default)]
     pub repository_id: String,
-    #[serde(default, rename = "ref")]
+    #[serde(rename = "ref")]
     pub git_ref: String,
-    #[serde(default)]
     pub run_id: String,
-    #[serde(default)]
     pub run_attempt: String,
-    #[serde(default)]
     pub sha: String,
-    #[serde(default)]
     pub job_workflow_ref: String,
-    #[serde(default)]
     pub actor: String,
 }
 
@@ -249,13 +217,10 @@ pub struct Verifier {
 impl Verifier {
     /// Fetches the issuer's signing keys.
     pub async fn fetch() -> Result<Verifier> {
-        let url = format!("{OIDC_ISSUER}/.well-known/jwks");
-        let jwks = tailcat::shared_client()
-            .get(url)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .context("fetching GitHub's OIDC keys")?
+        let req =
+            tailcat::shared_client().get(format!("{OIDC_ISSUER}/.well-known/jwks")).timeout(Duration::from_secs(15));
+        let jwks = send(req, || "fetching GitHub's OIDC keys".into())
+            .await?
             .json()
             .await
             .context("decoding GitHub's OIDC keys")?;
@@ -291,55 +256,48 @@ pub fn admit(
     verifier: Option<&Verifier>,
     audience_prefix: &str,
 ) -> Result<()> {
-    let own_run = from_run == e.run_id;
     if scope == Scope::Run {
-        if !own_run {
-            bail!("record from run {from_run}, not ours");
-        }
-        if !r.run_attempt.is_empty() && r.run_attempt != e.run_attempt {
-            bail!("record from attempt {}, not ours ({})", r.run_attempt, e.run_attempt);
-        }
+        ensure!(from_run == e.run_id, "record from run {from_run}, not ours");
+        ensure!(
+            r.run_attempt.is_empty() || r.run_attempt == e.run_attempt,
+            "record from attempt {}, not ours ({})",
+            r.run_attempt,
+            e.run_attempt
+        );
     }
     if r.jwt.is_empty() {
-        if scope != Scope::Run {
-            bail!("record carries no OIDC token, required outside run scope");
-        }
+        ensure!(scope == Scope::Run, "record carries no OIDC token, required outside run scope");
         return Ok(());
     }
     let v = verifier.ok_or_else(|| anyhow!("no OIDC verifier"))?;
     let c = v.verify(&r.jwt, &audience_for(audience_prefix, &r.nodekey))?;
-    if !e.repository_id.is_empty() && c.repository_id != e.repository_id {
-        bail!("token is for repository {}, not ours", c.repository_id);
-    }
+    ensure!(
+        e.repository_id.is_empty() || c.repository_id == e.repository_id,
+        "token is for repository {}, not ours",
+        c.repository_id
+    );
     match scope {
-        Scope::Run => {
-            if c.run_id != e.run_id || c.run_attempt != e.run_attempt {
-                bail!("token is for run {} attempt {}, not ours", c.run_id, c.run_attempt);
-            }
+        Scope::Run if c.run_id != e.run_id || c.run_attempt != e.run_attempt => {
+            bail!("token is for run {} attempt {}, not ours", c.run_id, c.run_attempt)
         }
-        Scope::Branch => {
-            if c.git_ref != e.git_ref {
-                bail!("token is for ref {}, not {}", c.git_ref, e.git_ref);
-            }
+        Scope::Branch if c.git_ref != e.git_ref => bail!("token is for ref {}, not {}", c.git_ref, e.git_ref),
+        Scope::Pr
+            if !(c.git_ref.starts_with("refs/pull/") && c.git_ref.ends_with("/merge")) || c.git_ref != e.git_ref =>
+        {
+            bail!("token is for ref {}, not this pull request's {}", c.git_ref, e.git_ref)
         }
-        Scope::Pr => {
-            if !(c.git_ref.starts_with("refs/pull/") && c.git_ref.ends_with("/merge")) || c.git_ref != e.git_ref {
-                bail!("token is for ref {}, not this pull request's {}", c.git_ref, e.git_ref);
-            }
-        }
+        _ => {}
     }
-    if c.run_id != from_run {
-        bail!("token is for run {}, but the record came from run {from_run}", c.run_id);
-    }
+    ensure!(c.run_id == from_run, "token is for run {}, but the record came from run {from_run}", c.run_id);
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tailcat::NodePrivate;
 
-    fn genv() -> GithubEnv {
+    pub fn genv() -> GithubEnv {
         GithubEnv {
             api_url: "https://api.github.com".into(),
             repository: "o/r".into(),
@@ -354,22 +312,12 @@ mod tests {
         }
     }
 
-    fn rec(attempt: &str) -> NodeRecord {
-        let k = NodePrivate::generate();
+    pub fn rec(attempt: &str) -> NodeRecord {
         NodeRecord {
-            index: 0,
-            nodekey: k.public(),
-            discokey: k.disco_private().public(),
-            overlay_ip: "100.64.1.0".parse().unwrap(),
             derp_region: 1,
-            derp: None,
-            routes: vec![],
-            endpoints: vec![],
-            os: String::new(),
-            arch: String::new(),
             run_id: "100".into(),
             run_attempt: attempt.into(),
-            jwt: String::new(),
+            ..NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap())
         }
     }
 
@@ -377,74 +325,133 @@ mod tests {
     fn run_scope_admission() {
         let e = genv();
         assert!(admit(&rec("1"), "100", &e, Scope::Run, None, "p:").is_ok());
+        assert!(admit(&rec(""), "100", &e, Scope::Run, None, "p:").is_ok(), "no attempt recorded");
         assert!(admit(&rec("2"), "100", &e, Scope::Run, None, "p:").is_err(), "stale attempt");
         assert!(admit(&rec("1"), "99", &e, Scope::Run, None, "p:").is_err(), "another run");
         assert!(admit(&rec("1"), "100", &e, Scope::Branch, None, "p:").is_err(), "no token outside run scope");
+        assert!(admit(&rec("1"), "100", &e, Scope::Pr, None, "p:").is_err(), "no token outside run scope");
+        let mut r = rec("1");
+        r.jwt = "x.y.z".into();
+        assert!(admit(&r, "100", &e, Scope::Run, None, "p:").is_err(), "a token but no verifier");
     }
 
-    /// Signs GitHub-shaped OIDC tokens with a local key and checks
-    /// admission against them.
+    /// Signs GitHub-shaped OIDC tokens with a local key.
+    pub(crate) struct Signer {
+        enc: jsonwebtoken::EncodingKey,
+        jwks: jsonwebtoken::jwk::JwkSet,
+        pub now: u64,
+    }
+
+    impl Signer {
+        pub fn new() -> Signer {
+            use base64::Engine as _;
+            use rsa::pkcs1::EncodeRsaPrivateKey;
+            use rsa::traits::PublicKeyParts;
+
+            let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+            let b64 = |b: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let jwks = serde_json::from_value(serde_json::json!({
+                "keys": [{"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+                          "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be())}]
+            }))
+            .unwrap();
+            Signer {
+                enc: jsonwebtoken::EncodingKey::from_rsa_der(key.to_pkcs1_der().unwrap().as_bytes()),
+                jwks,
+                now: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            }
+        }
+
+        /// A verifier that trusts this signer.
+        pub fn verifier(&self) -> Verifier {
+            Verifier::from_jwks(self.jwks.clone())
+        }
+
+        /// Signs `claims` over a valid default set for run 100 of repo 42.
+        pub fn sign(&self, kid: Option<&str>, claims: serde_json::Value) -> String {
+            let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            h.kid = kid.map(Into::into);
+            let mut c = serde_json::json!({
+                "iss": OIDC_ISSUER, "exp": self.now + 600, "iat": self.now,
+                "repository_id": "42", "ref": "refs/heads/main", "run_id": "100", "run_attempt": "1",
+            });
+            c.as_object_mut().unwrap().extend(claims.as_object().unwrap().clone());
+            jsonwebtoken::encode(&h, &c, &self.enc).unwrap()
+        }
+
+        /// A record for a fresh key with a token for it, plus `claims`.
+        pub fn rec(&self, claims: serde_json::Value) -> NodeRecord {
+            let mut r = rec("1");
+            let mut c = serde_json::json!({ "aud": audience_for(P, &r.nodekey) });
+            c.as_object_mut().unwrap().extend(claims.as_object().unwrap().clone());
+            r.jwt = self.sign(Some("k1"), c);
+            r
+        }
+    }
+
+    pub const P: &str = "tailcat-device:";
+
     #[test]
     fn oidc_admission() {
-        use base64::Engine as _;
-        use rsa::pkcs1::EncodeRsaPrivateKey;
-        use rsa::traits::PublicKeyParts;
+        use serde_json::json;
 
-        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
-        let b64 = |b: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
-                      "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be())}]
-        }))
-        .unwrap();
-        let v = Verifier::from_jwks(jwks);
-        let enc = jsonwebtoken::EncodingKey::from_rsa_der(key.to_pkcs1_der().unwrap().as_bytes());
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let sign = |aud: String, git_ref: &str, run: &str, exp: u64| {
-            let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-            h.kid = Some("k1".into());
-            let claims = serde_json::json!({
-                "iss": OIDC_ISSUER, "aud": aud, "exp": exp, "iat": now,
-                "repository_id": "42", "ref": git_ref, "run_id": run, "run_attempt": "1",
-            });
-            jsonwebtoken::encode(&h, &claims, &enc).unwrap()
-        };
+        let s = Signer::new();
+        let v = s.verifier();
         let e = genv();
-        let p = "tailcat-device:";
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, Some(&v), P);
 
-        let mut r = rec("1");
-        r.jwt = sign(audience_for(p, &r.nodekey), "refs/heads/main", "100", now + 600);
-        admit(&r, "100", &e, Scope::Run, Some(&v), p).unwrap();
+        let r = s.rec(json!({}));
+        admit(&r, "100", Scope::Run).unwrap();
 
         // A token for another node's key doesn't transfer.
-        let other = rec("1");
         let mut stolen = rec("1");
-        stolen.jwt = sign(audience_for(p, &other.nodekey), "refs/heads/main", "100", now + 600);
-        assert!(admit(&stolen, "100", &e, Scope::Run, Some(&v), p).is_err());
+        stolen.jwt = r.jwt.clone();
+        assert!(admit(&stolen, "100", Scope::Run).is_err());
+
+        // Run scope wants this very run and attempt.
+        assert!(admit(&s.rec(json!({"run_attempt": "2"})), "100", Scope::Run).is_err(), "other attempt");
 
         // Branch scope admits another run on the same ref, not another ref.
-        let mut sib = rec("1");
-        sib.jwt = sign(audience_for(p, &sib.nodekey), "refs/heads/main", "99", now + 600);
-        admit(&sib, "99", &e, Scope::Branch, Some(&v), p).unwrap();
-        assert!(admit(&sib, "100", &e, Scope::Branch, Some(&v), p).is_err(), "token run != artifact run");
-        let mut wrong_ref = rec("1");
-        wrong_ref.jwt = sign(audience_for(p, &wrong_ref.nodekey), "refs/heads/evil", "99", now + 600);
-        assert!(admit(&wrong_ref, "99", &e, Scope::Branch, Some(&v), p).is_err());
+        let sib = s.rec(json!({"run_id": "99"}));
+        admit(&sib, "99", Scope::Branch).unwrap();
+        assert!(admit(&sib, "100", Scope::Branch).is_err(), "token run != artifact run");
+        assert!(admit(&s.rec(json!({"run_id": "99", "ref": "refs/heads/evil"})), "99", Scope::Branch).is_err());
 
-        // Expired and forged tokens fail.
-        let mut old = rec("1");
-        old.jwt = sign(audience_for(p, &old.nodekey), "refs/heads/main", "100", now - 3600);
-        assert!(admit(&old, "100", &e, Scope::Run, Some(&v), p).is_err());
+        // Another repository's token fails in every scope.
+        let foreign = s.rec(json!({"repository_id": "7"}));
+        for scope in [Scope::Run, Scope::Branch] {
+            assert!(admit(&foreign, "100", scope).is_err(), "{scope:?}");
+        }
+
+        // Expired, forged, keyless and unknown-key tokens fail.
+        assert!(admit(&s.rec(json!({"exp": s.now - 3600})), "100", Scope::Run).is_err(), "expired");
+        assert!(admit(&s.rec(json!({"iss": "https://evil.example"})), "100", Scope::Run).is_err(), "issuer");
         let mut forged = r.clone();
         let mut b = forged.jwt.into_bytes();
         let i = b.len() - 10; // inside the signature
         b[i] = if b[i] == b'A' { b'B' } else { b'A' };
         forged.jwt = String::from_utf8(b).unwrap();
-        assert!(admit(&forged, "100", &e, Scope::Run, Some(&v), p).is_err());
+        assert!(admit(&forged, "100", Scope::Run).is_err(), "forged");
+        let mut keyless = r.clone();
+        keyless.jwt = s.sign(None, json!({"aud": audience_for(P, &r.nodekey)}));
+        assert!(admit(&keyless, "100", Scope::Run).is_err(), "no key ID");
+        let mut unknown = r.clone();
+        unknown.jwt = s.sign(Some("k2"), json!({"aud": audience_for(P, &r.nodekey)}));
+        assert!(admit(&unknown, "100", Scope::Run).is_err(), "unknown key ID");
     }
 
     #[test]
-    fn url_encoding() {
-        assert_eq!(urlencode("tailcat-device:ab"), "tailcat-device%3Aab");
+    fn pr_scope_admission() {
+        use serde_json::json;
+
+        let s = Signer::new();
+        let pr = GithubEnv { git_ref: "refs/pull/5/merge".into(), head_ref: "feature".into(), ..genv() };
+        let v = s.verifier();
+        let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, "99", e, Scope::Pr, Some(&v), P);
+
+        admit(&s.rec(json!({"run_id": "99", "ref": "refs/pull/5/merge"})), &pr).unwrap();
+        assert!(admit(&s.rec(json!({"run_id": "99", "ref": "refs/pull/6/merge"})), &pr).is_err(), "other PR");
+        // Branch refs never pass PR scope, even when they match ours.
+        assert!(admit(&s.rec(json!({"run_id": "99"})), &genv()).is_err(), "not a PR ref");
     }
 }

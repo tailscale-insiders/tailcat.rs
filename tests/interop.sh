@@ -10,74 +10,32 @@
 
 set -euo pipefail
 
-RS=${1:?usage: interop.sh <rust tailcat> <go tailcat>}
-GO=${2:?usage: interop.sh <rust tailcat> <go tailcat>}
-work=$(mktemp -d)
-export HOME="$work/home"
-mkdir -p "$HOME"
+# Each implementation's binary is in the variable of its name, so "${!c}"
+# is client $c's.
+# shellcheck disable=SC2034
+rust=${1:?usage: interop.sh <rust tailcat> <go tailcat>} go=${2:?usage: interop.sh <rust tailcat> <go tailcat>}
+impls=(rust go)
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
+# Servers run a relay of their own; clients ignore this.
+export TS_DEBUG_TAILCAT_LOCAL_DERP=1
 # Build sandboxes don't set USER, and Go's os/user needs it without cgo
 # (nixpkgs' Go tailcat is built without cgo).
 USER=${USER:-$(id -un)}
 export USER
-pids=()
-cleanup() {
-	for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-	wait 2>/dev/null || true
-	rm -rf "$work"
-}
-trap cleanup EXIT
-
-failures=0
-pass() { echo "ok   $*"; }
-fail() {
-	echo "FAIL $*" | tr "\r" " "
-	failures=$((failures + 1))
-}
-
-# start <name> <server command...>: runs a server with a local relay and
-# waits for its address, which it leaves in $addr.
-start() {
-	local name=$1
-	shift
-	rm -f "$work/addr"
-	TS_DEBUG_TAILCAT_LOCAL_DERP=1 TAILCAT_ADDR_FILE="$work/addr" "$@" >"$work/$name.out" 2>"$work/$name.log" &
-	pids+=($!)
-	server_pid=$!
-	for _ in $(seq 150); do
-		[ -s "$work/addr" ] && break
-		sleep 0.1
-	done
-	if [ ! -s "$work/addr" ]; then
-		echo "server $name did not start:"
-		cat "$work/$name.log"
-		exit 1
-	fi
-	addr=$(cat "$work/addr")
-}
-
-stop() {
-	kill "$server_pid" 2>/dev/null || true
-	wait "$server_pid" 2>/dev/null || true
-}
-
-impls=("rust:$RS" "go:$GO")
 
 # The stdin/stdout pipe, both directions, every pairing.
 for s in "${impls[@]}"; do
 	for c in "${impls[@]}"; do
-		sn=${s%%:*} sb=${s#*:} cn=${c%%:*} cb=${c#*:}
-		[ "$sn" = go ] && [ "$cn" = go ] && continue
-		start "pipe-$sn" "$sb"
-		msg="hello from $cn to $sn"
-		if echo "$msg" | timeout 60 "$cb" "$addr" >/dev/null 2>"$work/client.log"; then
-			sleep 0.5
-			if grep -qx "$msg" "$work/pipe-$sn.out"; then
-				pass "pipe: $cn client -> $sn server"
-			else
-				fail "pipe: $cn client -> $sn server: server got '$(cat "$work/pipe-$sn.out")'"
-			fi
+		[ "$s" = go ] && [ "$c" = go ] && continue
+		start "pipe-$s" "${!s}"
+		msg="hello from $c to $s"
+		if ! echo "$msg" | timeout 60 "${!c}" "$addr" >/dev/null 2>"$work/client.log"; then
+			fail "pipe: $c client -> $s server: client failed: $(tail -3 "$work/client.log")"
+		elif sleep 0.5 && grep -qx "$msg" "$work/pipe-$s.out"; then
+			pass "pipe: $c client -> $s server"
 		else
-			fail "pipe: $cn client -> $sn server: client failed: $(tail -3 "$work/client.log")"
+			fail "pipe: $c client -> $s server: server got '$(cat "$work/pipe-$s.out")'"
 		fi
 		stop
 	done
@@ -85,88 +43,73 @@ done
 
 # The exec service, with the peer's key in the environment.
 for c in "${impls[@]}"; do
-	cn=${c%%:*} cb=${c#*:}
-	start exec "$RS" serve exec -- sh -c 'tr a-z A-Z; echo "key=${TAILCAT_PEER_KEY%%:*}"'
-	out=$(echo shout | timeout 60 "$cb" "$addr" 7 2>"$work/client.log" || true)
+	start exec "$rust" serve exec -- sh -c 'tr a-z A-Z; echo "key=${TAILCAT_PEER_KEY%%:*}"'
+	out=$(echo shout | timeout 60 "${!c}" "$addr" 7 2>"$work/client.log" || true)
 	if [ "$out" = "$(printf 'SHOUT\nkey=nodekey')" ]; then
-		pass "exec: $cn client -> rust server"
+		pass "exec: $c client -> rust server"
 	else
-		fail "exec: $cn client -> rust server: got '$out' $(tail -3 "$work/client.log")"
+		fail "exec: $c client -> rust server: got '$out' $(tail -3 "$work/client.log")"
 	fi
 	stop
 done
 
 # An allowlist keeps strangers out.
-"$RS" genkey --client --key="$work/allowed.private.json" >"$work/allowed.pub" 2>/dev/null
+"$rust" genkey --client --key="$work/allowed.private.json" >"$work/allowed.pub" 2>/dev/null
+allow=--allow=$(cat "$work/allowed.pub")
 for s in "${impls[@]}"; do
-	sn=${s%%:*} sb=${s#*:}
-	start "allow-$sn" "$sb" serve --allow="$(cat "$work/allowed.pub")" 1
+	start "allow-$s" "${!s}" serve "$allow" 1
 	for c in "${impls[@]}"; do
-		cn=${c%%:*} cb=${c#*:}
-		if echo stranger | timeout 30 "$cb" --key=new "$addr" 1 >/dev/null 2>&1; then
-			fail "allow: $cn stranger admitted by $sn server"
+		if echo stranger | timeout 30 "${!c}" --key=new "$addr" 1 >/dev/null 2>&1; then
+			fail "allow: $c stranger admitted by $s server"
 		else
-			pass "allow: $cn stranger rejected by $sn server"
+			pass "allow: $c stranger rejected by $s server"
 		fi
 	done
 	stop
 	# The allowed key gets in (with the one-shot server, the first
 	# connection is written to its stdout).
 	for c in "${impls[@]}"; do
-		cn=${c%%:*} cb=${c#*:}
-		start "allowed-$sn" "$sb" serve --allow="$(cat "$work/allowed.pub")"
-		if echo "friend of $cn" | timeout 60 "$cb" --key="$work/allowed.private.json" "$addr" >/dev/null 2>"$work/client.log" &&
-			sleep 0.5 && grep -qx "friend of $cn" "$work/allowed-$sn.out"; then
-			pass "allow: $cn allowed key admitted by $sn server"
+		start "allowed-$s" "${!s}" serve "$allow"
+		if echo "friend of $c" | timeout 60 "${!c}" --key="$work/allowed.private.json" "$addr" >/dev/null 2>"$work/client.log" &&
+			sleep 0.5 && grep -qx "friend of $c" "$work/allowed-$s.out"; then
+			pass "allow: $c allowed key admitted by $s server"
 		else
-			fail "allow: $cn allowed key admitted by $sn server: $(tail -3 "$work/client.log")"
+			fail "allow: $c allowed key admitted by $s server: $(tail -3 "$work/client.log")"
 		fi
 		stop
 	done
 done
 
-# Parsing each other's addresses.
-start parse "$GO"
-if "$RS" parse "$addr" | grep -q '"ServerPublic": "nodekey:'; then
-	pass "parse: rust parses a go address"
-else
-	fail "parse: rust parses a go address"
-fi
-stop
-start parse "$RS"
-if "$GO" parse "$addr" | grep -q '"ServerPublic": "nodekey:'; then
-	pass "parse: go parses a rust address"
-else
-	fail "parse: go parses a rust address"
-fi
-stop
-
-# Key files are interchangeable.
-"$GO" genkey --client --key="$work/goclient.private.json" >"$work/goclient.pub" 2>/dev/null
-if [ "$("$RS" --key="$work/goclient.private.json" printpub)" = "$(cat "$work/goclient.pub")" ]; then
-	pass "keys: rust reads a go client key"
-else
-	fail "keys: rust reads a go client key"
-fi
-"$RS" genkey --client --key="$work/rsclient.private.json" >"$work/rsclient.pub" 2>/dev/null
-if [ "$("$GO" --key="$work/rsclient.private.json" printpub)" = "$(cat "$work/rsclient.pub")" ]; then
-	pass "keys: go reads a rust client key"
-else
-	fail "keys: go reads a rust client key"
-fi
+# Each parses the other's addresses and reads the other's key files.
+for a in "${impls[@]}"; do
+	for b in "${impls[@]}"; do
+		[ "$a" = "$b" ] && continue
+		start "parse-$a" "${!a}"
+		if "${!b}" parse "$addr" | grep -q '"ServerPublic": "nodekey:'; then
+			pass "parse: $b parses a $a address"
+		else
+			fail "parse: $b parses a $a address"
+		fi
+		stop
+		"${!a}" genkey --client --key="$work/$a-client.private.json" >"$work/$a-client.pub" 2>/dev/null
+		if [ "$("${!b}" --key="$work/$a-client.private.json" printpub)" = "$(cat "$work/$a-client.pub")" ]; then
+			pass "keys: $b reads a $a client key"
+		else
+			fail "keys: $b reads a $a client key"
+		fi
+	done
+done
 
 # SSH, if an OpenSSH client is available.
 if command -v ssh >/dev/null; then
 	for s in "${impls[@]}"; do
-		sn=${s%%:*} sb=${s#*:}
-		start "ssh-$sn" "$sb" serve no-auth-ssh
+		start "ssh-$s" "${!s}" serve no-auth-ssh
 		for c in "${impls[@]}"; do
-			cn=${c%%:*} cb=${c#*:}
-			out=$(timeout 60 "$cb" ssh "$addr" 'echo ssh-ok; exit 3' 2>"$work/client.log") && code=0 || code=$?
+			out=$(timeout 60 "${!c}" ssh "$addr" 'echo ssh-ok; exit 3' 2>"$work/client.log") && code=0 || code=$?
 			if [ "$out" = ssh-ok ] && [ "$code" = 3 ]; then
-				pass "ssh: $cn client -> $sn server"
+				pass "ssh: $c client -> $s server"
 			else
-				fail "ssh: $cn client -> $sn server: out='$out' exit=$code $(tail -3 "$work/client.log")"
+				fail "ssh: $c client -> $s server: out='$out' exit=$code $(tail -3 "$work/client.log")"
 			fi
 		done
 		stop
@@ -176,20 +119,14 @@ fi
 # File service: a Rust server, read with both clients' ls.
 mkdir -p "$work/pub/sub"
 echo one >"$work/pub/one.txt"
-start files "$RS" serve --files="$work/pub" files
+start files "$rust" serve --files="$work/pub" files
 for c in "${impls[@]}"; do
-	cn=${c%%:*} cb=${c#*:}
-	if timeout 60 "$cb" ls "$addr" 2>"$work/client.log" | grep -q '^one.txt$'; then
-		pass "files: $cn ls of a rust file server"
+	if timeout 60 "${!c}" ls "$addr" 2>"$work/client.log" | grep -q '^one.txt$'; then
+		pass "files: $c ls of a rust file server"
 	else
-		fail "files: $cn ls of a rust file server: $(tail -3 "$work/client.log")"
+		fail "files: $c ls of a rust file server: $(tail -3 "$work/client.log")"
 	fi
 done
 stop
 
-echo
-if [ "$failures" -gt 0 ]; then
-	echo "$failures interop test(s) failed"
-	exit 1
-fi
-echo "all interop tests passed"
+finish interop
