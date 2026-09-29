@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::wire::{
@@ -31,8 +31,8 @@ const TCP_BUFFER: usize = 512 << 10;
 const UDP_QUEUE: usize = 512;
 /// How long an accepted connection may take to complete its handshake.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long an accepted socket may sit in Listen: the SYN didn't take,
-/// or the handshake was reset.
+/// How long an accepted socket may wait for its SYN: the SYN didn't
+/// take, or the handshake was reset.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Abort a connection whose peer stops acknowledging data for this long.
 const TCP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -117,8 +117,35 @@ impl phy::Device for QueueDevice {
 type FlowKey = (SocketAddr, SocketAddr); // (local, remote)
 
 struct PendingAccept {
+    flow: FlowKey,
     handler: Box<dyn FnOnce(TcpStream) + Send>,
     since: Instant,
+}
+
+/// How a TCP connection ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum End {
+    /// The peer sent a FIN: a clean end of stream.
+    Fin,
+    /// The peer sent a RST.
+    Reset,
+    /// We aborted it, or the stack was closed.
+    Aborted,
+    /// The peer stopped acknowledging data.
+    TimedOut,
+}
+
+impl End {
+    /// The error to report once the data received is used up, if any.
+    fn error(self) -> Option<io::Error> {
+        let (kind, msg) = match self {
+            End::Fin => return None,
+            End::Reset => (io::ErrorKind::ConnectionReset, "connection reset by peer"),
+            End::Aborted => (io::ErrorKind::ConnectionAborted, "connection aborted"),
+            End::TimedOut => (io::ErrorKind::TimedOut, "connection timed out"),
+        };
+        Some(io::Error::new(kind, msg))
+    }
 }
 
 struct State {
@@ -129,6 +156,9 @@ struct State {
     accepting: HashMap<SocketHandle, PendingAccept>,
     /// Every TCP socket's 4-tuple, to route SYN retransmits correctly.
     tuples: HashMap<FlowKey, SocketHandle>,
+    /// How connections ended, where the socket's state doesn't say: a
+    /// closed socket may have had a FIN, a RST or an abort.
+    ends: HashMap<SocketHandle, End>,
     /// Sockets no longer referenced by a TcpStream; they're removed once
     /// they finish closing.
     orphans: Vec<SocketHandle>,
@@ -153,6 +183,79 @@ impl State {
     fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
         self.sockets.iter().filter_map(|(_, s)| tcp::Socket::downcast(s))
     }
+
+    /// How the connection on socket `h` ended, if its receive side has.
+    fn end(&self, h: SocketHandle) -> Option<End> {
+        match self.sockets.get::<tcp::Socket>(h).state() {
+            tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait => Some(End::Fin),
+            // smoltcp closes a socket by itself only on a RST, which
+            // `ingress` records, or when the peer times out.
+            tcp::State::Closed => Some(self.ends.get(&h).copied().unwrap_or(End::TimedOut)),
+            _ => None,
+        }
+    }
+
+    /// Feeds the queued packets to smoltcp one at a time, recording how
+    /// connections end. A smoltcp socket in Listen takes a SYN from any
+    /// peer, so an accepted socket waits closed, listens only while its
+    /// own flow's SYN is processed, and is closed again if it's still
+    /// listening afterwards (or back to listening, after a RST).
+    fn ingress(&mut self, now: smoltcp::time::Instant) {
+        while let Some(pkt) = self.device.rx.front() {
+            let flow = tcp_flow(pkt);
+            let h = flow.and_then(|(key, _)| self.tuples.get(&key).copied());
+            if let (Some(((local, _), true)), Some(h)) = (flow, h)
+                && self.accepting.contains_key(&h)
+            {
+                let s = self.sockets.get_mut::<tcp::Socket>(h);
+                if s.state() == tcp::State::Closed && s.listen(local).is_ok() {
+                    self.ends.remove(&h);
+                }
+            }
+            let before = h.map(|h| self.sockets.get::<tcp::Socket>(h).state());
+            self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets);
+            let (Some(h), Some(before)) = (h, before) else { continue };
+            let s = self.sockets.get_mut::<tcp::Socket>(h);
+            match s.state() {
+                tcp::State::Listen => s.close(),
+                tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait => {
+                    self.ends.entry(h).or_insert(End::Fin);
+                }
+                tcp::State::Closed if before != tcp::State::Closed => {
+                    self.ends.entry(h).or_insert(End::Reset);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The source, destination, protocol and payload of an IP packet.
+fn parse_ip(pkt: &[u8]) -> Option<(IpAddr, IpAddr, IpProtocol, &[u8])> {
+    let (src, dst, proto, off): (IpAddr, IpAddr, _, _) = match pkt.first().map(|b| b >> 4) {
+        Some(6) => {
+            let ip = Ipv6Packet::new_checked(pkt).ok()?;
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), 40)
+        }
+        Some(4) => {
+            let ip = Ipv4Packet::new_checked(pkt).ok()?;
+            (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), ip.header_len() as usize)
+        }
+        _ => return None,
+    };
+    Some((src, dst, proto, &pkt[off.min(pkt.len())..]))
+}
+
+/// A TCP segment's flow, and whether it's a connection's opening SYN.
+fn tcp_flow(pkt: &[u8]) -> Option<(FlowKey, bool)> {
+    let (src, dst, IpProtocol::Tcp, body) = parse_ip(pkt)? else { return None };
+    let tcp = TcpPacket::new_checked(body).ok()?;
+    let key = (SocketAddr::new(dst, tcp.dst_port()), SocketAddr::new(src, tcp.src_port()));
+    Some((key, tcp.syn() && !tcp.ack() && !tcp.rst()))
+}
+
+fn socket_addr(ep: smoltcp::wire::IpEndpoint) -> SocketAddr {
+    SocketAddr::new(ep.addr.into(), ep.port)
 }
 
 struct Shared {
@@ -210,6 +313,7 @@ impl Stack {
                 device,
                 accepting: HashMap::new(),
                 tuples: HashMap::new(),
+                ends: HashMap::new(),
                 orphans: Vec::new(),
                 udp: HashMap::new(),
                 next_port: rand::Rng::gen_range(&mut rand::thread_rng(), EPHEMERAL),
@@ -233,18 +337,7 @@ impl Stack {
 
     /// Feeds an IP packet from the tunnel into the stack.
     pub fn inject(&self, pkt: Vec<u8>) {
-        let (src, dst, proto, off): (IpAddr, IpAddr, _, _) = match pkt.first().map(|b| b >> 4) {
-            Some(6) => {
-                let Ok(ip) = Ipv6Packet::new_checked(&pkt[..]) else { return };
-                (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), 40)
-            }
-            Some(4) => {
-                let Ok(ip) = Ipv4Packet::new_checked(&pkt[..]) else { return };
-                (ip.src_addr().into(), ip.dst_addr().into(), ip.next_header(), ip.header_len() as usize)
-            }
-            _ => return,
-        };
-        let body = &pkt[off.min(pkt.len())..];
+        let Some((src, dst, proto, body)) = parse_ip(&pkt) else { return };
         match proto {
             IpProtocol::Udp => return self.inject_udp(body, src, dst),
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {}
@@ -273,14 +366,16 @@ impl Stack {
                         TcpDecision::Drop => return,
                         TcpDecision::Reset => {} // smoltcp answers unmatched SYNs with RST
                         TcpDecision::Accept(handler) => {
+                            if d.port() == 0 {
+                                return;
+                            }
+                            // The socket stays closed until the poll loop
+                            // gets to this SYN; see State::ingress.
                             if !st.tuples.contains_key(&(d, s)) {
-                                let mut sock = new_tcp_socket();
-                                if sock.listen(d).is_err() {
-                                    return;
-                                }
-                                let h = st.sockets.add(sock);
+                                let h = st.sockets.add(new_tcp_socket());
                                 st.tuples.insert((d, s), h);
-                                st.accepting.insert(h, PendingAccept { handler, since: Instant::now() });
+                                let pa = PendingAccept { flow: (d, s), handler, since: Instant::now() };
+                                st.accepting.insert(h, pa);
                             }
                         }
                     }
@@ -312,7 +407,7 @@ impl Stack {
 
     /// Opens a TCP connection from `local_ip` to `remote`.
     pub async fn dial_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
-        let h = {
+        let (h, local) = {
             let mut st = self.shared.lock();
             let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
             let mut sock = new_tcp_socket();
@@ -320,10 +415,10 @@ impl Stack {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
             let h = st.sockets.add(sock);
             st.tuples.insert((local, remote), h);
-            h
+            (h, local)
         };
         self.shared.wake.notify_one();
-        let stream = TcpStream::new(self.shared.clone(), h);
+        let stream = TcpStream { shared: self.shared.clone(), handle: h, local, remote };
         std::future::poll_fn(|cx| stream.poll_connected(cx)).await?;
         Ok(stream)
     }
@@ -363,11 +458,16 @@ impl Stack {
 
     /// Stops the stack, aborting every connection.
     pub fn close(&self) {
-        let mut st = self.shared.lock();
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
         st.closed = true;
-        st.sockets.iter_mut().filter_map(|(_, s)| tcp::Socket::downcast_mut(s)).for_each(tcp::Socket::abort);
+        for (h, s) in st.sockets.iter_mut() {
+            if let Some(s) = tcp::Socket::downcast_mut(s) {
+                abort(s, h, &mut st.ends);
+            }
+        }
         st.udp.clear();
-        drop(st);
+        drop(guard);
         self.shared.wake.notify_one();
     }
 }
@@ -381,26 +481,43 @@ fn new_tcp_socket() -> tcp::Socket<'static> {
     s
 }
 
+/// Aborts the connection on socket `h` with a RST, and remembers that we
+/// did.
+fn abort(s: &mut tcp::Socket<'static>, h: SocketHandle, ends: &mut HashMap<SocketHandle, End>) {
+    if s.is_open() {
+        ends.entry(h).or_insert(End::Aborted);
+    }
+    s.abort();
+}
+
 async fn poll_loop(shared: Weak<Shared>) {
     loop {
         let Some(sh) = shared.upgrade() else { return };
         let (out, delay, accepted, closed) = {
             let mut guard = sh.lock();
             let st = &mut *guard;
-            st.iface.poll(now(), &mut st.device, &mut st.sockets);
+            let t = now();
+            st.iface.poll_maintenance(t);
+            st.ingress(t);
+            while st.iface.poll_egress(t, &mut st.device, &mut st.sockets) == PollResult::SocketStateChanged {}
 
             // Hand off inbound connections that finished their handshake,
-            // and give up on ones that never did.
+            // and give up on ones that never did. A socket only ever
+            // connects to its own flow's peer, but check: the handler
+            // trusts peer_addr() as the peer's identity.
             let sockets = &st.sockets;
             let (accepted, dead): (Vec<_>, Vec<_>) = st
                 .accepting
                 .extract_if(|&h, pa| match sockets.get::<tcp::Socket>(h).state() {
                     tcp::State::SynReceived => pa.since.elapsed() > ACCEPT_TIMEOUT,
-                    tcp::State::Listen => pa.since.elapsed() > LISTEN_TIMEOUT,
+                    tcp::State::Closed | tcp::State::Listen => pa.since.elapsed() > LISTEN_TIMEOUT,
                     _ => true,
                 })
-                .partition(|&(h, _)| {
-                    matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+                .partition(|(h, pa)| {
+                    let s = sockets.get::<tcp::Socket>(*h);
+                    matches!(s.state(), tcp::State::Established | tcp::State::CloseWait)
+                        && (s.local_endpoint().map(socket_addr), s.remote_endpoint().map(socket_addr))
+                            == (Some(pa.flow.0), Some(pa.flow.1))
                 });
             for (h, _) in dead {
                 st.sockets.get_mut::<tcp::Socket>(h).abort();
@@ -408,12 +525,13 @@ async fn poll_loop(shared: Weak<Shared>) {
             }
 
             // Reap closed sockets nobody holds any more.
-            let State { sockets, tuples, orphans, .. } = st;
+            let State { sockets, tuples, ends, orphans, .. } = st;
             orphans.retain(|&h| {
                 let done = matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Closed | tcp::State::TimeWait);
                 if done {
                     sockets.remove(h);
                     tuples.retain(|_, v| *v != h);
+                    ends.remove(&h);
                 }
                 !done
             });
@@ -423,7 +541,8 @@ async fn poll_loop(shared: Weak<Shared>) {
         };
         out.into_iter().for_each(|p| (sh.out)(p));
         for (h, pa) in accepted {
-            (pa.handler)(TcpStream::new(sh.clone(), h));
+            let (local, remote) = pa.flow;
+            (pa.handler)(TcpStream { shared: sh.clone(), handle: h, local, remote });
         }
         sh.polled.notify_waiters();
         if closed {
@@ -451,13 +570,6 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    fn new(shared: Arc<Shared>, handle: SocketHandle) -> Self {
-        let tuple = shared.lock().tuples.iter().find(|&(_, &h)| h == handle).map(|(&k, _)| k);
-        let unspecified = SocketAddr::from(([0u8; 16], 0));
-        let (local, remote) = tuple.unwrap_or((unspecified, unspecified));
-        TcpStream { shared, handle, local, remote }
-    }
-
     /// The local address (ours).
     pub fn local_addr(&self) -> SocketAddr {
         self.local
@@ -472,6 +584,13 @@ impl TcpStream {
         f(self.shared.lock().sockets.get_mut::<tcp::Socket>(self.handle))
     }
 
+    /// Runs `f` on the socket and how its connection ended, if it has.
+    fn with_end<R>(&self, f: impl FnOnce(&mut tcp::Socket<'static>, Option<End>) -> R) -> R {
+        let mut st = self.shared.lock();
+        let end = st.end(self.handle);
+        f(st.sockets.get_mut::<tcp::Socket>(self.handle), end)
+    }
+
     /// Runs `f` on the socket, then wakes the poll loop.
     fn with_wake<R>(&self, f: impl FnOnce(&mut tcp::Socket<'static>) -> R) -> R {
         let r = self.with(f);
@@ -480,10 +599,12 @@ impl TcpStream {
     }
 
     fn poll_connected(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.with(|s| match s.state() {
+        self.with_end(|s, end| match s.state() {
             tcp::State::Established | tcp::State::CloseWait => Poll::Ready(Ok(())),
             tcp::State::Closed | tcp::State::TimeWait => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")))
+                // A RST in answer to our SYN: nobody's listening.
+                let refused = || io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+                Poll::Ready(Err(end.filter(|&e| e != End::Reset).and_then(End::error).unwrap_or_else(refused)))
             }
             _ => {
                 s.register_send_waker(cx.waker());
@@ -500,7 +621,11 @@ impl TcpStream {
 
     /// Aborts the connection with a RST.
     pub fn abort(&self) {
-        self.with_wake(|s| s.abort());
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        abort(st.sockets.get_mut::<tcp::Socket>(self.handle), self.handle, &mut st.ends);
+        drop(guard);
+        self.shared.wake.notify_one();
     }
 
     /// Waits until everything sent has been acknowledged and, if the
@@ -541,11 +666,13 @@ impl Drop for TcpStream {
 
 impl AsyncRead for TcpStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let n = ready!(self.with(|s| {
+        let n = ready!(self.with_end(|s, end| {
             if s.can_recv() {
                 Poll::Ready(s.recv_slice(buf.initialize_unfilled()).map_err(io::Error::other))
             } else if !s.may_recv() {
-                Poll::Ready(Ok(0)) // EOF
+                // EOF, if the peer closed the connection rather than
+                // resetting it or timing out.
+                Poll::Ready(end.and_then(End::error).map_or(Ok(0), Err))
             } else {
                 s.register_recv_waker(cx.waker());
                 Poll::Pending
@@ -562,11 +689,12 @@ impl AsyncRead for TcpStream {
 
 impl AsyncWrite for TcpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
-        let n = ready!(self.with(|s| {
+        let n = ready!(self.with_end(|s, end| {
             if s.can_send() {
                 Poll::Ready(s.send_slice(data).map_err(io::Error::other))
             } else if !s.may_send() {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")))
+                let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "connection closed");
+                Poll::Ready(Err(end.and_then(End::error).unwrap_or_else(closed)))
             } else {
                 s.register_send_waker(cx.waker());
                 Poll::Pending
