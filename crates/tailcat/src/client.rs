@@ -2,11 +2,11 @@
 //! [`Addr`], lazily on first use.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{OnceCell, watch};
 use tracing::debug;
 
 use crate::addr::{Addr, ConnInfo};
@@ -42,6 +42,8 @@ pub struct DiscoPingResult {
 struct Running {
     ci: ConnInfo,
     server_ip: Ipv6Addr,
+    /// Our own tailcat address, the source of every dial.
+    my_ip: IpAddr,
     ms: Arc<MagicSock>,
     engine: Arc<Engine>,
     stack: Stack,
@@ -71,8 +73,7 @@ struct ClientInner {
     derp_map_url: Option<String>,
     derp_map_cache: Option<Arc<dyn DerpMapCache>>,
     derp_map: Option<DerpMap>,
-    start: AsyncMutex<()>,
-    running: OnceLock<Running>,
+    running: OnceCell<Running>,
     up_done: AtomicBool,
 }
 
@@ -103,8 +104,7 @@ impl Client {
                 derp_map_url: opts.derp_map_url,
                 derp_map_cache: opts.derp_map_cache,
                 derp_map: opts.derp_map,
-                start: AsyncMutex::new(()),
-                running: OnceLock::new(),
+                running: OnceCell::new(),
                 up_done: AtomicBool::new(false),
             }),
         }
@@ -131,13 +131,10 @@ impl Client {
     }
 
     async fn ensure_started(&self) -> Result<&Running> {
-        if let Some(r) = self.inner.running.get() {
-            return Ok(r);
-        }
-        let _g = self.inner.start.lock().await;
-        if let Some(r) = self.inner.running.get() {
-            return Ok(r);
-        }
+        self.inner.running.get_or_try_init(|| self.start()).await
+    }
+
+    async fn start(&self) -> Result<Running> {
         let mut ci = self.inner.server.parse()?;
         if ci.server_disco_public.is_zero() {
             return Err(Error::Addr(
@@ -200,10 +197,10 @@ impl Client {
             },
         );
         let out_engine = Arc::downgrade(&engine);
-        let my_ip = self.inner.key.public().tailcat_ip();
+        let my_ip = IpAddr::V6(self.inner.key.public().tailcat_ip());
         // The client accepts no inbound connections at all.
         let stack = Stack::new(
-            StackConfig { addrs: vec![IpAddr::V6(my_ip)], any_ip: false, mtu: crate::TUNNEL_MTU },
+            StackConfig { addrs: vec![my_ip], any_ip: false, mtu: crate::TUNNEL_MTU },
             Arc::new(move |pkt| {
                 if let Some(e) = out_engine.upgrade() {
                     e.send_ip_to_peer(&server_key, &pkt);
@@ -212,14 +209,13 @@ impl Client {
             Some(Arc::new(|_, _| TcpDecision::Drop)),
             None,
         );
-        let st2 = stack.clone();
+        let inject = stack.clone();
         let task = tokio::spawn(async move {
             while let Some(p) = inbound.recv().await {
-                st2.inject(p.data);
+                inject.inject(p.data);
             }
         });
-        let _ = self.inner.running.set(Running { ci, server_ip, ms, engine, stack, meowed: meow_rx, task });
-        Ok(self.inner.running.get().expect("just set"))
+        Ok(Running { ci, server_ip, my_ip, ms, engine, stack, meowed: meow_rx, task })
     }
 
     /// Starts the client if needed, then announces it to the server over
@@ -277,26 +273,19 @@ impl Client {
         // Nudge path discovery with some tunnel traffic too.
         r.ms.send_call_me_maybe(&server);
         let res = r.ms.ping(&server, timeout).await?;
-        Ok(match res.via {
-            PathAddr::Udp(a) => DiscoPingResult {
-                latency: res.latency,
-                endpoint: Some(a),
-                derp_region_id: 0,
-                derp_region_code: String::new(),
-            },
-            PathAddr::Derp(rid) => {
-                let code =
-                    r.ci.region.iter().find(|x| x.region_id == rid).map(|x| x.region_code.clone()).unwrap_or_default();
-                DiscoPingResult { latency: res.latency, endpoint: None, derp_region_id: rid, derp_region_code: code }
-            }
-        })
+        let (endpoint, derp_region_id) = match res.via {
+            PathAddr::Udp(a) => (Some(a), 0),
+            PathAddr::Derp(rid) => (None, rid),
+        };
+        // Region IDs are never 0 once expanded, so direct pongs get no code.
+        let region = r.ci.region.iter().find(|x| x.region_id == derp_region_id);
+        let derp_region_code = region.map(|x| x.region_code.clone()).unwrap_or_default();
+        Ok(DiscoPingResult { latency: res.latency, endpoint, derp_region_id, derp_region_code })
     }
 
     /// Opens a TCP connection to a port on the server.
     pub async fn dial_tcp_port(&self, port: u16) -> std::io::Result<TcpStream> {
-        let r = self.up().await?;
-        let dst = SocketAddr::new(IpAddr::V6(r.server_ip), port);
-        r.stack.dial_tcp(IpAddr::V6(self.inner.key.public().tailcat_ip()), dst).await
+        self.dial_tcp(SocketAddr::new(self.up().await?.server_ip.into(), port)).await
     }
 
     /// Opens a TCP connection to any address through the server, which
@@ -304,21 +293,19 @@ impl Client {
     /// over the IPv6-only tunnel.
     pub async fn dial_tcp(&self, dst: SocketAddr) -> std::io::Result<TcpStream> {
         let r = self.up().await?;
-        r.stack.dial_tcp(IpAddr::V6(self.inner.key.public().tailcat_ip()), map_nat64(dst)).await
+        r.stack.dial_tcp(r.my_ip, map_nat64(dst)).await
     }
 
     /// Opens a UDP flow to a port on the server.
     pub async fn dial_udp_port(&self, port: u16) -> std::io::Result<UdpConn> {
-        let r = self.up().await?;
-        r.stack
-            .dial_udp(IpAddr::V6(self.inner.key.public().tailcat_ip()), SocketAddr::new(IpAddr::V6(r.server_ip), port))
+        self.dial_udp(SocketAddr::new(self.up().await?.server_ip.into(), port)).await
     }
 
     /// Opens a UDP flow to any address through the server (which must
     /// forward UDP).
     pub async fn dial_udp(&self, dst: SocketAddr) -> std::io::Result<UdpConn> {
         let r = self.up().await?;
-        r.stack.dial_udp(IpAddr::V6(self.inner.key.public().tailcat_ip()), map_nat64(dst))
+        r.stack.dial_udp(r.my_ip, map_nat64(dst))
     }
 
     /// Waits until none of the client's TCP connections have anything
@@ -326,9 +313,7 @@ impl Client {
     /// exiting after the last connection closes: the TCP stack lives in
     /// this process, so exiting at once can lose the final ACK.
     pub async fn drain_tcp(&self, timeout: Duration) -> bool {
-        match self.inner.running.get() {
-            Some(r) => r.stack.drain_tcp(timeout).await,
-            None => true,
-        }
+        let Some(r) = self.inner.running.get() else { return true };
+        r.stack.drain_tcp(timeout).await
     }
 }

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +14,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
-use super::{ClientInfo, FrameType, MAGIC, MAX_FRAME_SIZE, PEER_GONE_NOT_HERE, PROTOCOL_VERSION, ServerInfo};
+use super::{
+    ClientInfo, FrameType, MAGIC, MAX_FRAME_SIZE, PEER_GONE_NOT_HERE, PROTOCOL_VERSION, ServerInfo, frame, split_key,
+};
 use crate::derpmap::{DerpNode, DerpRegion};
 use crate::key::{NodePrivate, NodePublic};
 use crate::{Error, Result};
@@ -23,22 +24,16 @@ use crate::{Error, Result};
 const CLIENT_QUEUE: usize = 1024;
 const KEEPALIVE: Duration = Duration::from_secs(60);
 
-struct Slot {
-    id: u64,
-    tx: mpsc::Sender<Vec<u8>>,
-}
-
-/// The relay's state: its key and the connected clients.
+/// The relay's state: its key and the connected clients' send queues.
 pub struct Server {
     key: NodePrivate,
-    clients: Mutex<HashMap<NodePublic, Slot>>,
-    next_id: AtomicU64,
+    clients: Mutex<HashMap<NodePublic, mpsc::Sender<Vec<u8>>>>,
 }
 
 impl Server {
     /// Creates a relay with a fresh key.
     pub fn new() -> Arc<Self> {
-        Arc::new(Server { key: NodePrivate::generate(), clients: Mutex::default(), next_id: AtomicU64::new(1) })
+        Arc::new(Server { key: NodePrivate::generate(), clients: Mutex::default() })
     }
 
     /// The relay's public key.
@@ -54,13 +49,12 @@ impl Server {
     /// Serves TLS connections from `ln` until it fails.
     pub async fn serve_tls(self: Arc<Self>, ln: TcpListener, tls: Arc<rustls::ServerConfig>) {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-        loop {
-            let Ok((tcp, remote)) = ln.accept().await else { return };
+        while let Ok((tcp, remote)) = ln.accept().await {
             let _ = tcp.set_nodelay(true);
             let s = self.clone();
-            let acceptor = acceptor.clone();
+            let accept = acceptor.accept(tcp);
             tokio::spawn(async move {
-                match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
+                match tokio::time::timeout(Duration::from_secs(10), accept).await {
                     Ok(Ok(tls)) => {
                         if let Err(e) = s.handle_http(tls, remote).await {
                             trace!("derp server: {remote}: {e}");
@@ -76,10 +70,8 @@ impl Server {
         let mut br = BufReader::new(stream);
         let mut request_line = String::new();
         br.read_line(&mut request_line).await?;
-        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
-        let mut upgrade = String::new();
-        let mut fast_start = false;
-        let mut total = 0;
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+        let (mut upgrade, mut fast_start, mut total) = (false, false, 0);
         loop {
             let mut line = String::new();
             let n = br.read_line(&mut line).await?;
@@ -94,76 +86,56 @@ impl Server {
             if let Some((k, v)) = line.split_once(':') {
                 let v = v.trim();
                 if k.eq_ignore_ascii_case("upgrade") {
-                    upgrade = v.to_ascii_lowercase();
+                    upgrade = v.eq_ignore_ascii_case("derp");
                 } else if k.eq_ignore_ascii_case(super::FAST_START_HEADER) {
                     fast_start = v == "1";
                 }
             }
         }
-        let w = br.get_mut();
-        match path.as_str() {
+        let canned: &[u8] = match path {
             "/derp/probe" | "/derp/latency-check" => {
-                w.write_all(
-                    b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await?;
-                w.flush().await?;
-                return Ok(());
+                b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             }
-            "/generate_204" => {
-                w.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await?;
-                w.flush().await?;
-                return Ok(());
+            "/generate_204" => b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            _ if !upgrade => {
+                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 32\r\nConnection: close\r\n\r\nDERP requires connection upgrade"
             }
-            _ => {}
-        }
-        if upgrade != "derp" {
-            w.write_all(
-                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 32\r\nConnection: close\r\n\r\nDERP requires connection upgrade",
-            )
-            .await?;
-            w.flush().await?;
-            return Ok(());
-        }
-        if !fast_start {
-            let resp = format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\nDerp-Version: {PROTOCOL_VERSION}\r\nDerp-Public-Key: {}\r\n\r\n",
-                hex::encode(self.key.public().as_bytes())
-            );
-            w.write_all(resp.as_bytes()).await?;
-            w.flush().await?;
-        }
-        self.accept(br, remote).await
+            _ if !fast_start => {
+                let resp = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\nDerp-Version: {PROTOCOL_VERSION}\r\nDerp-Public-Key: {}\r\n\r\n",
+                    hex::encode(self.key.public().as_bytes())
+                );
+                // The server key frame that follows flushes this.
+                br.get_mut().write_all(resp.as_bytes()).await?;
+                return self.accept(br, remote).await;
+            }
+            _ => return self.accept(br, remote).await,
+        };
+        br.get_mut().write_all(canned).await?;
+        Ok(br.get_mut().flush().await?)
     }
 
     async fn accept<S: AsyncRead + AsyncWrite + Unpin>(&self, mut br: BufReader<S>, remote: SocketAddr) -> Result<()> {
-        let mut greeting = MAGIC.to_vec();
-        greeting.extend_from_slice(self.key.public().as_bytes());
-        super::write_frame(br.get_mut(), FrameType::ServerKey, &[&greeting]).await?;
+        super::write_frame(br.get_mut(), FrameType::ServerKey, &[MAGIC, self.key.public().as_bytes()]).await?;
 
         let (t, payload) = tokio::time::timeout(Duration::from_secs(10), super::read_frame(&mut br, 256 << 10))
             .await
             .map_err(|_| Error::Derp("timeout waiting for client info".into()))??;
-        if t != FrameType::ClientInfo as u8 || payload.len() < 32 + 24 {
-            return Err(Error::Derp("bad client info frame".into()));
-        }
-        let client = NodePublic::from_slice(&payload[..32]).expect("32 bytes");
-        let msg = self
-            .key
-            .open_from(&client, &payload[32..])
-            .ok_or_else(|| Error::Derp("cannot open client info box".into()))?;
+        let (client, sealed) = split_key(&payload)
+            .filter(|_| t == FrameType::ClientInfo as u8)
+            .ok_or_else(|| Error::Derp("bad client info frame".into()))?;
+        let msg =
+            self.key.open_from(&client, sealed).ok_or_else(|| Error::Derp("cannot open client info box".into()))?;
         let info: ClientInfo = serde_json::from_slice(&msg).map_err(|e| Error::Derp(format!("client info: {e}")))?;
         if !super::valid_app_name(&info.app_name) {
             return Err(Error::Derp("invalid app name".into()));
         }
 
         let si = serde_json::to_vec(&ServerInfo { version: PROTOCOL_VERSION, ..Default::default() }).unwrap();
-        let sealed = self.key.seal_to(&client, &si);
-        super::write_frame(br.get_mut(), FrameType::ServerInfo, &[&sealed]).await?;
+        super::write_frame(br.get_mut(), FrameType::ServerInfo, &[&self.key.seal_to(&client, &si)]).await?;
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
-        self.clients.lock().unwrap().insert(client, Slot { id, tx: tx.clone() });
+        self.clients.lock().unwrap().insert(client, tx.clone());
         debug!("derp server: {remote} connected as {}", client.short_string());
 
         let (mut rd, wr) = tokio::io::split(br);
@@ -172,34 +144,19 @@ impl Server {
             loop {
                 let (t, payload) = super::read_frame(&mut rd, MAX_FRAME_SIZE).await?;
                 match FrameType::from_u8(t) {
-                    Some(FrameType::SendPacket) if payload.len() >= 32 => {
-                        let dst = NodePublic::from_slice(&payload[..32]).expect("32 bytes");
-                        let dst_tx = self.clients.lock().unwrap().get(&dst).map(|s| s.tx.clone());
-                        match dst_tx {
-                            Some(dtx) => {
-                                let mut f = Vec::with_capacity(5 + payload.len());
-                                super::encode_frame(
-                                    &mut f,
-                                    FrameType::RecvPacket,
-                                    &[client.as_bytes(), &payload[32..]],
-                                );
-                                let _ = dtx.try_send(f); // drop if the recipient is slow
-                            }
-                            None => {
-                                let mut f = Vec::new();
-                                super::encode_frame(
-                                    &mut f,
-                                    FrameType::PeerGone,
-                                    &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]],
-                                );
-                                let _ = tx.try_send(f);
-                            }
-                        }
+                    Some(FrameType::SendPacket) => {
+                        let Some((dst, pkt)) = split_key(&payload) else { continue };
+                        let clients = self.clients.lock().unwrap();
+                        // Frames are dropped if the recipient is slow.
+                        let _ = match clients.get(&dst) {
+                            Some(dtx) => dtx.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
+                            None => tx.try_send(frame(FrameType::PeerGone, &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]])),
+                        };
                     }
-                    Some(FrameType::Ping) if payload.len() >= 8 => {
-                        let mut f = Vec::new();
-                        super::encode_frame(&mut f, FrameType::Pong, &[&payload[..8]]);
-                        let _ = tx.try_send(f);
+                    Some(FrameType::Ping) => {
+                        if let Some(d) = payload.get(..8) {
+                            let _ = tx.try_send(frame(FrameType::Pong, &[d]));
+                        }
                     }
                     _ => {}
                 }
@@ -208,21 +165,14 @@ impl Server {
             Ok::<(), Error>(())
         };
         let writer = async {
-            let mut ka = tokio::time::interval(KEEPALIVE);
-            ka.tick().await;
+            let mut ka = tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
             loop {
                 tokio::select! {
                     f = rx.recv() => {
                         let Some(f) = f else { return Ok::<(), Error>(()) };
-                        wr.write_all(&f).await?;
-                        while let Ok(f) = rx.try_recv() {
-                            wr.write_all(&f).await?;
-                        }
-                        wr.flush().await?;
+                        super::write_queued(&mut wr, f, &mut rx).await?;
                     }
-                    _ = ka.tick() => {
-                        super::write_frame(&mut wr, FrameType::KeepAlive, &[]).await?;
-                    }
+                    _ = ka.tick() => super::write_frame(&mut wr, FrameType::KeepAlive, &[]).await?,
                 }
             }
         };
@@ -230,8 +180,9 @@ impl Server {
             r = reader => r,
             r = writer => r,
         };
+        // A newer connection with the same key may have replaced ours.
         let mut clients = self.clients.lock().unwrap();
-        if clients.get(&client).is_some_and(|s| s.id == id) {
+        if clients.get(&client).is_some_and(|c| c.same_channel(&tx)) {
             clients.remove(&client);
         }
         debug!("derp server: {} disconnected", client.short_string());
@@ -242,8 +193,7 @@ impl Server {
 /// Answers STUN binding requests on `sock` forever.
 pub async fn serve_stun(sock: UdpSocket) {
     let mut buf = [0u8; 1500];
-    loop {
-        let Ok((n, src)) = sock.recv_from(&mut buf).await else { return };
+    while let Ok((n, src)) = sock.recv_from(&mut buf).await {
         if let Some(tx) = crate::stun::parse_binding_request(&buf[..n]) {
             let _ = sock.send_to(&crate::stun::response(tx, src), src).await;
         }
@@ -262,33 +212,32 @@ pub struct DevDerp {
 
 impl Drop for DevDerp {
     fn drop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
-        }
+        self.tasks.iter().for_each(|t| t.abort());
     }
 }
 
 impl DevDerp {
     /// Starts a relay on `127.0.0.1` with OS-chosen ports.
     pub async fn start_local() -> Result<DevDerp> {
-        Self::start(SocketAddr::from(([127, 0, 0, 1], 0)), SocketAddr::from(([127, 0, 0, 1], 0)), None).await
+        let local = SocketAddr::from(([127, 0, 0, 1], 0));
+        Self::start(local, local, None).await
     }
 
     /// Starts a relay listening for DERP (TLS) on `derp_addr` and STUN on
     /// `stun_addr`. The region advertises `advertise` (or the DERP
-    /// listener's address) as the node's IPv4 address.
+    /// listener's address) as the node's IP address.
     pub async fn start(derp_addr: SocketAddr, stun_addr: SocketAddr, advertise: Option<IpAddr>) -> Result<DevDerp> {
         let server = Server::new();
         let ln = TcpListener::bind(derp_addr).await?;
-        let derp_port = ln.local_addr()?.port();
+        let derp = ln.local_addr()?;
         let udp = UdpSocket::bind(stun_addr).await?;
         let stun_port = udp.local_addr()?.port();
-        let ip = advertise.unwrap_or_else(|| ln.local_addr().map(|a| a.ip()).unwrap_or(derp_addr.ip()));
         let tls = Arc::new(crate::tls::self_signed_server_config(&["T", "localhost"])?);
         let tasks = vec![tokio::spawn(server.clone().serve_tls(ln, tls)), tokio::spawn(serve_stun(udp))];
-        let (ipv4, ipv6) = match ip {
-            IpAddr::V4(v4) => (v4.to_string(), "none".to_string()),
-            IpAddr::V6(v6) => ("none".to_string(), v6.to_string()),
+        // "none" tells clients not to try the other family.
+        let (ipv4, ipv6) = match advertise.unwrap_or(derp.ip()) {
+            ip @ IpAddr::V4(_) => (ip.to_string(), "none".into()),
+            ip @ IpAddr::V6(_) => ("none".into(), ip.to_string()),
         };
         let region = DerpRegion {
             region_id: 1,
@@ -299,10 +248,9 @@ impl DevDerp {
                 region_id: 1,
                 host_name: "T".into(),
                 ipv4,
-                // "none" tells clients not to try the other family.
                 ipv6,
                 stun_port: stun_port as i32,
-                derp_port: derp_port as i32,
+                derp_port: derp.port() as i32,
                 insecure_for_tests: true,
                 ..Default::default()
             }],
@@ -313,21 +261,22 @@ impl DevDerp {
 
     /// Waits until a client with key `k` is connected, or `timeout` passes.
     pub async fn wait_for_client(&self, k: &NodePublic, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            if self.server.is_client_connected(k) {
-                return true;
+        let connected = async {
+            while !self.server.is_client_connected(k) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
+        };
+        tokio::time::timeout(timeout, connected).await.is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::derp::client::DerpClient;
+    use crate::derp::client::{DerpClient, login};
+    use crate::derp::read_frame;
+
+    const T: Duration = Duration::from_secs(5);
 
     #[tokio::test]
     async fn relays_between_two_clients() {
@@ -337,18 +286,113 @@ mod tests {
         let ka = NodePrivate::generate();
         let kb = NodePrivate::generate();
         let a = DerpClient::spawn(dev.region.clone(), ka.clone(), "test-a", true, a_tx);
+        // Nothing is queued before the connection is up.
+        assert!(!a.send(&kb.public(), b"too early"));
         let b = DerpClient::spawn(dev.region.clone(), kb.clone(), "test-b", true, b_tx);
-        assert!(a.wait_connected(Duration::from_secs(5)).await);
-        assert!(b.wait_connected(Duration::from_secs(5)).await);
-        assert!(dev.wait_for_client(&kb.public(), Duration::from_secs(5)).await);
+        assert!(a.wait_connected(T).await);
+        assert!(b.wait_connected(T).await);
+        assert!(dev.wait_for_client(&kb.public(), T).await);
 
         assert!(a.send(&kb.public(), b"hello b"));
-        let got = tokio::time::timeout(Duration::from_secs(5), b_rx.recv()).await.unwrap().unwrap();
+        let got = tokio::time::timeout(T, b_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.src, ka.public());
+        assert_eq!(got.region_id, 1);
         assert_eq!(got.data, b"hello b");
 
         assert!(b.send(&ka.public(), b"hi a"));
-        let got = tokio::time::timeout(Duration::from_secs(5), a_rx.recv()).await.unwrap().unwrap();
+        let got = tokio::time::timeout(T, a_rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.data, b"hi a");
+
+        // Oversized packets are refused rather than truncated.
+        assert!(!a.send(&kb.public(), &vec![0; crate::derp::MAX_PACKET_SIZE + 1]));
+
+        // Dropping a client disconnects it from the relay.
+        drop(b);
+        let gone = async {
+            while dev.server.is_client_connected(&kb.public()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(T, gone).await.unwrap();
+    }
+
+    /// Runs [`Server::handle_http`] on one end of an in-memory pipe and
+    /// returns the other end, with `request` already written.
+    async fn http(request: &str) -> (Arc<Server>, BufReader<tokio::io::DuplexStream>) {
+        let server = Server::new();
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let s = server.clone();
+        tokio::spawn(async move { s.handle_http(far, SocketAddr::from(([127, 0, 0, 1], 1))).await });
+        let mut near = BufReader::new(near);
+        near.get_mut().write_all(request.as_bytes()).await.unwrap();
+        (server, near)
+    }
+
+    async fn response(request: &str) -> String {
+        let (_server, mut c) = http(request).await;
+        let mut s = String::new();
+        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_string(&mut c, &mut s)).await.unwrap().unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn answers_plain_http() {
+        assert!(response("GET /derp/probe HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response("GET /generate_204 HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 204 "));
+        let r = response("GET /derp HTTP/1.1\r\nUpgrade: websocket\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 426 ") && r.ends_with("DERP requires connection upgrade"));
+    }
+
+    #[tokio::test]
+    async fn fast_start_skips_the_upgrade_response() {
+        let (server, mut c) = http("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nDerp-Fast-Start: 1\r\n\r\n").await;
+        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
+        assert_eq!(t, FrameType::ServerKey as u8);
+        assert_eq!(&payload[..8], MAGIC);
+        assert_eq!(&payload[8..], server.public_key().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn answers_pings_and_reports_absent_peers() {
+        let (server, mut c) = http("").await;
+        let key = NodePrivate::generate();
+        assert_eq!(login(&mut c, "T", &key, "test").await.unwrap(), server.public_key());
+        let (t, sealed) = read_frame(&mut c, 1 << 10).await.unwrap();
+        assert_eq!(t, FrameType::ServerInfo as u8);
+        let info: ServerInfo = serde_json::from_slice(&key.open_from(&server.public_key(), &sealed).unwrap()).unwrap();
+        assert_eq!(info.version, PROTOCOL_VERSION);
+        assert!(server.is_client_connected(&key.public()));
+
+        let stranger = NodePrivate::generate().public();
+        c.get_mut().write_all(&frame(FrameType::SendPacket, &[stranger.as_bytes(), b"hello?"])).await.unwrap();
+        c.get_mut().write_all(&frame(FrameType::Ping, &[b"12345678"])).await.unwrap();
+        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
+        assert_eq!(t, FrameType::PeerGone as u8);
+        assert_eq!(payload, [stranger.as_bytes().as_slice(), &[PEER_GONE_NOT_HERE]].concat());
+        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
+        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, &b"12345678"[..]));
+
+        // Hanging up unregisters the client.
+        drop(c);
+        let gone = async {
+            while server.is_client_connected(&key.public()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(T, gone).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_bad_client_info_box() {
+        let (server, mut c) = http("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nDerp-Fast-Start: 1\r\n\r\n").await;
+        read_frame(&mut c, 1 << 10).await.unwrap();
+        let key = NodePrivate::generate();
+        // Sealed to the wrong key, so the server can't open it.
+        let sealed = key.seal_to(&key.public(), b"{}");
+        c.get_mut().write_all(&frame(FrameType::ClientInfo, &[key.public().as_bytes(), &sealed])).await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_end(&mut c, &mut rest)).await.unwrap().unwrap();
+        assert!(rest.is_empty());
+        assert!(!server.is_client_connected(&key.public()));
     }
 }

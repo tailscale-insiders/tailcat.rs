@@ -2,7 +2,7 @@
 //! region's nodes over UDP, falling back to timing HTTPS requests to the
 //! relays' `/derp/latency-check` endpoint when UDP is blocked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -64,25 +64,14 @@ async fn stun_report(dm: &DerpMap) -> Report {
     let mut targets: Vec<(i32, SocketAddr)> = Vec::new();
     for (rid, n) in measurable(dm) {
         let Some(port) = n.stun_port() else { continue };
-        for a in n.resolve_addrs(port).await {
-            targets.push((rid, a));
-        }
+        targets.extend(n.resolve_addrs(port).await.into_iter().map(|a| (rid, a)));
     }
     if targets.is_empty() {
         return rep;
     }
 
+    let regions: HashSet<i32> = targets.iter().map(|t| t.0).collect();
     let mut pending: HashMap<stun::TxId, (i32, Instant)> = HashMap::new();
-    let send_all = |pending: &mut HashMap<stun::TxId, (i32, Instant)>| {
-        let mut out = Vec::new();
-        for &(rid, a) in &targets {
-            let tx = stun::new_txid();
-            pending.insert(tx, (rid, Instant::now()));
-            out.push((a, stun::request(tx)));
-        }
-        out
-    };
-
     let deadline = tokio::time::Instant::now() + STUN_TIMEOUT;
     let mut resend = tokio::time::interval(Duration::from_millis(500));
     let mut buf4 = [0u8; 1500];
@@ -93,11 +82,11 @@ async fn stun_report(dm: &DerpMap) -> Report {
             _ = tokio::time::sleep_until(deadline) => break,
             _ = resend.tick(), if rounds < 3 => {
                 rounds += 1;
-                for (a, pkt) in send_all(&mut pending) {
-                    let s = if a.is_ipv4() { Some(&sock4) } else { sock6.as_ref() };
-                    if let Some(s) = s {
-                        let _ = s.send_to(&pkt, a).await;
-                    }
+                for &(rid, a) in &targets {
+                    let Some(s) = (if a.is_ipv4() { Some(&sock4) } else { sock6.as_ref() }) else { continue };
+                    let tx = stun::new_txid();
+                    pending.insert(tx, (rid, Instant::now()));
+                    let _ = s.send_to(&stun::request(tx), a).await;
                 }
             }
             r = sock4.recv_from(&mut buf4) => {
@@ -112,22 +101,22 @@ async fn stun_report(dm: &DerpMap) -> Report {
             }
         }
         // Stop early once every region has answered at least once.
-        let regions: std::collections::HashSet<i32> = targets.iter().map(|t| t.0).collect();
-        if regions.iter().all(|r| rep.region_latency.contains_key(r)) && rounds >= 2 {
+        if rounds >= 2 && regions.iter().all(|r| rep.region_latency.contains_key(r)) {
             break;
         }
     }
     rep
 }
 
+/// Records `d` as the latency to `rid` if it's the lowest seen yet.
+fn note_latency(m: &mut HashMap<i32, Duration>, rid: i32, d: Duration) {
+    m.entry(rid).and_modify(|e| *e = (*e).min(d)).or_insert(d);
+}
+
 fn note_reply(rep: &mut Report, pending: &mut HashMap<stun::TxId, (i32, Instant)>, pkt: &[u8], v4: bool) {
     let Some((tx, addr)) = stun::parse_response(pkt) else { return };
     let Some((rid, sent)) = pending.remove(&tx) else { return };
-    let d = sent.elapsed();
-    let e = rep.region_latency.entry(rid).or_insert(d);
-    if d < *e {
-        *e = d;
-    }
+    note_latency(&mut rep.region_latency, rid, sent.elapsed());
     if v4 && rep.global_v4.is_none() {
         rep.global_v4 = Some(addr);
     }
@@ -142,13 +131,10 @@ async fn https_report(dm: &DerpMap) -> HashMap<i32, Duration> {
             Some((rid, d))
         });
     }
-    let mut out: HashMap<i32, Duration> = HashMap::new();
+    let mut out = HashMap::new();
     while let Some(r) = set.join_next().await {
         if let Ok(Some((rid, d))) = r {
-            let e = out.entry(rid).or_insert(d);
-            if d < *e {
-                *e = d;
-            }
+            note_latency(&mut out, rid, d);
         }
     }
     out
@@ -165,4 +151,51 @@ async fn https_latency(n: &DerpNode) -> Option<Duration> {
     let mut buf = [0u8; 12];
     tls.read_exact(&mut buf).await.ok()?;
     buf.starts_with(b"HTTP/1.").then(|| t0.elapsed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derpmap::DerpRegion;
+
+    /// Answers STUN binding requests on a loopback port after `delay`.
+    async fn stun_server(delay: Duration) -> u16 {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+                if let Some(tx) = stun::parse_binding_request(&buf[..n]) {
+                    tokio::time::sleep(delay).await;
+                    let _ = sock.send_to(&stun::response(tx, src), src).await;
+                }
+            }
+        });
+        port
+    }
+
+    fn region(region_id: i32, stun_port: u16, avoid: bool) -> (i32, DerpRegion) {
+        let node = DerpNode {
+            ipv4: "127.0.0.1".into(),
+            ipv6: "none".into(),
+            stun_port: stun_port.into(),
+            ..Default::default()
+        };
+        (region_id, DerpRegion { region_id, avoid, nodes: vec![node], ..Default::default() })
+    }
+
+    #[tokio::test]
+    async fn picks_the_fastest_measurable_region() {
+        let fast = stun_server(Duration::ZERO).await;
+        let slow = stun_server(Duration::from_millis(100)).await;
+        let dm = DerpMap {
+            regions: [region(1, slow, false), region(2, fast, false), region(3, fast, true)].into(),
+            ..Default::default()
+        };
+        let rep = report(&dm).await.unwrap();
+        assert_eq!(rep.region_latency.len(), 2, "{rep:?}");
+        assert!(rep.region_latency[&1] > rep.region_latency[&2]);
+        assert!(rep.global_v4.unwrap().ip().is_loopback());
+        assert_eq!(pick_best_region(&dm).await.unwrap(), Some(2));
+    }
 }

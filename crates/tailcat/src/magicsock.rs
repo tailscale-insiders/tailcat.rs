@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
 use crate::derp::ReceivedPacket;
@@ -131,17 +131,11 @@ pub struct PeerPath {
     pub last_recv: Option<Instant>,
 }
 
-#[derive(Debug, Default, Clone)]
-struct Candidate {
-    last_ping: Option<Instant>,
-    last_pong: Option<Instant>,
-    latency: Option<Duration>,
-}
-
 struct Peer {
     cfg: PeerConfig,
     shared: Arc<DiscoShared>,
-    candidates: HashMap<SocketAddr, Candidate>,
+    /// Candidate endpoints, and when each was last pinged.
+    candidates: HashMap<SocketAddr, Option<Instant>>,
     best: Option<(SocketAddr, Duration)>,
     trust_until: Option<Instant>,
     last_send: Option<Instant>,
@@ -154,6 +148,22 @@ struct Peer {
 }
 
 impl Peer {
+    fn new(cfg: PeerConfig, shared: Arc<DiscoShared>) -> Self {
+        Peer {
+            cfg,
+            shared,
+            candidates: HashMap::new(),
+            best: None,
+            trust_until: None,
+            last_send: None,
+            last_recv: None,
+            last_full_ping: None,
+            last_call_me_maybe: None,
+            last_upgrade: None,
+            derp_seen: None,
+        }
+    }
+
     fn trusted(&self, now: Instant) -> bool {
         self.best.is_some() && self.trust_until.is_some_and(|t| now < t)
     }
@@ -167,9 +177,12 @@ struct PendingPing {
     peer: NodePublic,
     to: PathAddr,
     sent: Instant,
-    waiter: Option<Arc<Mutex<Option<oneshot::Sender<PingResult>>>>>,
+    /// Where a [`MagicSock::ping`] caller waits for the first pong to any
+    /// of its pings: a channel of capacity 1, so later pongs are dropped.
+    waiter: Option<mpsc::Sender<PingResult>>,
 }
 
+#[derive(Default)]
 struct Inner {
     peers: HashMap<NodePublic, Peer>,
     by_disco: HashMap<DiscoPublic, NodePublic>,
@@ -204,7 +217,6 @@ pub struct MagicSock {
     inner: Mutex<Inner>,
     wg_tx: mpsc::Sender<WireguardPacket>,
     derp_tx: mpsc::Sender<ReceivedPacket>,
-    endpoints_tx: watch::Sender<Vec<SocketAddr>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -228,7 +240,6 @@ impl MagicSock {
         };
         let (wg_tx, wg_rx) = mpsc::channel(1024);
         let (derp_tx, derp_rx) = mpsc::channel(1024);
-        let (endpoints_tx, _) = watch::channel(Vec::new());
         let disco_private = cfg.private_key.disco_private();
         let ms = Arc::new(MagicSock {
             public_key: cfg.private_key.public(),
@@ -242,30 +253,12 @@ impl MagicSock {
             on_derp_recv: cfg.on_derp_recv,
             udp4,
             udp6,
-            inner: Mutex::new(Inner {
-                peers: HashMap::new(),
-                by_disco: HashMap::new(),
-                by_addr: HashMap::new(),
-                derp: HashMap::new(),
-                derp_map: cfg.derp_map,
-                pending: HashMap::new(),
-                stun_pending: HashMap::new(),
-                stun_round: 0,
-                stun_endpoints_round: 0,
-                local_endpoints: Vec::new(),
-                stun_endpoints: Vec::new(),
-                endpoints: Vec::new(),
-                closed: false,
-            }),
+            inner: Mutex::new(Inner { derp_map: cfg.derp_map, ..Default::default() }),
             wg_tx,
             derp_tx,
-            endpoints_tx,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::default(),
         });
-        {
-            let mut inner = ms.inner.lock().unwrap();
-            ms.ensure_derp_locked(&mut inner, ms.home_region);
-        }
+        ms.ensure_derp_locked(&mut ms.inner.lock().unwrap(), ms.home_region);
         let weak = Arc::downgrade(&ms);
         let mut tasks = vec![tokio::spawn(derp_recv_loop(weak.clone(), derp_rx))];
         for s in [&ms.udp4, &ms.udp6].into_iter().flatten() {
@@ -294,41 +287,18 @@ impl MagicSock {
         self.home_region
     }
 
-    /// Our home DERP region's details.
-    pub fn home_region_info(&self) -> Option<DerpRegion> {
-        self.inner.lock().unwrap().derp_map.regions.get(&self.home_region).cloned()
-    }
-
-    /// Our node private key.
-    pub fn private_key(&self) -> &NodePrivate {
-        &self.private_key
-    }
-
     /// Waits until the home DERP connection is up, or `timeout` passes.
     pub async fn wait_derp_connected(&self, timeout: Duration) -> bool {
-        let rx = {
-            let inner = self.inner.lock().unwrap();
-            match inner.derp.get(&self.home_region) {
-                Some(c) => c.connected_watch(),
-                None => return false,
-            }
-        };
-        crate::derp::client::wait_connected(rx, timeout).await
-    }
-
-    /// The local UDP addresses we're bound to.
-    pub fn local_addrs(&self) -> Vec<SocketAddr> {
-        [&self.udp4, &self.udp6].into_iter().flatten().filter_map(|s| s.local_addr().ok()).collect()
+        let wait = self.inner.lock().unwrap().derp.get(&self.home_region).map(|c| c.wait_connected(timeout));
+        match wait {
+            Some(w) => w.await,
+            None => false,
+        }
     }
 
     /// Our current advertised endpoints.
     pub fn endpoints(&self) -> Vec<SocketAddr> {
         self.inner.lock().unwrap().endpoints.clone()
-    }
-
-    /// Watches our advertised endpoints.
-    pub fn watch_endpoints(&self) -> watch::Receiver<Vec<SocketAddr>> {
-        self.endpoints_tx.subscribe()
     }
 
     /// Adds (or replaces) a DERP region that peers may be reached through.
@@ -346,51 +316,22 @@ impl MagicSock {
 
     /// Adds a peer or updates what we know about it.
     pub fn upsert_peer(&self, cfg: PeerConfig) {
-        let mut inner = self.inner.lock().unwrap();
-        if cfg.home_region != 0 && cfg.home_region != self.home_region {
-            self.ensure_derp_locked(&mut inner, cfg.home_region);
-        }
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        self.ensure_derp_locked(inner, cfg.home_region);
         let key = cfg.node_key;
-        if let Some(p) = inner.peers.get(&key)
-            && p.cfg.disco_key != cfg.disco_key
-        {
-            let old = p.cfg.disco_key;
-            inner.by_disco.remove(&old);
+        let shared = || Arc::new(self.disco_private.shared(&cfg.disco_key));
+        let p = inner.peers.entry(key).or_insert_with(|| Peer::new(cfg.clone(), shared()));
+        if p.cfg.disco_key != cfg.disco_key {
+            inner.by_disco.remove(&p.cfg.disco_key);
+            p.shared = shared();
         }
         inner.by_disco.insert(cfg.disco_key, key);
         for ep in &cfg.endpoints {
             inner.by_addr.insert(*ep, key);
+            p.candidates.entry(*ep).or_default();
         }
-        match inner.peers.get_mut(&key) {
-            Some(p) => {
-                if p.cfg.disco_key != cfg.disco_key {
-                    p.shared = Arc::new(self.disco_private.shared(&cfg.disco_key));
-                }
-                for ep in &cfg.endpoints {
-                    p.candidates.entry(*ep).or_default();
-                }
-                p.cfg = cfg;
-            }
-            None => {
-                let candidates = cfg.endpoints.iter().map(|e| (*e, Candidate::default())).collect();
-                inner.peers.insert(
-                    key,
-                    Peer {
-                        shared: Arc::new(self.disco_private.shared(&cfg.disco_key)),
-                        cfg,
-                        candidates,
-                        best: None,
-                        trust_until: None,
-                        last_send: None,
-                        last_recv: None,
-                        last_full_ping: None,
-                        last_call_me_maybe: None,
-                        last_upgrade: None,
-                        derp_seen: None,
-                    },
-                );
-            }
-        }
+        p.cfg = cfg;
     }
 
     /// Forgets a peer. It reports whether the peer was known.
@@ -401,16 +342,6 @@ impl MagicSock {
         inner.by_addr.retain(|_, k| k != key);
         inner.pending.retain(|_, pp| pp.peer != *key);
         true
-    }
-
-    /// Reports whether a peer is known.
-    pub fn has_peer(&self, key: &NodePublic) -> bool {
-        self.inner.lock().unwrap().peers.contains_key(key)
-    }
-
-    /// Returns the peer known at a UDP address.
-    pub fn peer_for_addr(&self, a: &SocketAddr) -> Option<NodePublic> {
-        self.inner.lock().unwrap().by_addr.get(a).copied()
     }
 
     /// Returns a snapshot of a peer's paths.
@@ -430,12 +361,6 @@ impl MagicSock {
         })
     }
 
-    /// Returns snapshots of all peers' paths.
-    pub fn peer_paths(&self) -> Vec<PeerPath> {
-        let keys: Vec<NodePublic> = self.inner.lock().unwrap().peers.keys().copied().collect();
-        keys.iter().filter_map(|k| self.peer_path(k)).collect()
-    }
-
     /// Sends a raw packet to `peer` through DERP region `region` (or the
     /// peer's region if 0). It reports whether the packet was queued.
     pub fn send_derp(&self, peer: &NodePublic, region: i32, pkt: &[u8]) -> bool {
@@ -445,8 +370,7 @@ impl MagicSock {
         } else {
             inner.peers.get(peer).map(|p| p.derp_region()).filter(|r| *r != 0).unwrap_or(self.home_region)
         };
-        self.ensure_derp_locked(&mut inner, region);
-        inner.derp.get(&region).is_some_and(|c| c.send(peer, pkt))
+        self.send_derp_locked(&mut inner, region, peer, pkt)
     }
 
     /// Sends a WireGuard packet to `peer` over its best path(s), starting
@@ -460,21 +384,19 @@ impl MagicSock {
         p.last_send = Some(now);
         let trusted = p.trusted(now);
         let udp = p.best.map(|b| b.0);
-        let derp_region = if trusted { None } else { Some(p.derp_region()).filter(|r| *r != 0) };
+        // Without a trusted direct path, also send over DERP: through the
+        // peer's region, or our own if there's no direct path to try.
+        let derp =
+            (!trusted).then(|| p.derp_region()).filter(|r| *r != 0).or(udp.is_none().then_some(self.home_region));
         if !trusted && self.enable_udp {
             self.discover_locked(&mut inner, peer, now, true);
         }
-        let derp_region = derp_region.or_else(|| (udp.is_none()).then_some(self.home_region));
-        if let Some(r) = derp_region {
-            self.ensure_derp_locked(&mut inner, r);
-        }
-        let derp_sent = derp_region.and_then(|r| inner.derp.get(&r)).map(|c| c.send(peer, pkt));
+        let derp_sent = derp.is_some_and(|r| self.send_derp_locked(&mut inner, r, peer, pkt));
         drop(inner);
-        if let Some(a) = udp {
-            self.send_udp(a, pkt);
-        }
-        if udp.is_none() && derp_sent != Some(true) {
-            trace!(peer = %peer.short_string(), "magicsock: WireGuard packet dropped: no path");
+        match udp {
+            Some(a) => self.send_udp(a, pkt),
+            None if !derp_sent => trace!(peer = %peer.short_string(), "magicsock: WireGuard packet dropped: no path"),
+            None => {}
         }
         Ok(())
     }
@@ -485,50 +407,36 @@ impl MagicSock {
         self.call_me_maybe_locked(&mut inner, peer, Instant::now());
     }
 
-    /// Advertises our endpoints to every peer.
-    pub fn advertise_endpoints(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        let now = Instant::now();
-        let peers: Vec<NodePublic> = inner.peers.keys().copied().collect();
-        for p in peers {
-            self.call_me_maybe_locked(&mut inner, &p, now);
-        }
-    }
-
     /// Sends disco pings to `peer` over every path (DERP and each known
     /// endpoint) and returns the first pong. It also advertises our
     /// endpoints, nudging the peer to try a direct path.
     pub async fn ping(&self, peer: &NodePublic, timeout: Duration) -> Result<PingResult> {
-        let (tx, rx) = oneshot::channel();
-        let waiter = Arc::new(Mutex::new(Some(tx)));
+        let (tx, mut rx) = mpsc::channel(1);
         {
             let mut inner = self.inner.lock().unwrap();
             let now = Instant::now();
             let Some(p) = inner.peers.get(peer) else {
                 return Err(Error::other(format!("unknown peer {}", peer.short_string())));
             };
-            let region = p.derp_region();
             // Like Tailscale's CLI ping: with a trusted direct path, ping
             // just that; otherwise ping over DERP and every candidate.
-            if let (true, Some((best, _))) = (p.trusted(now), p.best) {
-                self.send_ping_locked(&mut inner, peer, PathAddr::Udp(best), now, Some(waiter.clone()));
-            } else {
-                let cands: Vec<SocketAddr> = p.candidates.keys().copied().collect();
-                if region != 0 {
-                    self.send_ping_locked(&mut inner, peer, PathAddr::Derp(region), now, Some(waiter.clone()));
+            let direct = p.best.filter(|_| p.trusted(now));
+            let paths: Vec<PathAddr> = match direct {
+                Some((best, _)) => vec![PathAddr::Udp(best)],
+                None => {
+                    let derp = Some(p.derp_region()).filter(|r| *r != 0).map(PathAddr::Derp);
+                    let udp = p.candidates.keys().filter(|_| self.enable_udp).copied().map(PathAddr::Udp);
+                    derp.into_iter().chain(udp).collect()
                 }
-                if self.enable_udp {
-                    for c in cands {
-                        self.send_ping_locked(&mut inner, peer, PathAddr::Udp(c), now, Some(waiter.clone()));
-                    }
-                    self.call_me_maybe_locked(&mut inner, peer, now);
-                }
+            };
+            for to in paths {
+                self.send_ping_locked(&mut inner, peer, to, now, Some(tx.clone()));
+            }
+            if direct.is_none() {
+                self.call_me_maybe_locked(&mut inner, peer, now);
             }
         }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(r)) => Ok(r),
-            _ => Err(Error::Timeout("disco ping".into())),
-        }
+        tokio::time::timeout(timeout, rx.recv()).await.ok().flatten().ok_or_else(|| Error::Timeout("disco ping".into()))
     }
 
     /// Stops all background work.
@@ -543,6 +451,11 @@ impl MagicSock {
     }
 
     // -----------------------------------------------------------------
+
+    fn send_derp_locked(&self, inner: &mut Inner, region: i32, peer: &NodePublic, pkt: &[u8]) -> bool {
+        self.ensure_derp_locked(inner, region);
+        inner.derp.get(&region).is_some_and(|c| c.send(peer, pkt))
+    }
 
     fn ensure_derp_locked(&self, inner: &mut Inner, region: i32) {
         if region == 0 || inner.closed || inner.derp.contains_key(&region) {
@@ -577,10 +490,7 @@ impl MagicSock {
         match to {
             PathAddr::Udp(a) => self.send_udp(a, &pkt),
             PathAddr::Derp(r) => {
-                self.ensure_derp_locked(inner, r);
-                if let Some(c) = inner.derp.get(&r) {
-                    c.send(peer, &pkt);
-                }
+                self.send_derp_locked(inner, r, peer, &pkt);
             }
         }
     }
@@ -591,12 +501,12 @@ impl MagicSock {
         peer: &NodePublic,
         to: PathAddr,
         now: Instant,
-        waiter: Option<Arc<Mutex<Option<oneshot::Sender<PingResult>>>>>,
+        waiter: Option<mpsc::Sender<PingResult>>,
     ) {
         let tx_id: TxId = rand::thread_rng().r#gen();
         inner.pending.insert(tx_id, PendingPing { peer: *peer, to, sent: now, waiter });
         if let (PathAddr::Udp(a), Some(p)) = (to, inner.peers.get_mut(peer)) {
-            p.candidates.entry(a).or_default().last_ping = Some(now);
+            p.candidates.insert(a, Some(now));
         }
         let msg = Message::Ping { tx_id, node_key: Some(self.public_key), padding: 0 };
         self.send_disco(inner, peer, to, &msg);
@@ -613,7 +523,7 @@ impl MagicSock {
         let due: Vec<SocketAddr> = p
             .candidates
             .iter()
-            .filter(|(_, c)| c.last_ping.is_none_or(|t| now - t >= DISCO_PING_INTERVAL))
+            .filter(|(_, last_ping)| last_ping.is_none_or(|t| now - t >= DISCO_PING_INTERVAL))
             .map(|(a, _)| *a)
             .collect();
         for a in due {
@@ -666,10 +576,7 @@ impl MagicSock {
                     PathAddr::Udp(a) => {
                         inner.by_addr.insert(a, peer_key);
                         let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                        let is_new = !p.candidates.contains_key(&a);
-                        p.candidates.entry(a).or_default();
-                        let pinged_recently = p.candidates[&a].last_ping.is_some_and(|t| now - t < DISCO_PING_INTERVAL);
-                        if is_new || !pinged_recently {
+                        if p.candidates.get(&a).copied().flatten().is_none_or(|t| now - t >= DISCO_PING_INTERVAL) {
                             // Ping back: it both verifies the path for our
                             // side and helps punch through the NAT.
                             self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(a), now, None);
@@ -677,8 +584,7 @@ impl MagicSock {
                         a
                     }
                     PathAddr::Derp(r) => {
-                        let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                        p.derp_seen = Some(r);
+                        inner.peers.get_mut(&peer_key).expect("known peer").derp_seen = Some(r);
                         SocketAddr::new(IpAddr::V4(DERP_MAGIC_IP), r as u16)
                     }
                 };
@@ -690,25 +596,19 @@ impl MagicSock {
                     return;
                 }
                 let latency = now - pp.sent;
-                if let Some(w) = &pp.waiter
-                    && let Some(tx) = w.lock().unwrap().take()
-                {
-                    let _ = tx.send(PingResult { latency, via: src });
+                if let Some(w) = &pp.waiter {
+                    let _ = w.try_send(PingResult { latency, via: src });
                 }
                 if let (PathAddr::Udp(from), PathAddr::Udp(to)) = (src, pp.to) {
                     inner.by_addr.insert(from, peer_key);
                     let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                    let c = p.candidates.entry(to).or_default();
-                    c.last_pong = Some(now);
-                    c.latency = Some(latency);
-                    let untrusted = !p.trusted(now);
-                    if untrusted || better_addr((to, latency), p.best) {
-                        if p.best.map(|b| b.0) != Some(to) {
+                    // A pong confirms the path in use, renewing its trust,
+                    // or replaces it if that's untrusted or worse.
+                    let current = p.best.map(|b| b.0);
+                    if current == Some(to) || !p.trusted(now) || better_addr((to, latency), p.best) {
+                        if current != Some(to) {
                             debug!(peer = %peer_key.short_string(), "magicsock: now using {to} ({latency:?})");
                         }
-                        p.best = Some((to, latency));
-                    }
-                    if p.best.map(|b| b.0) == Some(to) {
                         p.best = Some((to, latency));
                         p.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
                     }
@@ -722,16 +622,11 @@ impl MagicSock {
                 if !self.enable_udp {
                     return;
                 }
-                let eps: Vec<SocketAddr> = endpoints
-                    .into_iter()
-                    .filter(|e| !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()))
-                    .collect();
-                for e in &eps {
-                    inner.by_addr.insert(*e, peer_key);
-                    inner.peers.get_mut(&peer_key).expect("known peer").candidates.entry(*e).or_default();
-                }
-                for e in eps {
-                    self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(e), now, None);
+                for e in endpoints {
+                    if !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+                        inner.by_addr.insert(e, peer_key);
+                        self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(e), now, None);
+                    }
                 }
             }
         }
@@ -808,8 +703,7 @@ impl MagicSock {
         eps.dedup();
         if eps != inner.endpoints {
             debug!("magicsock: endpoints now {eps:?}");
-            inner.endpoints = eps.clone();
-            self.endpoints_tx.send_replace(eps);
+            inner.endpoints = eps;
             // Tailcat has no control plane distributing endpoints, so tell
             // every peer directly whenever they change.
             let now = Instant::now();
@@ -822,35 +716,21 @@ impl MagicSock {
 
     /// Gathers local interface endpoints and re-STUNs.
     async fn refresh_endpoints(&self) {
-        let port4 = self.udp4.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
-        let port6 = self.udp6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
-        let mut local = Vec::new();
-        if let Ok(ifs) = if_addrs::get_if_addrs() {
-            for i in ifs {
-                if i.is_loopback() {
-                    continue;
+        let port = |s: &Option<Arc<UdpSocket>>| s.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
+        let (port4, port6) = (port(&self.udp4), port(&self.udp6));
+        let mut local: Vec<SocketAddr> = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| i.ip())
+            .filter(|ip| !ip.is_loopback() && self.endpoint_filter.as_ref().is_none_or(|f| f(*ip)))
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) if !v4.is_link_local() => Some(SocketAddr::new(ip, port4?)),
+                IpAddr::V6(v6) if !v6.is_unicast_link_local() && !is_tailscale_ula(&v6) => {
+                    Some(SocketAddr::new(ip, port6?))
                 }
-                let ip = i.ip();
-                if let Some(f) = &self.endpoint_filter
-                    && !f(ip)
-                {
-                    continue;
-                }
-                match ip {
-                    IpAddr::V4(v4) if !v4.is_link_local() => {
-                        if let Some(p) = port4 {
-                            local.push(SocketAddr::new(ip, p));
-                        }
-                    }
-                    IpAddr::V6(v6) if !v6.is_unicast_link_local() && !is_tailscale_ula(&v6) => {
-                        if let Some(p) = port6 {
-                            local.push(SocketAddr::new(ip, p));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+                _ => None,
+            })
+            .collect();
         local.sort();
         local.dedup();
 
@@ -907,9 +787,7 @@ impl MagicSock {
 
 impl Drop for MagicSock {
     fn drop(&mut self) {
-        for t in self.tasks.lock().unwrap().drain(..) {
-            t.abort();
-        }
+        self.close();
     }
 }
 
@@ -933,29 +811,19 @@ fn better_addr(a: (SocketAddr, Duration), b: Option<(SocketAddr, Duration)>) -> 
     if a.0 == b.0 {
         return false;
     }
-    let (mut ap, mut bp) = (0i64, 0i64);
+    // Points for being faster (by how many percent), for being on the
+    // local network, and for IPv6.
     let (al, bl) = (a.1.as_micros() as i64, b.1.as_micros() as i64);
-    if al > bl && al > 0 {
-        bp = 100 - (bl * 100) / al;
+    let (ap, bp) = if al > bl && al > 0 {
+        (0, 100 - bl * 100 / al)
     } else if bl > 0 {
-        ap = 100 - (al * 100) / bl;
-    }
-    if is_private(a.0.ip()) {
-        ap += 20;
-    }
-    if is_private(b.0.ip()) {
-        bp += 20;
-    }
-    if a.0.is_ipv6() {
-        ap += 10;
-    }
-    if b.0.is_ipv6() {
-        bp += 10;
-    }
-    if ap == bp {
-        return a.1 < b.1;
-    }
-    ap > bp
+        (100 - al * 100 / bl, 0)
+    } else {
+        (0, 0)
+    };
+    let bonus = |a: SocketAddr| 20 * is_private(a.ip()) as i64 + 10 * a.is_ipv6() as i64;
+    let (ap, bp) = (ap + bonus(a.0), bp + bonus(b.0));
+    if ap == bp { a.1 < b.1 } else { ap > bp }
 }
 
 async fn derp_recv_loop(ms: Weak<MagicSock>, mut rx: mpsc::Receiver<ReceivedPacket>) {
@@ -971,16 +839,7 @@ async fn udp_recv_loop(ms: Weak<MagicSock>, sock: Arc<UdpSocket>) {
         let r = sock.recv_from(&mut buf).await;
         let Some(ms) = ms.upgrade() else { return };
         match r {
-            Ok((n, src)) => {
-                let src = match src {
-                    SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-                        Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
-                        None => src,
-                    },
-                    v4 => v4,
-                };
-                ms.handle_udp(&buf[..n], src);
-            }
+            Ok((n, src)) => ms.handle_udp(&buf[..n], SocketAddr::new(src.ip().to_canonical(), src.port())),
             Err(e) => {
                 // ICMP-induced errors (connection refused etc.) are transient.
                 trace!("magicsock: UDP recv: {e}");
@@ -1001,27 +860,143 @@ async fn timer_loop(ms: Weak<MagicSock>) {
 }
 
 async fn endpoint_loop(ms: Weak<MagicSock>) {
-    // STUN right away, again shortly after (in case the first round was
-    // lost while the relay connection came up), then every 20–26s.
-    let mut first = 2;
-    loop {
+    // STUN right away, twice more soon after (in case the first round
+    // was lost while the relay connection came up), then every 20–26s.
+    let later = std::iter::repeat_with(|| rand::thread_rng().gen_range(20_000..26_000));
+    for delay_ms in [300, 2000].into_iter().chain(later) {
         {
             let Some(ms) = ms.upgrade() else { return };
             ms.refresh_endpoints().await;
         }
-        let d = if first > 0 {
-            first -= 1;
-            Duration::from_millis(if first == 1 { 300 } else { 2000 })
-        } else {
-            Duration::from_millis(rand::thread_rng().gen_range(20_000..26_000))
-        };
-        tokio::time::sleep(d).await;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derp::server::DevDerp;
+
+    const T: Duration = Duration::from_secs(10);
+
+    async fn sock(dev: &DevDerp, enable_udp: bool) -> (Arc<MagicSock>, mpsc::Receiver<WireguardPacket>) {
+        let mut derp_map = DerpMap::default();
+        derp_map.regions.insert(1, dev.region.clone());
+        let cfg = Config {
+            private_key: NodePrivate::generate(),
+            derp_map,
+            home_region: 1,
+            derp_app_name: "test".into(),
+            listen_port: 0,
+            on_derp_recv: None,
+            endpoint_filter: None,
+            enable_udp,
+        };
+        let (ms, rx) = MagicSock::start(cfg).await.unwrap();
+        assert!(ms.wait_derp_connected(T).await);
+        (ms, rx)
+    }
+
+    fn introduce(a: &MagicSock, b: &MagicSock) {
+        for (x, y) in [(a, b), (b, a)] {
+            x.upsert_peer(PeerConfig {
+                node_key: y.public_key(),
+                disco_key: y.disco_public(),
+                home_region: 1,
+                endpoints: vec![],
+            });
+        }
+    }
+
+    async fn recv(rx: &mut mpsc::Receiver<WireguardPacket>) -> WireguardPacket {
+        tokio::time::timeout(T, rx.recv()).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn pings_and_sends_over_derp_without_udp() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let (a, _a_rx) = sock(&dev, false).await;
+        let (b, mut b_rx) = sock(&dev, false).await;
+        let stranger = NodePrivate::generate().public();
+        assert!(a.ping(&b.public_key(), T).await.is_err(), "pinged an unknown peer");
+        introduce(&a, &b);
+
+        let r = a.ping(&b.public_key(), T).await.unwrap();
+        assert_eq!(r.via, PathAddr::Derp(1));
+        let path = a.peer_path(&b.public_key()).unwrap();
+        assert!(path.best.is_none() && !path.direct_trusted && path.candidates.is_empty());
+        assert_eq!(path.home_region, 1);
+
+        a.send_wireguard(&b.public_key(), b"not really WireGuard").unwrap();
+        let p = recv(&mut b_rx).await;
+        assert_eq!(
+            (p.peer, p.src, p.data.as_slice()),
+            (Some(a.public_key()), PathAddr::Derp(1), &b"not really WireGuard"[..])
+        );
+        assert!(b.peer_path(&a.public_key()).unwrap().last_recv.is_some());
+        assert!(a.send_wireguard(&stranger, b"x").is_err());
+
+        assert!(a.remove_peer(&b.public_key()));
+        assert!(!a.remove_peer(&b.public_key()));
+        assert!(a.peer_path(&b.public_key()).is_none());
+        assert!(a.ping(&b.public_key(), T).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upgrades_to_a_direct_path() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let (a, _a_rx) = sock(&dev, true).await;
+        let (b, mut b_rx) = sock(&dev, true).await;
+        introduce(&a, &b);
+        // STUN against the local relay finds each side's loopback address,
+        // which CallMeMaybe then hands to the other.
+        let direct = async {
+            loop {
+                let _ = a.ping(&b.public_key(), Duration::from_secs(1)).await;
+                if a.peer_path(&b.public_key()).is_some_and(|p| p.direct_trusted) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(T, direct).await.expect("no direct path");
+        let (best, _) = a.peer_path(&b.public_key()).unwrap().best.unwrap();
+        assert!(!a.endpoints().is_empty());
+
+        // With a trusted path, pings and packets go only that way.
+        let r = a.ping(&b.public_key(), T).await.unwrap();
+        assert_eq!(r.via, PathAddr::Udp(best));
+        while b_rx.try_recv().is_ok() {}
+        a.send_wireguard(&b.public_key(), b"direct").unwrap();
+        let p = recv(&mut b_rx).await;
+        assert!(matches!(p.src, PathAddr::Udp(_)), "came via {}", p.src);
+        assert_eq!((p.peer, p.data.as_slice()), (Some(a.public_key()), &b"direct"[..]));
+    }
+
+    #[test]
+    fn peer_derp_region_falls_back_to_where_it_was_heard() {
+        let k = NodePrivate::generate();
+        let cfg = PeerConfig {
+            node_key: k.public(),
+            disco_key: k.disco_private().public(),
+            home_region: 0,
+            endpoints: vec![],
+        };
+        let mut p = Peer::new(cfg, Arc::new(k.disco_private().shared(&k.disco_private().public())));
+        assert_eq!(p.derp_region(), 0);
+        p.derp_seen = Some(7);
+        assert_eq!(p.derp_region(), 7);
+        p.cfg.home_region = 3;
+        assert_eq!(p.derp_region(), 3);
+
+        let now = Instant::now();
+        assert!(!p.trusted(now));
+        p.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
+        assert!(!p.trusted(now), "trust without a path");
+        p.best = Some(("192.0.2.1:1".parse().unwrap(), Duration::ZERO));
+        assert!(p.trusted(now));
+        assert!(!p.trusted(now + TRUST_UDP_ADDR_DURATION));
+    }
 
     #[test]
     fn better_addr_prefers_faster_and_private() {
@@ -1035,5 +1010,12 @@ mod tests {
         assert!(!better_addr((pubv4, ms(51)), Some((pubv4b, ms(50)))));
         assert!(better_addr((lan, ms(12)), Some((pubv4, ms(10)))));
         assert!(!better_addr((pubv4, ms(10)), Some((pubv4, ms(50)))));
+        // IPv6 earns a bonus too, but less than being local.
+        let pubv6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+        assert!(better_addr((pubv6, ms(10)), Some((pubv4, ms(10)))));
+        assert!(!better_addr((pubv4, ms(10)), Some((pubv6, ms(10)))));
+        assert!(!better_addr((pubv6, ms(10)), Some((lan, ms(10)))));
+        // Equal scores fall back to raw latency, zero included.
+        assert!(!better_addr((pubv4, ms(0)), Some((pubv4b, ms(0)))));
     }
 }
