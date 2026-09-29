@@ -19,6 +19,7 @@ cleanup() {
 	wait 2>/dev/null || true
 	for i in $(seq 0 $((N - 1))); do ip netns del "tcd$i" 2>/dev/null || true; done
 	ip link del tcd-br 2>/dev/null || true
+	iptables -D FORWARD -i tcd-br -o tcd-br -j ACCEPT 2>/dev/null || true
 	if [ "${keep:-}" != 1 ]; then rm -rf "$work"; fi
 }
 trap cleanup EXIT
@@ -33,6 +34,11 @@ dump_logs() {
 ip link add tcd-br type bridge
 ip addr add 10.99.0.1/24 dev tcd-br
 ip link set tcd-br up
+# Docker (present on GitHub's runners) loads br_netfilter and drops
+# forwarded packets, which would include bridged traffic between the
+# namespaces: exactly the direct paths this test wants to see.
+sysctl -qw net.bridge.bridge-nf-call-iptables=0 2>/dev/null || true
+iptables -I FORWARD -i tcd-br -o tcd-br -j ACCEPT 2>/dev/null || true
 for i in $(seq 0 $((N - 1))); do
 	ns=tcd$i
 	ip netns add "$ns"

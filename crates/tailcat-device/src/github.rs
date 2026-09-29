@@ -382,6 +382,67 @@ mod tests {
         assert!(admit(&rec("1"), "100", &e, Scope::Branch, None, "p:").is_err(), "no token outside run scope");
     }
 
+    /// Signs GitHub-shaped OIDC tokens with a local key and checks
+    /// admission against them.
+    #[test]
+    fn oidc_admission() {
+        use base64::Engine as _;
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let b64 = |b: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(serde_json::json!({
+            "keys": [{"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+                      "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be())}]
+        }))
+        .unwrap();
+        let v = Verifier::from_jwks(jwks);
+        let enc = jsonwebtoken::EncodingKey::from_rsa_der(key.to_pkcs1_der().unwrap().as_bytes());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let sign = |aud: String, git_ref: &str, run: &str, exp: u64| {
+            let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            h.kid = Some("k1".into());
+            let claims = serde_json::json!({
+                "iss": OIDC_ISSUER, "aud": aud, "exp": exp, "iat": now,
+                "repository_id": "42", "ref": git_ref, "run_id": run, "run_attempt": "1",
+            });
+            jsonwebtoken::encode(&h, &claims, &enc).unwrap()
+        };
+        let e = genv();
+        let p = "tailcat-device:";
+
+        let mut r = rec("1");
+        r.jwt = sign(audience_for(p, &r.nodekey), "refs/heads/main", "100", now + 600);
+        admit(&r, "100", &e, Scope::Run, Some(&v), p).unwrap();
+
+        // A token for another node's key doesn't transfer.
+        let other = rec("1");
+        let mut stolen = rec("1");
+        stolen.jwt = sign(audience_for(p, &other.nodekey), "refs/heads/main", "100", now + 600);
+        assert!(admit(&stolen, "100", &e, Scope::Run, Some(&v), p).is_err());
+
+        // Branch scope admits another run on the same ref, not another ref.
+        let mut sib = rec("1");
+        sib.jwt = sign(audience_for(p, &sib.nodekey), "refs/heads/main", "99", now + 600);
+        admit(&sib, "99", &e, Scope::Branch, Some(&v), p).unwrap();
+        assert!(admit(&sib, "100", &e, Scope::Branch, Some(&v), p).is_err(), "token run != artifact run");
+        let mut wrong_ref = rec("1");
+        wrong_ref.jwt = sign(audience_for(p, &wrong_ref.nodekey), "refs/heads/evil", "99", now + 600);
+        assert!(admit(&wrong_ref, "99", &e, Scope::Branch, Some(&v), p).is_err());
+
+        // Expired and forged tokens fail.
+        let mut old = rec("1");
+        old.jwt = sign(audience_for(p, &old.nodekey), "refs/heads/main", "100", now - 3600);
+        assert!(admit(&old, "100", &e, Scope::Run, Some(&v), p).is_err());
+        let mut forged = r.clone();
+        let mut b = forged.jwt.into_bytes();
+        let i = b.len() - 10; // inside the signature
+        b[i] = if b[i] == b'A' { b'B' } else { b'A' };
+        forged.jwt = String::from_utf8(b).unwrap();
+        assert!(admit(&forged, "100", &e, Scope::Run, Some(&v), p).is_err());
+    }
+
     #[test]
     fn url_encoding() {
         assert_eq!(urlencode("tailcat-device:ab"), "tailcat-device%3Aab");

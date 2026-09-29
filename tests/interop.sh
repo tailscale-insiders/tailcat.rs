@@ -15,6 +15,10 @@ GO=${2:?usage: interop.sh <rust tailcat> <go tailcat>}
 work=$(mktemp -d)
 export HOME="$work/home"
 mkdir -p "$HOME"
+# Build sandboxes don't set USER, and Go's os/user needs it without cgo
+# (nixpkgs' Go tailcat is built without cgo).
+USER=${USER:-$(id -un)}
+export USER
 pids=()
 cleanup() {
 	for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
@@ -26,7 +30,7 @@ trap cleanup EXIT
 failures=0
 pass() { echo "ok   $*"; }
 fail() {
-	echo "FAIL $*"
+	echo "FAIL $*" | tr "\r" " "
 	failures=$((failures + 1))
 }
 

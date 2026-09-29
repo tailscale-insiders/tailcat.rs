@@ -533,7 +533,16 @@ mod pty {
     ) -> u32 {
         let (mut master, mut slave) = (-1, -1);
         let mut ws = winsize(req.cols, req.rows);
-        let r = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
+        // The winsize parameter is `*const` on Linux and `*mut` on macOS.
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ws),
+            )
+        };
         let mut err_w = wr.make_writer_ext(Some(1));
         if r != 0 {
             let _ = err_w.write_all(format!("pty open: {}\r\n", std::io::Error::last_os_error()).as_bytes()).await;
