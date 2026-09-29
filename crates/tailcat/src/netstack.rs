@@ -564,7 +564,9 @@ async fn poll_loop(shared: Weak<Shared>) {
             let State { sockets, tuples, ends, orphans, .. } = st;
             orphans.retain(|&(h, since)| {
                 let s = sockets.get_mut::<tcp::Socket>(h);
-                let done = matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait);
+                // An aborted socket keeps its peer until it has sent the RST.
+                let done = s.state() == tcp::State::TimeWait
+                    || s.state() == tcp::State::Closed && s.remote_endpoint().is_none();
                 if done {
                     sockets.remove(h);
                     tuples.retain(|_, v| *v != h);

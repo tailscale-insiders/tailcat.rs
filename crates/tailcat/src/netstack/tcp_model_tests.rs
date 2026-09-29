@@ -1002,7 +1002,6 @@ fn orphan_in_fin_wait_2_is_reaped() {
 /// socket was reaped in the same pass that aborted it, before the RST
 /// went out.
 #[test]
-#[ignore = "known bug: a stalled handshake is reaped without a RST"]
 fn stalled_handshake_is_reset() {
     let mut net = Net::new();
     let i = net.open(SOURCE_PORTS[0]);
