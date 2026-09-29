@@ -110,6 +110,19 @@ for s in "${impls[@]}"; do
 		fi
 	done
 	stop
+	# The allowed key gets in (with the one-shot server, the first
+	# connection is written to its stdout).
+	for c in "${impls[@]}"; do
+		cn=${c%%:*} cb=${c#*:}
+		start "allowed-$sn" "$sb" serve --allow="$(cat "$work/allowed.pub")"
+		if echo "friend of $cn" | timeout 60 "$cb" --key="$work/allowed.private.json" "$addr" >/dev/null 2>"$work/client.log" &&
+			sleep 0.5 && grep -qx "friend of $cn" "$work/allowed-$sn.out"; then
+			pass "allow: $cn allowed key admitted by $sn server"
+		else
+			fail "allow: $cn allowed key admitted by $sn server: $(tail -3 "$work/client.log")"
+		fi
+		stop
+	done
 done
 
 # Parsing each other's addresses.

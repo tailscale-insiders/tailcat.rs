@@ -153,7 +153,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let filter = if cli.verbose { "info,tailcat=debug,tailcat_device=debug" } else { "info,tailcat=warn" };
+    let filter =
+        if cli.verbose { "info,tailcat=debug,tailcat_device=debug" } else { "info,tailcat=warn,tailcat_device=info" };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
         .with_writer(std::io::stderr)
@@ -294,11 +295,21 @@ async fn run(cli: Cli) -> Result<()> {
             let expected = nodes.map(|n| n.saturating_sub(1));
             let deadline = Instant::now() + wait;
             let mut last_status = Instant::now();
+            let mut last_poll: Option<Instant> = None;
             let mut ready = false;
+            // Poll quickly while nodes are joining, then back off: the
+            // GitHub API is rate-limited per repository.
+            let settled_poll = if github { Duration::from_secs(30) } else { Duration::from_secs(5) };
             let signal = shutdown_signal();
             tokio::pin!(signal);
             loop {
-                match source.poll().await {
+                let joining = expected.is_some_and(|n| overlay.peer_count() < n) || !ready;
+                let poll_every = if joining { Duration::from_secs(2) } else { settled_poll };
+                let poll_due = last_poll.is_none_or(|t| t.elapsed() >= poll_every);
+                if poll_due {
+                    last_poll = Some(Instant::now());
+                }
+                match if poll_due { source.poll().await } else { Ok(Vec::new()) } {
                     Ok(recs) => {
                         for r in &recs {
                             // Fetch the DERP map the first time a peer needs it.
@@ -334,13 +345,8 @@ async fn run(cli: Cli) -> Result<()> {
                 if let Some(f) = &status_file {
                     let _ = std::fs::write(f, serde_json::to_vec_pretty(&overlay.status())?);
                 }
-                let pause = if expected.is_some_and(|n| have < n) || !ready {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(15)
-                };
                 tokio::select! {
-                    _ = tokio::time::sleep(pause) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     _ = &mut signal => {
                         info!("overlay: shutting down");
                         overlay.close();
