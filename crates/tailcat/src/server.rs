@@ -763,6 +763,9 @@ impl<T> Drop for Listener<T> {
 }
 
 #[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Barrier;
 
