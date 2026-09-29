@@ -10,3 +10,6 @@ result-*
 
 # Cargo build output
 /target
+
+# Hegel property-test example database
+.hegel

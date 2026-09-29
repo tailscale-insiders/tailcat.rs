@@ -48,3 +48,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+# Property-based and model-based tests. The static engine builds as an
+# ordinary dependency, so it works with vendored (Nix) builds.
+hegeltest = { version = "0.48", features = ["static-engine"] }
