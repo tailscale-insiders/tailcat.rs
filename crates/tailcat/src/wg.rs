@@ -254,31 +254,47 @@ impl Engine {
         }
     }
 
+    /// Finds the peer a packet is from, as wireguard-go does: a handshake
+    /// initiation by the static key inside (adding the peer if it's new),
+    /// anything else by the session it's addressed to. Magicsock's label
+    /// on a UDP packet is only a guess from the source address, which a
+    /// peer can claim as its own, so it counts for nothing; over DERP the
+    /// relay vouches for the sender, so a packet from anyone else is
+    /// dropped.
     fn identify(&self, pkt: &WireguardPacket) -> Option<Arc<WgPeer>> {
-        if let Some(p) = pkt.peer.and_then(|k| self.peer(&k)) {
-            return Some(p);
-        }
-        // A known sender but not (yet) a WireGuard peer: only a
-        // handshake initiation can make it one.
+        let sent_by = |k: NodePublic| match pkt.src {
+            PathAddr::Derp(_) => pkt.peer == Some(k),
+            PathAddr::Udp(_) => true,
+        };
         let idx = match Tunn::parse_incoming_packet(&pkt.data).ok()? {
             Packet::HandshakeInit(init) => {
                 let hh = parse_handshake_anon(&self.private, &self.public, &init).ok()?;
                 let k = NodePublic::from_bytes(hh.peer_static_public);
-                if pkt.peer.is_some_and(|expected| expected != k) {
-                    return None;
-                }
-                if let Some(p) = self.peer(&k) {
-                    return Some(p);
-                }
-                let cfg = self.peer_config.as_ref()?(&k)?;
-                debug!(peer = %k.short_string(), "wg: adding peer on handshake");
-                return Some(self.insert_locked(&mut self.peers.lock().unwrap(), k, cfg));
+                return if sent_by(k) { self.peer_or_add(k) } else { None };
             }
             Packet::HandshakeResponse(r) => r.receiver_idx,
             Packet::PacketCookieReply(r) => r.receiver_idx,
             Packet::PacketData(d) => d.receiver_idx,
         };
-        self.peers.lock().unwrap().by_index.get(&(idx >> 8)).cloned()
+        let p = self.peers.lock().unwrap().by_index.get(&(idx >> 8)).cloned()?;
+        sent_by(p.key).then_some(p)
+    }
+
+    /// The peer with key `k`, else a new one if the `peer_config` hook
+    /// has a configuration for it.
+    fn peer_or_add(&self, k: NodePublic) -> Option<Arc<WgPeer>> {
+        if let Some(p) = self.peer(&k) {
+            return Some(p);
+        }
+        // The hook runs unlocked, since it may take a while. If the owner
+        // adds the peer meanwhile, its configuration wins.
+        let cfg = self.peer_config.as_ref()?(&k)?;
+        let mut peers = self.peers.lock().unwrap();
+        if let Some(p) = peers.by_key.get(&k) {
+            return Some(p.clone());
+        }
+        debug!(peer = %k.short_string(), "wg: adding peer on handshake");
+        Some(self.insert_locked(&mut peers, k, cfg))
     }
 
     async fn handle(&self, pkt: WireguardPacket) {
@@ -375,7 +391,10 @@ mod tests {
     use crate::derp::server::DevDerp;
     use crate::derpmap::DerpMap;
     use crate::magicsock;
+    use hegel::TestCase;
+    use hegel::generators as gs;
     use std::net::Ipv4Addr;
+    use std::sync::OnceLock;
 
     #[test]
     fn ipnet_contains() {
@@ -520,5 +539,91 @@ mod tests {
         let got = recv(&mut server).await;
         assert_eq!(got.peer, client.key.public());
         assert!(server.engine.peer(&client.key.public()).is_some());
+    }
+
+    /// An engine on a magicsock with no network, for driving `identify`.
+    fn offline(peer_config: Option<PeerConfigFn>) -> (Arc<Engine>, NodePrivate) {
+        let key = NodePrivate::generate();
+        let (ms, wg_rx) = MagicSock::offline(key.clone(), true);
+        let (engine, _) = Engine::start(&key, ms, wg_rx, peer_config, None);
+        (engine, key)
+    }
+
+    /// A handshake initiation from `from` to `to`.
+    fn handshake_init(from: &NodePrivate, to: &NodePublic) -> Vec<u8> {
+        let mut t = Tunn::new(from.x25519(), to.x25519(), None, None, 1, None);
+        let mut buf = vec![0u8; 256];
+        match t.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(b) => b.to_vec(),
+            _ => panic!("no handshake initiation"),
+        }
+    }
+
+    /// A handshake response (type 2), cookie reply (3) or data packet (4)
+    /// addressed to our session `index`, with zeros for its contents.
+    fn addressed_to(kind: u8, index: u32) -> Vec<u8> {
+        let (len, at) = match kind {
+            2 => (92, 8),
+            3 => (64, 4),
+            _ => (32, 4),
+        };
+        let mut p = vec![0u8; len];
+        p[0] = kind;
+        p[at..at + 4].copy_from_slice(&(index << 8 | 1).to_le_bytes());
+        p
+    }
+
+    /// Packets are attributed to the peer whose session they're addressed
+    /// to, or whose static key signs the handshake, whatever peer
+    /// magicsock guessed from a UDP source address; a peer can advertise
+    /// another's address as its own. Over DERP, where the relay vouches
+    /// for the sender, a packet claiming to be from anyone else is dropped.
+    #[hegel::test(test_cases = 100)]
+    fn identifies_senders_by_session_or_static_key(tc: TestCase) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+        let (engine, key) = offline(None);
+        let peers = [NodePrivate::generate(), NodePrivate::generate()];
+        for (i, p) in peers.iter().enumerate() {
+            engine.upsert_peer(p.public(), allow(Ipv4Addr::new(10, 0, 0, i as u8 + 2)));
+        }
+        let stranger = NodePrivate::generate().public();
+        let sender = tc.draw(gs::integers::<usize>().max_value(1));
+        let label = tc.draw(gs::integers::<usize>().max_value(3));
+        let over_derp = tc.draw(gs::booleans());
+        let kind = tc.draw(gs::integers::<u8>().min_value(1).max_value(4));
+        let sender = &peers[sender];
+        let label = [None, Some(peers[0].public()), Some(peers[1].public()), Some(stranger)][label];
+        let data = match kind {
+            1 => handshake_init(sender, &key.public()),
+            kind => addressed_to(kind, engine.peer(&sender.public()).unwrap().index),
+        };
+        let src = if over_derp { PathAddr::Derp(1) } else { PathAddr::Udp("192.0.2.1:41641".parse().unwrap()) };
+        let got = engine.identify(&WireguardPacket { peer: label, src, data }).map(|p| p.key);
+        let want = (!over_derp || label == Some(sender.public())).then_some(sender.public());
+        assert_eq!(got, want);
+    }
+
+    /// The owner configuring a peer while its handshake is being looked
+    /// up wins over the lookup hook's configuration.
+    #[tokio::test]
+    async fn owner_config_wins_over_a_racing_lookup() {
+        let engine_slot: Arc<OnceLock<Weak<Engine>>> = Arc::default();
+        let slot = engine_slot.clone();
+        let lookup: PeerConfigFn = Arc::new(move |k| {
+            slot.get()?.upgrade()?.upsert_peer(*k, allow(Ipv4Addr::new(10, 0, 0, 2)));
+            Some(allow(Ipv4Addr::new(10, 0, 0, 99)))
+        });
+        let (engine, key) = offline(Some(lookup));
+        engine_slot.set(Arc::downgrade(&engine)).unwrap();
+        let client = NodePrivate::generate();
+        let pkt = WireguardPacket {
+            peer: None,
+            src: PathAddr::Udp("192.0.2.1:41641".parse().unwrap()),
+            data: handshake_init(&client, &key.public()),
+        };
+        let p = engine.identify(&pkt).expect("handshake from a peer the hook knows");
+        assert!(Arc::ptr_eq(&p, &engine.peer(&client.public()).unwrap()), "identified a replaced peer");
+        assert!(p.allows(Ipv4Addr::new(10, 0, 0, 2).into()), "the owner's configuration was overwritten");
     }
 }
