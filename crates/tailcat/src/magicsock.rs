@@ -12,6 +12,7 @@
 //! settle on the same path.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -65,7 +66,9 @@ impl std::fmt::Display for PathAddr {
 /// A WireGuard packet received from the network.
 #[derive(Debug)]
 pub struct WireguardPacket {
-    /// The sending peer, if known from the path (always for DERP).
+    /// The sending peer, if known from the path: always for DERP, where
+    /// the relay vouches for it, and for UDP from an address the peer has
+    /// sent disco messages from (which doesn't prove who sent this one).
     pub peer: Option<NodePublic>,
     pub src: PathAddr,
     pub data: Vec<u8>,
@@ -143,6 +146,8 @@ struct Peer {
     shared: Arc<DiscoShared>,
     /// Candidate endpoints, and when each was last pinged.
     candidates: HashMap<SocketAddr, Option<Instant>>,
+    /// The endpoints in the peer's latest CallMeMaybe.
+    advertised: Vec<SocketAddr>,
     best: Option<(SocketAddr, Duration)>,
     trust_until: Option<Instant>,
     last_send: Option<Instant>,
@@ -160,6 +165,7 @@ impl Peer {
             cfg,
             shared,
             candidates: HashMap::new(),
+            advertised: Vec::new(),
             best: None,
             trust_until: None,
             last_send: None,
@@ -178,6 +184,14 @@ impl Peer {
     fn derp_region(&self) -> i32 {
         if self.cfg.home_region != 0 { self.cfg.home_region } else { self.derp_seen.unwrap_or(0) }
     }
+
+    /// Drops candidate `a` unless the config lists it or the peer still
+    /// advertises it.
+    fn forget_candidate(&mut self, a: &SocketAddr) {
+        if !self.cfg.endpoints.contains(a) && !self.advertised.contains(a) {
+            self.candidates.remove(a);
+        }
+    }
 }
 
 struct PendingPing {
@@ -192,7 +206,10 @@ struct PendingPing {
 #[derive(Default)]
 struct Inner {
     peers: HashMap<NodePublic, Peer>,
+    /// A peer holding each disco key. Peers normally have their own, but
+    /// nothing stops two claiming the same one.
     by_disco: HashMap<DiscoPublic, NodePublic>,
+    /// The peer each UDP address last sent us a disco message for.
     by_addr: HashMap<SocketAddr, NodePublic>,
     derp: HashMap<i32, DerpClient>,
     derp_map: DerpMap,
@@ -206,6 +223,20 @@ struct Inner {
     stun_endpoints: Vec<SocketAddr>,
     endpoints: Vec<SocketAddr>,
     closed: bool,
+}
+
+impl Inner {
+    /// Unindexes disco key `d` from `key`, which no longer holds it,
+    /// indexing it to another peer holding it instead, if any.
+    fn unindex_disco(&mut self, d: &DiscoPublic, key: &NodePublic) {
+        if self.by_disco.get(d) != Some(key) {
+            return;
+        }
+        match self.peers.iter().find(|(_, p)| p.cfg.disco_key == *d) {
+            Some((k, _)) => self.by_disco.insert(*d, *k),
+            None => self.by_disco.remove(d),
+        };
+    }
 }
 
 /// The path manager. Create it with [`MagicSock::start`].
@@ -327,25 +358,32 @@ impl MagicSock {
         let inner = &mut *guard;
         self.ensure_derp_locked(inner, cfg.home_region);
         let key = cfg.node_key;
+        let disco_key = cfg.disco_key;
         let shared = || Arc::new(self.disco_private.shared(&cfg.disco_key));
         let p = inner.peers.entry(key).or_insert_with(|| Peer::new(cfg.clone(), shared()));
         if p.cfg.disco_key != cfg.disco_key {
-            inner.by_disco.remove(&p.cfg.disco_key);
             p.shared = shared();
         }
-        inner.by_disco.insert(cfg.disco_key, key);
+        // Configured endpoints are only candidates: until a disco message
+        // comes from one, it might be anyone's.
         for ep in &cfg.endpoints {
-            inner.by_addr.insert(*ep, key);
             p.candidates.entry(*ep).or_default();
         }
-        p.cfg = cfg;
+        let old = std::mem::replace(&mut p.cfg, cfg);
+        for ep in &old.endpoints {
+            p.forget_candidate(ep);
+        }
+        if old.disco_key != disco_key {
+            inner.unindex_disco(&old.disco_key, &key);
+        }
+        inner.by_disco.insert(disco_key, key);
     }
 
     /// Forgets a peer. It reports whether the peer was known.
     pub fn remove_peer(&self, key: &NodePublic) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(p) = inner.peers.remove(key) else { return false };
-        inner.by_disco.remove(&p.cfg.disco_key);
+        inner.unindex_disco(&p.cfg.disco_key, key);
         inner.by_addr.retain(|_, k| k != key);
         inner.pending.retain(|_, pp| pp.peer != *key);
         true
@@ -512,8 +550,10 @@ impl MagicSock {
     ) {
         let tx_id: TxId = rand::thread_rng().r#gen();
         inner.pending.insert(tx_id, PendingPing { peer: *peer, to, sent: now, waiter });
-        if let (PathAddr::Udp(a), Some(p)) = (to, inner.peers.get_mut(peer)) {
-            p.candidates.insert(a, Some(now));
+        if let (PathAddr::Udp(a), Some(p)) = (to, inner.peers.get_mut(peer))
+            && let Some(last_ping) = p.candidates.get_mut(&a)
+        {
+            *last_ping = Some(now);
         }
         let msg = Message::Ping { tx_id, node_key: Some(self.public_key), padding: 0 };
         self.send_disco(inner, peer, to, &msg);
@@ -559,14 +599,14 @@ impl MagicSock {
         let Some(sender) = disco::source(pkt) else { return };
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let Some(peer_key) = inner.by_disco.get(&sender).copied() else {
+        // Over DERP the relay vouches for the sender's node key.
+        let Some(mut peer_key) = derp_src.or_else(|| inner.by_disco.get(&sender).copied()) else {
             trace!(disco = %sender.short_string(), "magicsock: disco from unknown key");
             return;
         };
-        if let Some(d) = derp_src
-            && d != peer_key
-        {
-            trace!("magicsock: disco key/node key mismatch over DERP");
+        let holds = |inner: &Inner, k: &NodePublic| inner.peers.get(k).is_some_and(|p| p.cfg.disco_key == sender);
+        if !holds(&inner, &peer_key) {
+            trace!("magicsock: disco key/node key mismatch");
             return;
         }
         let shared = inner.peers[&peer_key].shared.clone();
@@ -574,6 +614,18 @@ impl MagicSock {
             trace!("magicsock: disco box didn't open");
             return;
         };
+        if derp_src.is_none() {
+            // Over UDP, peers sharing the disco key are told apart by the
+            // node key in a ping, or the peer a pong's ping went to.
+            let named = match &msg {
+                Message::Ping { node_key, .. } => *node_key,
+                Message::Pong { tx_id, .. } => inner.pending.get(tx_id).map(|pp| pp.peer),
+                Message::CallMeMaybe { .. } => None,
+            };
+            if let Some(k) = named.filter(|k| holds(&inner, k)) {
+                peer_key = k;
+            }
+        }
         if crate::verbose() {
             debug!(peer = %peer_key.short_string(), %src, "magicsock: disco recv {}", msg.summary());
         }
@@ -583,7 +635,7 @@ impl MagicSock {
                     PathAddr::Udp(a) => {
                         inner.by_addr.insert(a, peer_key);
                         let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                        if p.candidates.get(&a).copied().flatten().is_none_or(|t| now - t >= DISCO_PING_INTERVAL) {
+                        if p.candidates.entry(a).or_default().is_none_or(|t| now - t >= DISCO_PING_INTERVAL) {
                             // Ping back: it both verifies the path for our
                             // side and helps punch through the NAT.
                             self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(a), now, None);
@@ -598,10 +650,10 @@ impl MagicSock {
                 self.send_disco(&mut inner, &peer_key, src, &Message::Pong { tx_id, src: pong_src });
             }
             Message::Pong { tx_id, .. } => {
-                let Some(pp) = inner.pending.remove(&tx_id) else { return };
-                if pp.peer != peer_key {
-                    return;
-                }
+                let pp = match inner.pending.entry(tx_id) {
+                    Entry::Occupied(e) if e.get().peer == peer_key => e.remove(),
+                    _ => return,
+                };
                 let latency = now - pp.sent;
                 if let Some(w) = &pp.waiter {
                     let _ = w.try_send(PingResult { latency, via: src });
@@ -629,11 +681,22 @@ impl MagicSock {
                 if !self.enable_udp {
                     return;
                 }
+                // The endpoints are only the peer's claims (they might be
+                // another peer's), so they replace its earlier claims as
+                // candidates, and a pong from one maps it to the peer.
+                let endpoints: Vec<SocketAddr> = endpoints
+                    .into_iter()
+                    .filter(|e| !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()))
+                    .collect();
+                let p = inner.peers.get_mut(&peer_key).expect("known peer");
+                for e in std::mem::replace(&mut p.advertised, endpoints.clone()) {
+                    p.forget_candidate(&e);
+                }
+                for e in &endpoints {
+                    p.candidates.entry(*e).or_default();
+                }
                 for e in endpoints {
-                    if !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()) {
-                        inner.by_addr.insert(e, peer_key);
-                        self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(e), now, None);
-                    }
+                    self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(e), now, None);
                 }
             }
         }
@@ -798,6 +861,34 @@ impl Drop for MagicSock {
     }
 }
 
+#[cfg(test)]
+impl MagicSock {
+    /// A magicsock with no sockets, relays or background tasks, whose
+    /// state tests drive by calling its handlers directly.
+    pub(crate) fn offline(key: NodePrivate, enable_udp: bool) -> (Arc<MagicSock>, mpsc::Receiver<WireguardPacket>) {
+        let (wg_tx, wg_rx) = mpsc::channel(1024);
+        let disco_private = key.disco_private();
+        let ms = MagicSock {
+            public_key: key.public(),
+            disco_public: disco_private.public(),
+            disco_private,
+            private_key: key,
+            home_region: 1,
+            app_name: "test".into(),
+            enable_udp,
+            endpoint_filter: None,
+            on_derp_recv: None,
+            udp4: None,
+            udp6: None,
+            inner: Mutex::default(),
+            wg_tx,
+            derp_tx: mpsc::channel(1).0,
+            tasks: Mutex::default(),
+        };
+        (Arc::new(ms), wg_rx)
+    }
+}
+
 fn is_tailscale_ula(v6: &std::net::Ipv6Addr) -> bool {
     let o = v6.octets();
     o[..6] == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
@@ -878,6 +969,9 @@ async fn endpoint_loop(ms: Weak<MagicSock>) {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
+
+#[cfg(test)]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {
