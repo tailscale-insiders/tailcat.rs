@@ -20,6 +20,9 @@ attempt=${GITHUB_RUN_ATTEMPT:-1}
 case ${1:-} in
 start)
 	dev=${2:?} nodes=${3:?}
+	# A ready file from an earlier node would pass the check below before
+	# this one is up.
+	sudo rm -f "$state/ready" "$state/status.json"
 	sudo -E nohup "$dev" up --key tailcat-device.key --github --nodes "$nodes" --wait 8m \
 		--tun tcmesh0 --status-file "$state/status.json" --ready-file "$state/ready" --status-interval 10s \
 		>"$state/node.log" 2>&1 &

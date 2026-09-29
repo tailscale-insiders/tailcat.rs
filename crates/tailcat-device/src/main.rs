@@ -4,6 +4,7 @@
 //!     tailcat-device up --records ./records --nodes 5
 //!     tailcat-device up --github --nodes 5           # records from run artifacts
 
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,7 +19,7 @@ use tailcat_device::github::{self, GithubEnv, Scope};
 use tailcat_device::record::{self, DeviceKey, NodeRecord};
 use tailcat_device::source::{GithubSource, Source};
 use tailcat_device::{Overlay, OverlayConfig};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -176,6 +177,9 @@ fn main() -> ExitCode {
             }
         }
     });
+    // Dropping the runtime would wait for blocking tasks, such as a DNS
+    // lookup for a DERP server that isn't answering.
+    rt.shutdown_timeout(Duration::from_secs(1));
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -192,6 +196,7 @@ async fn fetch_map(url: &str) -> Result<DerpMap> {
 }
 
 async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
+    // Fail early; saving the key checks again.
     ensure!(a.force || !a.key.exists(), "{} already exists; use --force to overwrite", a.key.display());
     let private = NodePrivate::generate();
     let overlay_ip = match a.ip {
@@ -221,14 +226,58 @@ async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
     }
     let out = a.out.unwrap_or_else(|| format!("node-{}-{}.json", a.attempt, a.index).into());
     let k = DeviceKey { private, record };
-    k.save(&a.key)?;
-    k.record.write(&out)?;
+    k.save(&a.key, a.force)?;
+    if let Err(e) = k.record.write(&out) {
+        // Without its record the key is no use; don't make the next try
+        // need --force.
+        let _ = std::fs::remove_file(&a.key);
+        return Err(e);
+    }
     eprintln!("# wrote key to {} and record to {}", a.key.display(), out.display());
     println!("{}", out.display());
     Ok(())
 }
 
 async fn up(derpmap_url: &str, a: UpArgs) -> Result<()> {
+    // Handle signals from the start, not from the first time something
+    // waits on them.
+    let signal = shutdown_signal()?;
+    // A ready file left by an earlier run would say we're ready too soon.
+    let ready_file = a.ready_file.clone();
+    let remove_ready = || match &ready_file {
+        Some(f) => match std::fs::remove_file(f) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context(format!("removing {}", f.display())),
+            _ => Ok(()),
+        },
+        None => Ok(()),
+    };
+    remove_ready()?;
+    let res = tokio::select! {
+        r = serve(derpmap_url, a) => r,
+        () = signal => {
+            info!("overlay: shutting down");
+            Ok(())
+        }
+    };
+    if let Err(e) = remove_ready() {
+        warn!("{e:#}");
+    }
+    res
+}
+
+/// Closes the overlay when `serve` ends or is cancelled: the packet loop
+/// holds a reference too, so dropping ours isn't enough.
+struct CloseOnDrop(Arc<Overlay>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// Runs the node until the packet loop fails or the peers don't all
+/// appear in time; `up` cancels it on a signal.
+async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
     let k = DeviceKey::load(&a.key)?;
     let mut source = if a.github {
         let env = GithubEnv::from_env()?;
@@ -255,90 +304,108 @@ async fn up(derpmap_url: &str, a: UpArgs) -> Result<()> {
         enable_udp: !a.no_udp,
     })
     .await?;
+    let _close = CloseOnDrop(overlay.clone());
     if !overlay.wait_derp(Duration::from_secs(15)).await {
         warn!("not yet connected to the home DERP region; continuing");
     }
     let me = overlay.record();
     let dev = open_tun(a.tun.as_deref(), me, &a.overlay_prefix, a.mtu)?;
-    let mut runner = tokio::spawn(overlay.clone().run(dev));
+    let runner = tokio::spawn(overlay.clone().run(dev));
     info!("overlay: {} is node {} at {}", me.nodekey, me.index, me.overlay_ip);
 
     let expected = a.nodes.map(|n| n.saturating_sub(1));
-    let deadline = Instant::now() + a.wait;
-    let mut last_status = Instant::now();
-    let mut last_poll: Option<Instant> = None;
-    let mut ready = false;
     // Poll quickly while nodes are joining, then back off: the GitHub API
     // is rate-limited per repository.
     let settled_poll = Duration::from_secs(if a.github { 30 } else { 5 });
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
-    loop {
-        let joining = !ready || expected.is_some_and(|n| overlay.peer_count() < n);
-        let poll_every = if joining { Duration::from_secs(2) } else { settled_poll };
-        if last_poll.is_none_or(|t| t.elapsed() >= poll_every) {
-            last_poll = Some(Instant::now());
-            match source.poll().await {
-                Ok(recs) => {
-                    for r in &recs {
-                        if r.derp.is_none() && dm.regions.is_empty() {
-                            dm = fetch_map(derpmap_url).await?;
+    let membership = async {
+        let mut last_poll: Option<Instant> = None;
+        let mut ready = false;
+        loop {
+            let joining = !ready || expected.is_some_and(|n| overlay.peer_count() < n);
+            let poll_every = if joining { Duration::from_secs(2) } else { settled_poll };
+            if last_poll.is_none_or(|t| t.elapsed() >= poll_every) {
+                last_poll = Some(Instant::now());
+                match source.poll().await {
+                    Ok(recs) => {
+                        if dm.regions.is_empty() && recs.iter().any(|r| r.derp.is_none()) {
+                            match fetch_map(derpmap_url).await {
+                                Ok(m) => dm = m,
+                                Err(e) => warn!("{e:#}; retrying next poll"),
+                            }
                         }
-                        if let Err(e) = overlay.add_peer(r, &dm) {
-                            warn!("{e:#}");
-                        }
+                        overlay.sync(&recs, &dm);
                     }
+                    Err(e) => warn!("polling records: {e:#}"),
                 }
-                Err(e) => warn!("polling records: {e:#}"),
             }
-        }
-        if let Some(n) = expected {
-            let have = overlay.peer_count();
-            ensure!(
-                have >= n || Instant::now() <= deadline,
-                "only {have} of {n} peers appeared within {}s",
-                a.wait.as_secs()
-            );
-            if have >= n && !ready && all_reachable(&overlay).await {
+            if let Some(n) = expected
+                && !ready
+                && overlay.peer_count() >= n
+                && all_reachable(&overlay).await
+            {
                 ready = true;
                 info!("overlay: all {n} peers reachable");
-                if let Some(f) = &a.ready_file {
-                    std::fs::write(f, b"ready\n")?;
+                if let Some(f) = &a.ready_file
+                    && let Err(e) = record::write_atomic(f, b"ready\n")
+                {
+                    warn!("{e:#}");
                 }
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        if last_status.elapsed() >= a.status_interval {
-            last_status = Instant::now();
-            log_status(&overlay);
-        }
-        if let Some(f) = &a.status_file {
-            let _ = std::fs::write(f, serde_json::to_vec_pretty(&overlay.status())?);
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-            _ = &mut signal => {
-                info!("overlay: shutting down");
-                overlay.close();
-                return Ok(());
+    };
+    // Status is written on its own schedule, not held up by slow polls.
+    let status = async {
+        let mut last_log = Instant::now();
+        loop {
+            if last_log.elapsed() >= a.status_interval {
+                last_log = Instant::now();
+                log_status(&overlay);
             }
-            r = &mut runner => {
-                return Err(match r {
-                    Ok(Ok(())) => anyhow!("the packet loop stopped"),
-                    Ok(Err(e)) => e,
-                    Err(e) => anyhow!("the packet loop panicked: {e}"),
-                });
+            if let Some(f) = &a.status_file {
+                let j = serde_json::to_vec_pretty(&overlay.status()).expect("status serializes");
+                if let Err(e) = record::write_atomic(f, &j) {
+                    debug!("{e:#}");
+                }
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
+    };
+    let deadline = async {
+        let Some(n) = expected else { return std::future::pending().await };
+        tokio::time::sleep(a.wait).await;
+        let have = overlay.peer_count();
+        if have >= n {
+            return std::future::pending().await;
+        }
+        anyhow!("only {have} of {n} peers appeared within {}s", a.wait.as_secs())
+    };
+    tokio::select! {
+        r = runner => Err(match r {
+            Ok(Ok(())) => anyhow!("the packet loop stopped"),
+            Ok(Err(e)) => e,
+            Err(e) => anyhow!("the packet loop panicked: {e}"),
+        }),
+        e = deadline => Err(e),
+        _ = membership => unreachable!(),
+        _ = status => unreachable!(),
     }
 }
 
-/// Pings every peer once, driving path discovery; true if all answer.
-async fn all_reachable(o: &Overlay) -> bool {
-    let mut ok = true;
+/// Pings every peer at once, driving path discovery; true if all answer.
+async fn all_reachable(o: &Arc<Overlay>) -> bool {
+    let mut pings = tokio::task::JoinSet::new();
     for p in o.status() {
-        match o.ping(&p.nodekey, Duration::from_secs(3)).await {
-            Ok(r) => info!(peer = p.index, "overlay: pong from {} in {:?} via {}", p.overlay_ip, r.latency, r.via),
-            Err(_) => ok = false,
+        let o = o.clone();
+        pings.spawn(async move { (o.ping(&p.nodekey, Duration::from_secs(3)).await, p) });
+    }
+    let mut ok = true;
+    while let Some(res) = pings.join_next().await {
+        match res {
+            Ok((Ok(r), p)) => {
+                info!(peer = p.index, "overlay: pong from {} in {:?} via {}", p.overlay_ip, r.latency, r.via)
+            }
+            _ => ok = false,
         }
     }
     ok
@@ -377,19 +444,27 @@ fn open_tun(name: Option<&str>, me: &NodeRecord, prefix: &IpNet, mtu: u16) -> Re
     Ok(Arc::new(dev))
 }
 
-async fn shutdown_signal() {
+/// Resolves on SIGINT or SIGTERM. The handlers are installed now, before
+/// the returned future is first polled.
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     #[cfg(unix)]
     {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+        let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+        Ok(async move {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
+            }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
+        Ok(async move {
+            let _ = ctrl_c.await;
+        })
     }
 }
 

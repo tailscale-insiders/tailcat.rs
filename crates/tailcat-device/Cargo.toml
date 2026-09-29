@@ -29,6 +29,7 @@ tun-rs.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+hegeltest = { version = "0.48", features = ["static-engine"] }
 rand.workspace = true
 rsa = "0.9"
 tempfile = "3"

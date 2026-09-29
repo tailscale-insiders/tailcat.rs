@@ -14,19 +14,21 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
 use tailcat::magicsock::{self, MagicSock, PeerPath};
 use tailcat::wg::{self, Engine, InboundPacket, IpNet};
-use tailcat::{DerpMap, NodePublic, PresharedKey};
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tailcat::{DerpMap, DerpRegion, NodePublic, PresharedKey};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
 
+use crate::reconcile::{Change, reconcile};
 use crate::record::{DeviceKey, NodeRecord};
 
 /// Something that carries raw IP packets: a TUN device, or a channel in
 /// tests.
 pub trait PacketDevice: Send + Sync + 'static {
+    /// Reads a packet. Reading nothing means the device is closed.
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
     fn send(&self, pkt: &[u8]) -> impl Future<Output = io::Result<usize>> + Send;
 }
@@ -71,19 +73,50 @@ pub struct PeerStatus {
     pub rx_bytes: usize,
 }
 
+/// Embedded DERP regions get local IDs from here up. The IDs they carry
+/// can't be trusted to be unique: every `init --region host,...` region
+/// is 900, and every `tailcat dev-derp --region-file` region is 1, the
+/// same as a region of the public DERP map.
+pub const EMBEDDED_REGION_BASE: i32 = 1_000_000;
+
 /// A running overlay node.
 pub struct Overlay {
     me: NodeRecord,
     ms: Arc<MagicSock>,
     engine: Arc<Engine>,
-    peers: Mutex<HashMap<NodePublic, NodeRecord>>,
+    /// Held across updates to magicsock and the engine, so they always
+    /// know the same peers.
+    state: Mutex<State>,
     inbound: Mutex<Option<mpsc::Receiver<InboundPacket>>>,
+    closed: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct State {
+    peers: HashMap<NodePublic, NodeRecord>,
+    /// Distinct embedded regions (with their IDs zeroed), each known by
+    /// `EMBEDDED_REGION_BASE` plus its position.
+    embedded: Vec<DerpRegion>,
+}
+
+impl State {
+    /// A record's home region: from `dm`, or embedded under a local ID.
+    fn region(&mut self, r: &NodeRecord, dm: &DerpMap) -> Option<DerpRegion> {
+        let Some(e) = &r.derp else { return dm.regions.get(&r.derp_region).cloned() };
+        let e = DerpRegion { region_id: 0, ..e.clone() };
+        let i = self.embedded.iter().position(|x| *x == e).unwrap_or_else(|| {
+            self.embedded.push(e.clone());
+            self.embedded.len() - 1
+        });
+        Some(DerpRegion { region_id: EMBEDDED_REGION_BASE + i as i32, ..e })
+    }
 }
 
 impl Overlay {
     /// Starts the node: connects to its home DERP region and brings up
-    /// the WireGuard engine. Peers are added with [`Overlay::add_peer`]
-    /// and packets flow once [`Overlay::run`] is given a device.
+    /// the WireGuard engine. Peers are added with [`Overlay::sync`] or
+    /// [`Overlay::add_peer`], and packets flow once [`Overlay::run`] is
+    /// given a device.
     pub async fn start(cfg: OverlayConfig) -> Result<Arc<Overlay>> {
         let OverlayConfig {
             key: DeviceKey { private, record: me },
@@ -92,8 +125,9 @@ impl Overlay {
             overlay_prefix,
             enable_udp,
         } = cfg;
-        let home = me
-            .home_region(&derp_map)
+        let mut state = State::default();
+        let home = state
+            .region(&me, &derp_map)
             .ok_or_else(|| anyhow!("home DERP region {} is not in the DERP map", me.derp_region))?;
         let home_region = home.region_id;
         derp_map.regions.insert(home_region, home);
@@ -111,7 +145,14 @@ impl Overlay {
         .context("starting magicsock")?;
         let (engine, inbound) = Engine::start(&private, ms.clone(), wg_rx, None, None);
         info!(overlay_ip = %me.overlay_ip, region = home_region, "overlay: node {} up as {}", me.index, me.nodekey.short_string());
-        Ok(Arc::new(Overlay { me, ms, engine, peers: Mutex::default(), inbound: Mutex::new(Some(inbound)) }))
+        Ok(Arc::new(Overlay {
+            me,
+            ms,
+            engine,
+            state: Mutex::new(state),
+            inbound: Mutex::new(Some(inbound)),
+            closed: watch::Sender::new(false),
+        }))
     }
 
     /// This node's record.
@@ -129,77 +170,115 @@ impl Overlay {
         self.ms.wait_derp_connected(timeout).await
     }
 
-    /// Adds or updates a peer from its record. Our own record is ignored.
-    /// It reports whether the peer was new.
+    /// The WireGuard engine, for diagnostics.
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
+    /// Brings the peers in line with a poll of every record, as
+    /// [`reconcile`] decides: one peer per overlay address, chosen the
+    /// same way however often and in whatever order records are polled.
+    /// Records whose home region isn't known are skipped.
+    pub fn sync(&self, polled: &[NodeRecord], dm: &DerpMap) {
+        let mut st = self.state.lock().unwrap();
+        let usable: Vec<NodeRecord> = polled
+            .iter()
+            .filter(|r| {
+                let ok = r.nodekey == self.me.nodekey || st.region(r, dm).is_some();
+                if !ok {
+                    warn!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region);
+                }
+                ok
+            })
+            .cloned()
+            .collect();
+        let changes = reconcile(&self.me, &st.peers, &usable);
+        for c in changes {
+            self.apply_locked(&mut st, c, dm);
+        }
+    }
+
+    /// Adds or updates a peer from its record, taking over its overlay
+    /// address from any other peer. Our own record is ignored. It
+    /// reports whether the peer was new.
     pub fn add_peer(&self, r: &NodeRecord, dm: &DerpMap) -> Result<bool> {
         if r.nodekey == self.me.nodekey {
             return Ok(false);
         }
-        let region = r
-            .home_region(dm)
+        ensure!(r.overlay_ip != self.me.overlay_ip, "peer {}: claims our overlay IP {}", r.index, r.overlay_ip);
+        let mut st = self.state.lock().unwrap();
+        st.region(r, dm)
             .ok_or_else(|| anyhow!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region))?;
-        let home_region = region.region_id;
-        self.ms.add_region(region);
-        let new = {
-            let mut peers = self.peers.lock().unwrap();
-            if peers.get(&r.nodekey) == Some(r) {
-                return Ok(false);
-            }
-            // An address may only belong to one peer.
-            for (k, _) in peers.extract_if(|k, p| p.overlay_ip == r.overlay_ip && *k != r.nodekey) {
-                self.forget(&k);
-            }
-            peers.insert(r.nodekey, r.clone()).is_none()
-        };
-        self.ms.upsert_peer(magicsock::PeerConfig {
-            node_key: r.nodekey,
-            disco_key: r.discokey,
-            home_region,
-            endpoints: r.endpoints.clone(),
-        });
-        self.engine.upsert_peer(
-            r.nodekey,
-            wg::PeerConfig {
-                allowed_ips: r.allowed_ips(),
-                preshared_key: PresharedKey::default(),
-                persistent_keepalive: None,
-            },
-        );
-        if new {
-            info!(peer = r.index, overlay_ip = %r.overlay_ip, "overlay: added peer {}", r.nodekey.short_string());
-            self.ms.send_call_me_maybe(&r.nodekey);
+        let new = !st.peers.contains_key(&r.nodekey);
+        let changes = reconcile(&self.me, &st.peers, std::slice::from_ref(r));
+        for c in changes {
+            self.apply_locked(&mut st, c, dm);
         }
-        Ok(new)
+        Ok(new && st.peers.contains_key(&r.nodekey))
+    }
+
+    fn apply_locked(&self, st: &mut State, c: Change, dm: &DerpMap) {
+        match c {
+            Change::Upsert(r) => {
+                // Upserted records passed the region check.
+                let Some(region) = st.region(&r, dm) else { return };
+                let home_region = region.region_id;
+                self.ms.add_region(region);
+                self.ms.upsert_peer(magicsock::PeerConfig {
+                    node_key: r.nodekey,
+                    disco_key: r.discokey,
+                    home_region,
+                    endpoints: r.endpoints.clone(),
+                });
+                self.engine.upsert_peer(
+                    r.nodekey,
+                    wg::PeerConfig {
+                        allowed_ips: r.allowed_ips(),
+                        preshared_key: PresharedKey::default(),
+                        persistent_keepalive: None,
+                    },
+                );
+                let (k, index, ip) = (r.nodekey, r.index, r.overlay_ip);
+                if st.peers.insert(k, r).is_none() {
+                    info!(peer = index, overlay_ip = %ip, "overlay: added peer {}", k.short_string());
+                    self.ms.send_call_me_maybe(&k);
+                }
+            }
+            Change::Remove(k) => {
+                if let Some(r) = st.peers.remove(&k) {
+                    info!(peer = r.index, overlay_ip = %r.overlay_ip, "overlay: removed peer {}", k.short_string());
+                }
+                self.engine.remove_peer(&k);
+                self.ms.remove_peer(&k);
+            }
+        }
     }
 
     /// Removes a peer.
     pub fn remove_peer(&self, k: &NodePublic) -> bool {
-        let removed = self.peers.lock().unwrap().remove(k).is_some();
-        if removed {
-            self.forget(k);
+        let mut st = self.state.lock().unwrap();
+        let known = st.peers.contains_key(k);
+        if known {
+            self.apply_locked(&mut st, Change::Remove(*k), &DerpMap::default());
         }
-        removed
-    }
-
-    fn forget(&self, k: &NodePublic) {
-        self.engine.remove_peer(k);
-        self.ms.remove_peer(k);
+        known
     }
 
     /// The number of peers.
     pub fn peer_count(&self) -> usize {
-        self.peers.lock().unwrap().len()
+        self.state.lock().unwrap().peers.len()
     }
 
-    /// Carries packets between `dev` and the peers until either fails.
-    /// It can be called once.
+    /// Carries packets between `dev` and the peers until either fails or
+    /// the overlay is closed. It can be called once.
     pub async fn run<D: PacketDevice>(self: Arc<Self>, dev: Arc<D>) -> Result<()> {
         let mut inbound = self.inbound.lock().unwrap().take().ok_or_else(|| anyhow!("Overlay::run called twice"))?;
+        let mut closed = self.closed.subscribe();
         let up = async {
             let mut buf = vec![0u8; 65536];
             loop {
                 match dev.recv(&mut buf).await {
-                    Ok(0) => {}
+                    Ok(0) => return io::Error::new(io::ErrorKind::UnexpectedEof, "the device closed"),
                     Ok(n) => self.engine.send_ip(&buf[..n]),
                     Err(e) => return e,
                 }
@@ -215,15 +294,17 @@ impl Overlay {
         tokio::select! {
             e = up => Err(anyhow::Error::new(e).context("reading from the device")),
             () = down => Ok(()),
+            _ = closed.wait_for(|c| *c) => Ok(()),
         }
     }
 
     /// Returns every peer's status, ordered by index.
     pub fn status(&self) -> Vec<PeerStatus> {
         let mut out: Vec<PeerStatus> = self
-            .peers
+            .state
             .lock()
             .unwrap()
+            .peers
             .values()
             .map(|r| {
                 let path = self.ms.peer_path(&r.nodekey);
@@ -249,8 +330,9 @@ impl Overlay {
         Ok(self.ms.ping(k, timeout).await?)
     }
 
-    /// Shuts the node down.
+    /// Shuts the node down, ending [`Overlay::run`].
     pub fn close(&self) {
+        self.closed.send_replace(true);
         self.engine.close();
         self.ms.close();
     }
@@ -282,7 +364,15 @@ impl ChannelDevice {
 
 impl PacketDevice for ChannelDevice {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let p = self.rx.lock().await.recv().await.ok_or_else(closed)?;
+        let mut rx = self.rx.lock().await;
+        // An empty packet would read as the device closing.
+        let p = loop {
+            match rx.recv().await {
+                Some(p) if p.is_empty() => {}
+                Some(p) => break p,
+                None => return Err(closed()),
+            }
+        };
         let n = p.len().min(buf.len());
         buf[..n].copy_from_slice(&p[..n]);
         Ok(n)
