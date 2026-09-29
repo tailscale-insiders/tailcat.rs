@@ -65,9 +65,10 @@ where
 
 /// Copies whole datagrams between a tunnel UDP flow and a connected OS
 /// UDP socket until either side fails or `idle` passes with no traffic
-/// either way. It sets `a`'s idle timeout, which counts both.
+/// either way. It limits `a`'s idle timeout, which counts both, to
+/// `idle`, keeping a shorter one already set.
 pub async fn proxy_packet_conns(a: &UdpConn, b: &tokio::net::UdpSocket, idle: Duration) {
-    a.set_idle_timeout(Some(idle));
+    a.limit_idle_timeout(idle);
     let a_to_b = async {
         let mut buf = vec![0u8; 65535];
         while let Ok(n) = a.recv(&mut buf).await {

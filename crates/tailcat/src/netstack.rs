@@ -778,6 +778,12 @@ impl UdpConn {
         *self.idle_timeout.lock().unwrap() = d;
     }
 
+    /// Shortens the idle timeout to `d`, if it's longer or unset.
+    pub(crate) fn limit_idle_timeout(&self, d: Duration) {
+        let mut t = self.idle_timeout.lock().unwrap();
+        *t = Some(t.map_or(d, |t| t.min(d)));
+    }
+
     fn touch(&self) {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
