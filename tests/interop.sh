@@ -53,6 +53,63 @@ for c in "${impls[@]}"; do
 	stop
 done
 
+# The client exits once the server is done, even with stdin still open.
+start exec-done "$rust" serve exec -- echo done
+mkfifo "$work/open-stdin"
+sleep 120 >"$work/open-stdin" &
+holder=$!
+out=$(timeout 30 "$rust" "$addr" 7 <"$work/open-stdin" 2>"$work/client.log") && code=0 || code=$?
+kill "$holder" 2>/dev/null || true
+if [ "$code" = 0 ] && [ "$out" = done ]; then
+	pass "exec: rust client exits with stdin open"
+else
+	fail "exec: rust client exits with stdin open: exit=$code out='$out' $(tail -3 "$work/client.log")"
+fi
+stop
+
+# The one-shot server serves its first connection and refuses the rest,
+# which would otherwise interleave with it on stdout.
+start oneshot "$rust"
+mkfifo "$work/first-stdin"
+timeout 60 "$rust" "$addr" <"$work/first-stdin" >/dev/null 2>"$work/first.log" &
+first=$!
+exec 3>"$work/first-stdin"
+echo first >&3
+for _ in $(seq 150); do
+	grep -qx first "$work/oneshot.out" && break
+	sleep 0.1
+done
+if echo second | timeout 30 "$rust" "$addr" >/dev/null 2>"$work/client.log"; then
+	fail "one-shot: a second connection was accepted"
+else
+	pass "one-shot: a second connection is refused"
+fi
+exec 3>&-
+wait "$first" && code=0 || code=$?
+for _ in $(seq 100); do
+	kill -0 "$server_pid" 2>/dev/null || break
+	sleep 0.1
+done
+if kill -0 "$server_pid" 2>/dev/null; then
+	fail "one-shot: server still running after its connection closed"
+	stop
+elif ! wait "$server_pid"; then
+	fail "one-shot: server failed: $(tail -3 "$work/oneshot.log")"
+elif [ "$code" = 0 ] && [ "$(cat "$work/oneshot.out")" = first ]; then
+	pass "one-shot: the first connection is served"
+else
+	fail "one-shot: the first connection is served: client exit=$code, server got '$(cat "$work/oneshot.out")'"
+fi
+
+# SIGTERM stops a server as cleanly as Ctrl-C.
+start term "$rust" serve 1
+kill -TERM "$server_pid"
+if wait "$server_pid"; then
+	pass "serve: exits cleanly on SIGTERM"
+else
+	fail "serve: exits cleanly on SIGTERM: exit=$?"
+fi
+
 # An allowlist keeps strangers out.
 "$rust" genkey --client --key="$work/allowed.private.json" >"$work/allowed.pub" 2>/dev/null
 allow=--allow=$(cat "$work/allowed.pub")

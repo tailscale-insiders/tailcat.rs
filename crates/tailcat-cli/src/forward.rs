@@ -95,7 +95,8 @@ pub async fn run_forward(g: &Global, bind: &str, addr_arg: &str, mappings: &[Str
 
 async fn forward_listener(cl: Client, ln: TcpListener, spec: ForwardSpec) {
     let spec = std::sync::Arc::new(spec);
-    while let Ok((mut conn, _)) = ln.accept().await {
+    loop {
+        let (mut conn, _) = crate::util::accept(|| ln.accept()).await;
         let _ = conn.set_nodelay(true);
         let (cl, spec) = (cl.clone(), spec.clone());
         tokio::spawn(async move {

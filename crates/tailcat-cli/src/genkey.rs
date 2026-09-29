@@ -121,8 +121,9 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Fail early, before any network work; writing checks again.
         if path.exists() && !a.force && region != "list" {
-            bail!("{} already exists; use --force to overwrite", path.display());
+            return Err(exists(&path));
         }
     }
 
@@ -131,7 +132,18 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         priv_key.public.preshared_key = PresharedKey::default();
     }
     let write = |k: &PrivateKey| -> Result<()> {
-        crate::util::write_private(&path, k.to_json_pretty().as_bytes())?;
+        let json = k.to_json_pretty();
+        // Atomically, so racing runs can't clobber each other's key and a
+        // crash can't leave a truncated one.
+        let written = if a.force {
+            crate::util::replace_private(&path, json.as_bytes())
+        } else {
+            crate::util::create_private(&path, json.as_bytes())
+        };
+        written.map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => exists(&path),
+            _ => anyhow!("writing {}: {e}", path.display()),
+        })?;
         eprintln!("# wrote file to {}", path.display());
         Ok(())
     };
@@ -199,4 +211,8 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     write(&priv_key)?;
     println!("{}", priv_key.public.addr());
     Ok(())
+}
+
+fn exists(path: &std::path::Path) -> anyhow::Error {
+    anyhow!("{} already exists; use --force to overwrite", path.display())
 }

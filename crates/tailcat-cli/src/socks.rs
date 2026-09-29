@@ -7,6 +7,7 @@
 //! through that server as an exit node.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -151,7 +152,8 @@ pub async fn socks_mode(g: &Global, listen: &str, mut args: Vec<String>) -> Resu
 }
 
 async fn serve(ln: TcpListener, dialer: Arc<Dialer>) {
-    while let Ok((c, peer)) = ln.accept().await {
+    loop {
+        let (c, peer) = crate::util::accept(|| ln.accept()).await;
         let d = dialer.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(c, d).await {
@@ -160,6 +162,11 @@ async fn serve(ln: TcpListener, dialer: Arc<Dialer>) {
         });
     }
 }
+
+/// How long to wait for a TCP connection or UDP flow to open, including
+/// resolving its destination. It's also WireGuard's handshake retransmit
+/// interval, so be generous.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const REP_SUCCESS: u8 = 0;
 const REP_HOST_UNREACHABLE: u8 = 4;
@@ -253,11 +260,7 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     };
     match cmd {
         1 => {
-            // The socks5 dial timeout is also WireGuard's handshake
-            // retransmit interval, so be generous.
-            let dial = tokio::time::timeout(Duration::from_secs(15), async {
-                d.dial_tcp(&classify(&host, port).await?).await
-            });
+            let dial = tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_tcp(&classify(&host, port).await?).await });
             let remote = match dial.await.unwrap_or_else(|_| Err(anyhow!("dial {host}:{port}: timed out"))) {
                 Ok(r) => r,
                 Err(e) => {
@@ -278,8 +281,12 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     }
 }
 
-/// Tunnel UDP flows by destination (host, port).
-type Flows = HashMap<(String, u16), Arc<tailcat::UdpConn>>;
+/// Tunnel UDP flows by destination (host, port); `None` while one is
+/// being set up.
+type Flows = HashMap<(String, u16), Option<Arc<tailcat::UdpConn>>>;
+
+/// The client's UDP address, where replies go.
+type ClientAddr = Arc<Mutex<Option<SocketAddr>>>;
 
 /// Relays datagrams between the client and tunnel UDP flows for as long
 /// as the control connection stays open.
@@ -288,45 +295,34 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     let sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     reply(&mut c, REP_SUCCESS, sock.local_addr()?).await?;
     let flows: Arc<Mutex<Flows>> = Arc::default();
-    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
-    let relay = {
-        let sock = sock.clone();
-        let flows = flows.clone();
-        async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
-                // RSV(2), FRAG(1): fragments aren't supported.
-                if n < 4 || buf[2] != 0 {
+    let client_addr: ClientAddr = Arc::default();
+    // Each flow's setup and reply relay, so they end with the association.
+    let mut flow_tasks = tokio::task::JoinSet::new();
+    let relay = async {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
+            while flow_tasks.try_join_next().is_some() {}
+            // RSV(2), FRAG(1): fragments aren't supported.
+            if n < 4 || buf[2] != 0 {
+                continue;
+            }
+            let Some((dst, payload)) = parse_addr(&buf[3..n]) else { continue };
+            *client_addr.lock().unwrap() = Some(from);
+            let flow = match flows.lock().unwrap().entry(dst.clone()) {
+                Entry::Occupied(e) => e.get().clone(),
+                Entry::Vacant(e) => {
+                    // Setting up a flow can take a DNS lookup and a tunnel
+                    // handshake; don't hold up other flows meanwhile.
+                    e.insert(None);
+                    let (d, flows, sock, ca) = (d.clone(), flows.clone(), sock.clone(), client_addr.clone());
+                    flow_tasks.spawn(udp_flow(d, dst, payload.to_vec(), flows, sock, ca));
                     continue;
                 }
-                let Some((dst, payload)) = parse_addr(&buf[3..n]) else { continue };
-                *client_addr.lock().unwrap() = Some(from);
-                let existing = flows.lock().unwrap().get(&dst).cloned();
-                let flow = match existing {
-                    Some(f) => f,
-                    None => {
-                        let Ok(t) = classify(&dst.0, dst.1).await else { continue };
-                        let Ok(f) = d.dial_udp(&t).await else { continue };
-                        let f = Arc::new(f);
-                        flows.lock().unwrap().insert(dst.clone(), f.clone());
-                        // Replies from this flow go back to the client,
-                        // wrapped with the destination's address.
-                        let (f2, sock2, ca) = (f.clone(), sock.clone(), client_addr.clone());
-                        tokio::spawn(async move {
-                            let mut b = vec![0u8; 65535];
-                            while let Ok(n) = f2.recv(&mut b).await {
-                                let Some(to) = *ca.lock().unwrap() else { continue };
-                                let mut out = vec![0, 0, 0];
-                                put_addr(&mut out, &dst.0, dst.1);
-                                out.extend_from_slice(&b[..n]);
-                                let _ = sock2.send_to(&out, to).await;
-                            }
-                        });
-                        f
-                    }
-                };
-                let _ = flow.send(payload).await;
+            };
+            // A flow still being set up drops the datagram, as UDP may.
+            if let Some(f) = flow {
+                let _ = f.send(payload).await;
             }
         }
     };
@@ -336,10 +332,49 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
         _ = relay => {}
         _ = async { while c.read(&mut sink).await.is_ok_and(|n| n > 0) {} } => {}
     }
-    for f in flows.lock().unwrap().values() {
+    flow_tasks.shutdown().await;
+    for f in flows.lock().unwrap().values().flatten() {
         f.close();
     }
     Ok(())
+}
+
+/// Opens the tunnel flow to `dst`, sends it `first`, and relays its
+/// replies to the client, wrapped with the destination's address, until
+/// it closes.
+async fn udp_flow(
+    d: Arc<Dialer>,
+    dst: (String, u16),
+    first: Vec<u8>,
+    flows: Arc<Mutex<Flows>>,
+    sock: Arc<UdpSocket>,
+    client_addr: ClientAddr,
+) {
+    let dial = tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_udp(&classify(&dst.0, dst.1).await?).await });
+    let f = match dial.await.unwrap_or_else(|_| Err(anyhow!("timed out"))) {
+        Ok(f) => Arc::new(f),
+        Err(e) => {
+            tracing::debug!("socks5: UDP to {}: {e}", crate::util::join_host_port(&dst.0, dst.1));
+            // The next datagram tries again.
+            flows.lock().unwrap().remove(&dst);
+            return;
+        }
+    };
+    flows.lock().unwrap().insert(dst.clone(), Some(f.clone()));
+    let _ = f.send(&first).await;
+    let mut b = vec![0u8; 65535];
+    while let Ok(n) = f.recv(&mut b).await {
+        let Some(to) = *client_addr.lock().unwrap() else { continue };
+        let mut out = vec![0, 0, 0];
+        put_addr(&mut out, &dst.0, dst.1);
+        out.extend_from_slice(&b[..n]);
+        let _ = sock.send_to(&out, to).await;
+    }
+    // The flow closed; the next datagram opens another.
+    let mut flows = flows.lock().unwrap();
+    if flows.get(&dst).is_some_and(|g| g.as_ref().is_some_and(|g| Arc::ptr_eq(g, &f))) {
+        flows.remove(&dst);
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +464,59 @@ mod tests {
         // be dialed.
         let connect = [&[5, 1, 0, 5, 1, 0, 3, 14][..], b"server.tailcat", &[0, 80]].concat();
         assert_eq!(roundtrip(a, &connect, 12).await, ok_reply(REP_HOST_UNREACHABLE));
+    }
+
+    /// A UDP flow that's slow to open doesn't hold up another flow's
+    /// datagrams.
+    #[tokio::test]
+    async fn slow_udp_flows_dont_stall_others() {
+        let dev = tailcat::derp::server::DevDerp::start_local().await.unwrap();
+        let echo = tailcat::Server::builder()
+            .region(dev.region.clone())
+            .on_udp(|_| {
+                Some(tailcat::udp_handler(|c: tailcat::UdpConn| async move {
+                    let mut b = [0u8; 2048];
+                    while let Ok(n) = c.recv(&mut b).await {
+                        let _ = c.send(&b[..n]).await;
+                    }
+                }))
+            })
+            .start()
+            .await
+            .unwrap();
+        let echo_addr = echo.tailcat_addr();
+        // No server has this address, so opening a flow to it waits for
+        // an answer that never comes.
+        let mut ghost = tailcat::PrivateKey::generate().public;
+        (ghost.region, ghost.region_id) = (vec![dev.region.clone()], 0);
+        let ghost_addr = ghost.addr();
+        assert!(echo_addr.as_str().len() < 256 && ghost_addr.as_str().len() < 256);
+
+        let mut c = TcpStream::connect(proxy().await).await.unwrap();
+        c.write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut rep = [0u8; 12];
+        c.read_exact(&mut rep).await.unwrap();
+        let relay =
+            SocketAddr::from((<[u8; 4]>::try_from(&rep[6..10]).unwrap(), u16::from_be_bytes([rep[10], rep[11]])));
+        let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let datagram = |host: &str, port, payload: &[u8]| {
+            let mut b = vec![0, 0, 0];
+            put_addr(&mut b, host, port);
+            b.extend_from_slice(payload);
+            b
+        };
+        u.send_to(&datagram(ghost_addr.as_str(), 7, b"lost"), relay).await.unwrap();
+        // Datagrams sent while a flow opens are dropped, so resend.
+        let want = datagram(echo_addr.as_str(), 7, b"echo");
+        let echoed = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut buf = [0u8; 2048];
+            loop {
+                u.send_to(&want, relay).await.unwrap();
+                if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(500), u.recv_from(&mut buf)).await {
+                    return buf[..n].to_vec();
+                }
+            }
+        });
+        assert_eq!(echoed.await.expect("the echo flow was held up"), want);
     }
 }

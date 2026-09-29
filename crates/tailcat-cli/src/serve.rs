@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
-    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpStream, UdpConn,
-    handler, udp_handler,
+    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpHandler, TcpStream,
+    UdpConn, handler, udp_handler,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -303,8 +304,11 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     }
 
     // Handlers that need the server itself (for peer identity, draining)
-    // get it through this cell, filled in after start.
+    // get it through this cell, filled in after start. A client that
+    // knows a saved key's address can connect before then, so handlers
+    // wait for `ready` first.
     let me: Arc<OnceLock<Server>> = Arc::default();
+    let (ready_tx, ready) = tokio::sync::watch::channel(false);
 
     #[cfg(feature = "ssh")]
     let ssh_handler = if ssh_services {
@@ -348,10 +352,13 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     }
 
     let ps = Arc::new(ps);
-    let exec_h: Arc<OnceLock<tailcat::TcpHandler>> = Arc::default();
+    let exec_h: Arc<OnceLock<TcpHandler>> = Arc::default();
+    // The accept-one-connection mode serves the first connection only.
+    let one_shot_taken = Arc::new(AtomicBool::new(false));
+    let serves_exec = exec_cmd.is_some();
     b = b.on_tcp({
         let (me, exec_h) = (me.clone(), exec_h.clone());
-        move |port| {
+        let route = move |port| {
             if port == 22
                 && let Some(h) = &ssh_handler
             {
@@ -367,19 +374,37 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
                 let t = ps.targets.get(&port).cloned().unwrap_or_else(|| format!("localhost:{port}"));
                 return Some(handler(move |c| proxy_to_local(t.clone(), c)));
             }
-            if let Some(h) = exec_h.get() {
-                return Some(h.clone());
+            if serves_exec {
+                let exec_h = exec_h.clone();
+                return Some(Arc::new(move |c| exec_h.get().expect("exec handler set at start")(c)) as TcpHandler);
             }
             if exit_node {
                 // Being an exit node includes localhost's ports too.
                 return Some(handler(move |c| proxy_to_local(format!("localhost:{port}"), c)));
             }
             if one_shot_stdout {
-                let me = me.clone();
-                return Some(handler(move |c| one_shot(me.clone(), c)));
+                // Refuse the rest, so they fail instead of being lost.
+                if one_shot_taken.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (me, taken) = (me.clone(), one_shot_taken.clone());
+                return Some(handler(move |c| {
+                    // Of connections that got this far at once, only the
+                    // first to be established is served.
+                    let first = !taken.swap(true, Ordering::Relaxed);
+                    let me = me.clone();
+                    async move {
+                        if first {
+                            one_shot(me, c).await;
+                        } else {
+                            c.abort();
+                        }
+                    }
+                }));
             }
             None
-        }
+        };
+        move |port| route(port).map(|h| after_start(ready.clone(), h))
     });
 
     let s = b.start().await.map_err(|e| anyhow!("Server.Start: {e}"))?;
@@ -387,6 +412,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     if let Some(a) = exec_cmd {
         let _ = exec_h.set(s.exec_conn_handler(a));
     }
+    ready_tx.send_replace(true);
     if psk.is_zero() {
         if new_key {
             eprintln!("# ⚠️ WARNING: serving without a WireGuard PSK");
@@ -416,8 +442,21 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         });
     }
     let _keep = dev_derp;
-    tokio::signal::ctrl_c().await?;
+    crate::forward::shutdown_signal().await;
     Ok(())
+}
+
+/// Holds `h` back until `ready`, when the cells handlers read the server
+/// from are filled in.
+fn after_start(ready: tokio::sync::watch::Receiver<bool>, h: TcpHandler) -> TcpHandler {
+    handler(move |c| {
+        let (mut ready, h) = (ready.clone(), h.clone());
+        async move {
+            if ready.wait_for(|r| *r).await.is_ok() {
+                h(c).await;
+            }
+        }
+    })
 }
 
 async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
@@ -439,7 +478,8 @@ async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
                 c.write_all(format!("{conn_str}\n").as_bytes()).await?;
                 c.shutdown().await?;
             }
-            None => crate::util::write_private(&v, conn_str.as_str().as_bytes())?,
+            None => crate::util::replace_private(&v, conn_str.as_str().as_bytes())
+                .map_err(|e| anyhow!("TAILCAT_ADDR_FILE: writing {v:?}: {e}"))?,
         },
         Err(_) => {}
     }
@@ -450,6 +490,8 @@ async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
 async fn one_shot(me: Arc<OnceLock<Server>>, mut c: TcpStream) {
     let mut out = tokio::io::stdout();
     if let Err(e) = tokio::io::copy(&mut c, &mut out).await {
+        // Keep what did arrive.
+        let _ = out.flush().await;
         eprintln!("{e}");
         std::process::exit(1);
     }
@@ -567,6 +609,36 @@ mod tests {
         for bad in ["65536", "1-65536", "80-", "-80", "a-b", "80:host:0", "80::22", "80:[::1]"] {
             assert!(parse_port_set(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    /// A connection that arrives before the server is ready waits for it
+    /// instead of reaching a handler whose server cells are still empty.
+    #[tokio::test]
+    async fn handlers_wait_for_start() {
+        use tokio::io::AsyncReadExt;
+        let dev = tailcat::derp::server::DevDerp::start_local().await.unwrap();
+        let (ready_tx, ready) = tokio::sync::watch::channel(false);
+        let ran = Arc::new(AtomicBool::new(false));
+        let h = after_start(ready, {
+            let ran = ran.clone();
+            handler(move |mut c: TcpStream| {
+                ran.store(true, Ordering::Relaxed);
+                async move {
+                    let _ = c.write_all(b"ok").await;
+                    let _ = c.shutdown().await;
+                    c.drain(Duration::from_secs(5)).await;
+                }
+            })
+        });
+        let s = Server::builder().region(dev.region.clone()).on_tcp(move |_| Some(h.clone())).start().await.unwrap();
+        let cl = tailcat::Client::new(s.tailcat_addr());
+        let mut c = tokio::time::timeout(Duration::from_secs(15), cl.dial_tcp_port(1)).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!ran.load(Ordering::Relaxed), "the handler ran before the server was ready");
+        ready_tx.send_replace(true);
+        let mut got = String::new();
+        tokio::time::timeout(Duration::from_secs(10), c.read_to_string(&mut got)).await.unwrap().unwrap();
+        assert_eq!(got, "ok");
     }
 
     #[test]
