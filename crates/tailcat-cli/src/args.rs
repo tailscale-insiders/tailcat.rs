@@ -107,6 +107,56 @@ impl fmt::Display for SshTarget {
     }
 }
 
+/// An `--ssh-authorized-keys` list: comma-separated sources of SSH
+/// public keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedKeysArg(pub Vec<KeySource>);
+
+/// Where `--ssh-authorized-keys` gets some of its keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// `<user>@github`: the user's keys on GitHub.
+    Github(String),
+    /// An authorized_keys file or a literal public key line, which one
+    /// found when the keys are loaded.
+    Local(String),
+}
+
+impl fmt::Display for KeySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeySource::Github(user) => write!(f, "{user}@github"),
+            KeySource::Local(s) => f.write_str(s),
+        }
+    }
+}
+
+impl FromStr for AuthorizedKeysArg {
+    type Err = String;
+
+    fn from_str(list: &str) -> Result<Self, String> {
+        let source = |(i, s): (usize, &str)| {
+            let (n, s) = (i + 1, s.trim());
+            match s.strip_suffix("@github") {
+                _ if s.is_empty() => Err(format!("source {n} is empty")),
+                Some(user) if !valid_github_user(user) => Err(format!("source {n}: invalid GitHub username {user:?}")),
+                Some(user) => Ok(KeySource::Github(user.into())),
+                None => Ok(KeySource::Local(s.into())),
+            }
+        };
+        list.split(',').enumerate().map(source).collect::<Result<_, _>>().map(AuthorizedKeysArg)
+    }
+}
+
+/// Whether `u` can be a GitHub username.
+fn valid_github_user(u: &str) -> bool {
+    let b = u.as_bytes();
+    (1..=39).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+}
+
 /// A `--files` argument: a directory, the current one if empty, and
 /// how it's served.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +287,22 @@ mod tests {
         assert_eq!(target("[fd7a::1]:2222"), Ok("[fd7a::1]:2222".into()));
         for bad in ["0", "10.0.0.1:0", "host:22"] {
             assert!(target(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn authorized_keys_args() {
+        let arg = |s: &str| s.parse::<AuthorizedKeysArg>().map(|a| a.0);
+        let local = |s: &str| KeySource::Local(s.into());
+        assert_eq!(arg("alice@github, keys"), Ok(vec![KeySource::Github("alice".into()), local("keys")]));
+        assert_eq!(arg("ssh-ed25519 AAAA"), Ok(vec![local("ssh-ed25519 AAAA")]));
+        assert_eq!(arg("keys,"), Err("source 2 is empty".into()));
+        assert!(arg("-x@github").unwrap_err().contains("invalid GitHub username"));
+
+        assert!(valid_github_user("bradfitz"));
+        assert!(valid_github_user("a-b"));
+        for bad in ["-x", "x-", "", &"a".repeat(40)] {
+            assert!(!valid_github_user(bad), "{bad:?} is valid");
         }
     }
 

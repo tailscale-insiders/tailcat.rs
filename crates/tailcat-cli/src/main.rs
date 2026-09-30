@@ -61,7 +61,7 @@ pub struct ServeFlags {
     /// Comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal
     /// OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys).
     #[arg(long, value_name = "SOURCES")]
-    pub ssh_authorized_keys: Option<String>,
+    pub ssh_authorized_keys: Option<args::AuthorizedKeysArg>,
     /// Include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter
     /// addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.
     #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]

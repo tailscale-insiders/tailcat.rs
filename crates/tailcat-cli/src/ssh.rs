@@ -11,48 +11,34 @@ use sha2::{Digest, Sha256};
 use tailcat::ssh::parse_authorized_keys;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::args::{KeyArg, SshTarget};
+use crate::args::{AuthorizedKeysArg, KeyArg, KeySource, SshTarget};
 use crate::{Global, usagef};
 
 const MAX_AUTHORIZED_KEYS_SIZE: usize = 1 << 20;
-
-fn valid_github_user(u: &str) -> bool {
-    let b = u.as_bytes();
-    (1..=39).contains(&b.len())
-        && b[0].is_ascii_alphanumeric()
-        && b[b.len() - 1].is_ascii_alphanumeric()
-        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
-}
 
 fn looks_like_ssh_public_key(s: &str) -> bool {
     let first = s.split_whitespace().next().unwrap_or("");
     ["ssh-", "ecdsa-", "sk-"].iter().any(|p| first.starts_with(p))
 }
 
-/// Resolves a comma-separated list of authorized-key sources: literal
-/// public key lines, authorized_keys files, or `user@github`.
-pub async fn load_authorized_keys(list: &str) -> Result<Vec<String>> {
+/// Loads the keys from each of `list`'s sources: a GitHub user's, an
+/// authorized_keys file's, or a literal public key line.
+pub async fn load_authorized_keys(list: &AuthorizedKeysArg) -> Result<Vec<String>> {
     let mut texts = Vec::new();
-    for (i, source) in list.split(',').enumerate() {
+    for (i, source) in list.0.iter().enumerate() {
         let n = i + 1;
-        let source = source.trim();
-        if source.is_empty() {
-            bail!("source {n} is empty");
-        }
-        let text = if let Some(user) = source.strip_suffix("@github") {
-            if !valid_github_user(user) {
-                bail!("source {n}: invalid GitHub username {user:?}");
+        let text = match source {
+            KeySource::Github(user) => {
+                fetch_github_keys(user).await.map_err(|e| anyhow!("source {n} ({source}): {e}"))?
             }
-            fetch_github_keys(user).await.map_err(|e| anyhow!("source {n} ({source}): {e}"))?
-        } else {
-            match std::fs::read(source).and_then(|b| limited_text(&b, "file")) {
+            KeySource::Local(s) => match std::fs::read(s).and_then(|b| limited_text(&b, "file")) {
                 Ok(t) => t,
-                Err(file_err) => match parse_authorized_keys(&[source.into()]) {
-                    Ok(_) => source.into(),
-                    Err(e) if looks_like_ssh_public_key(source) => bail!("source {n}: invalid SSH public key: {e}"),
-                    Err(_) => bail!("source {n}: reading {source:?}: {file_err}"),
+                Err(file_err) => match parse_authorized_keys(std::slice::from_ref(s)) {
+                    Ok(_) => s.clone(),
+                    Err(e) if looks_like_ssh_public_key(s) => bail!("source {n}: invalid SSH public key: {e}"),
+                    Err(_) => bail!("source {n}: reading {s:?}: {file_err}"),
                 },
-            }
+            },
         };
         parse_authorized_keys(std::slice::from_ref(&text)).map_err(|e| anyhow!("source {n} ({source}): {e}"))?;
         texts.push(text);
@@ -446,12 +432,6 @@ mod tests {
         let host = ssh_dest_host("tcabc");
         assert!(host.starts_with("tailcat-"));
         assert_eq!(host.len(), "tailcat-".len() + 16);
-
-        assert!(valid_github_user("bradfitz"));
-        assert!(valid_github_user("a-b"));
-        for bad in ["-x", "x-", "", &"a".repeat(40)] {
-            assert!(!valid_github_user(bad), "{bad:?} is valid");
-        }
     }
 
     #[test]
@@ -473,9 +453,12 @@ mod tests {
         assert_eq!(e.to_string(), "opening SFTP session: timed out");
     }
 
-    /// Why loading the authorized keys in `list` fails.
+    /// Why parsing or loading the authorized keys in `list` fails.
     async fn load_err(list: impl Display) -> String {
-        load_authorized_keys(&list.to_string()).await.unwrap_err().to_string()
+        match list.to_string().parse() {
+            Ok(list) => load_authorized_keys(&list).await.unwrap_err().to_string(),
+            Err(e) => e,
+        }
     }
 
     #[tokio::test]
@@ -483,7 +466,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("keys");
         fs::write(&file, format!("# mine\n{KEY}\n")).unwrap();
-        let texts = load_authorized_keys(&format!("{KEY}, {}", file.display())).await.unwrap();
+        let texts = load_authorized_keys(&format!("{KEY}, {}", file.display()).parse().unwrap()).await.unwrap();
         assert_eq!(texts, [KEY.to_string(), format!("# mine\n{KEY}\n")]);
 
         assert_eq!(load_err(format!("{KEY},")).await, "source 2 is empty");
