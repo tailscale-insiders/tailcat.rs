@@ -3,6 +3,7 @@
 //! relays' `/derp/latency-check` endpoint when UDP is blocked.
 
 use std::collections::{HashMap, HashSet};
+use std::future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -97,7 +98,7 @@ async fn stun_report(dm: &DerpMap) -> Report {
             r = async {
                 match &sock6 {
                     Some(s) => s.recv_from(&mut buf6).await,
-                    None => std::future::pending().await,
+                    None => future::pending().await,
                 }
             } => {
                 if let Ok((n, _)) = r {
@@ -150,6 +151,7 @@ async fn https_report(dm: &DerpMap) -> HashMap<i32, Duration> {
 /// already-established TLS connection.
 async fn https_latency(n: &DerpNode) -> Option<Duration> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let mut tls = crate::derp::client::dial_tls(n).await.ok()?;
     let host = n.host_name.dialable()?;
     let req = format!("HEAD /derp/latency-check HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
