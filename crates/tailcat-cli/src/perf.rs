@@ -519,6 +519,17 @@ impl Test {
         }
     }
 
+    /// Marks the test done, returning its failure, if any. It's done
+    /// under the error lock, so a concurrent `fail` either lands first
+    /// and is returned, or finds the test already done.
+    fn finish(&self) -> Option<String> {
+        let err = self.err.lock().unwrap();
+        self.done.set();
+        let e = err.clone();
+        drop(err);
+        e
+    }
+
     fn err(&self) -> String {
         self.err.lock().unwrap().clone().unwrap_or_default()
     }
@@ -686,13 +697,7 @@ impl Test {
                 }
             }
         }
-        // Finish under the error lock, so a concurrent fail() either lands
-        // first and is reported, or finds the test already done.
-        let err = {
-            let err = self.err.lock().unwrap();
-            self.done.set();
-            err.clone()
-        };
+        let err = self.finish();
         drop(held);
         if let Some(e) = err {
             return Err(e);
