@@ -240,7 +240,7 @@ impl ConnInfo {
             None => {
                 fetched = crate::derpmap::fetch_derp_map(opts)
                     .await
-                    .map_err(|e| Error::other(format!("fetching DERPMap for region {}: {e}", self.region_id)))?;
+                    .map_err(|e| Error::RegionMap { region_id: self.region_id, error: Box::new(e) })?;
                 &fetched
             }
         };

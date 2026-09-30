@@ -110,6 +110,8 @@ pub enum Error {
     Handshake { host: String, error: io::Error },
     #[error("DERP: client info: {error}")]
     BadClientInfo { error: serde_json::Error },
+    #[error("fetching DERPMap for region {region_id}: {error}")]
+    RegionMap { region_id: i32, error: Box<Error> },
     #[error("fetching {url}: {status}")]
     DerpMapStatus { url: String, status: reqwest::StatusCode },
     #[error("DERP map from {url} is too large")]
