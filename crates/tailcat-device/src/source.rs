@@ -74,10 +74,7 @@ impl GithubSource {
                     }
                 };
                 let rec = NodeRecord::from_json(&body);
-                if let Ok(r) = &rec
-                    && r.jwt.is_some()
-                    && self.verifier.is_none()
-                {
+                if rec.as_ref().is_ok_and(|r| r.jwt.is_some()) && self.verifier.is_none() {
                     self.verifier = Some(Verifier::fetch().await?);
                 }
                 // A token is checked as of the upload, which GitHub dates.
