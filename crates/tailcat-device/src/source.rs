@@ -56,6 +56,12 @@ impl GithubSource {
         self
     }
 
+    /// Whether `rec` carries a token and there are no keys yet to check
+    /// it with.
+    fn needs_keys_for(&self, rec: &Result<NodeRecord>) -> bool {
+        self.verifier.is_none() && rec.as_ref().is_ok_and(|r| r.jwt.is_some())
+    }
+
     async fn poll(&mut self) -> Result<impl Iterator<Item = &NodeRecord>> {
         let runs = match self.scope {
             Scope::Run => vec![(self.env.run_id.clone(), self.env.run_attempt.clone())],
@@ -74,7 +80,7 @@ impl GithubSource {
                     }
                 };
                 let rec = NodeRecord::from_json(&body);
-                if rec.as_ref().is_ok_and(|r| r.jwt.is_some()) && self.verifier.is_none() {
+                if self.needs_keys_for(&rec) {
                     self.verifier = Some(Verifier::fetch().await?);
                 }
                 // A token is checked as of the upload, which GitHub dates.
