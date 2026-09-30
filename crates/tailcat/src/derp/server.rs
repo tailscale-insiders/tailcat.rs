@@ -129,12 +129,8 @@ impl Server {
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
         let close = Arc::new(Notify::new());
-        let old = self.clients.lock().unwrap().insert(client, Client { tx: tx.clone(), close: close.clone() });
         debug!("derp server: {remote} connected as {}", client.short_string());
-        if let Some(old) = old {
-            debug!("derp server: closing {}'s older connection", client.short_string());
-            old.close.notify_one();
-        }
+        let _registered = self.register(client, &tx, &close);
 
         let (mut rd, wr) = tokio::io::split(br);
         let mut wr = BufWriter::new(wr);
@@ -179,19 +175,41 @@ impl Server {
             r = writer => r,
             _ = close.notified() => Err(Error::Derp("replaced by a newer connection".into())),
         };
-        self.forget(&client, &tx);
-        debug!("derp server: {} disconnected", client.short_string());
         res
     }
 
-    /// Removes `client`, unless a newer connection with its key, which
-    /// has another queue than `tx`, replaced it.
-    fn forget(&self, client: &NodePublic, tx: &mpsc::Sender<Vec<u8>>) {
-        let mut clients = self.clients.lock().unwrap();
-        if clients.get(client).is_some_and(|c| c.tx.same_channel(tx)) {
-            clients.remove(client);
+    /// Registers a connection from `client` with queue `tx`, replacing
+    /// and closing any older one with its key, until the returned
+    /// [`Registered`] drops.
+    #[must_use = "dropping the Registered at once unregisters the client"]
+    fn register(&self, client: NodePublic, tx: &mpsc::Sender<Vec<u8>>, close: &Arc<Notify>) -> Registered<'_> {
+        let old = self.clients.lock().unwrap().insert(client, Client { tx: tx.clone(), close: close.clone() });
+        if let Some(old) = old {
+            debug!("derp server: closing {}'s older connection", client.short_string());
+            old.close.notify_one();
+        }
+        Registered { server: self, client, tx: tx.clone() }
+    }
+}
+
+/// A client's connection in the relay's table. Dropping it removes the
+/// client, unless a newer connection with its key, which has another
+/// queue, replaced it, however the connection ends: closed, failed or
+/// cancelled.
+struct Registered<'a> {
+    server: &'a Server,
+    client: NodePublic,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        let mut clients = self.server.clients.lock().unwrap();
+        if clients.get(&self.client).is_some_and(|c| c.tx.same_channel(&self.tx)) {
+            clients.remove(&self.client);
         }
         drop(clients);
+        debug!("derp server: {} disconnected", self.client.short_string());
     }
 }
 
@@ -309,6 +327,7 @@ impl DevDerp {
 #[cfg(test)]
 mod tests {
     use tokio::io::{DuplexStream, duplex};
+    use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
 
     use super::*;
@@ -379,13 +398,19 @@ mod tests {
 
     /// Like [`http`], on an existing server.
     async fn connect(server: &Arc<Server>, request: &str) -> Conn {
+        connect_task(server, request).await.0
+    }
+
+    /// Like [`connect`], also returning the server's task for the
+    /// connection.
+    async fn connect_task(server: &Arc<Server>, request: &str) -> (Conn, JoinHandle<Result<()>>) {
         let (near, far) = duplex(1 << 20);
         let s = server.clone();
         let peer = SocketAddr::from(([127, 0, 0, 1], 1));
-        tokio::spawn(async move { s.handle_http(far, peer).await });
+        let task = tokio::spawn(async move { s.handle_http(far, peer).await });
         let mut near = BufReader::new(near);
         write(&mut near, request.as_bytes()).await;
-        near
+        (near, task)
     }
 
     async fn write(c: &mut Conn, data: &[u8]) {
@@ -492,6 +517,23 @@ mod tests {
         write(&mut new, &frame(FrameType::Ping, &[PING])).await;
         let (t, payload) = next_frame(&mut new).await;
         assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, PING));
+    }
+
+    /// A connection cancelled mid-session, as a task is at shutdown,
+    /// unregisters its client as one that hangs up does.
+    #[tokio::test]
+    async fn a_cancelled_connection_unregisters_its_client() {
+        let server = Server::new();
+        let key = NodePrivate::generate();
+        let (mut c, task) = connect_task(&server, "").await;
+        login(&mut c, "T", &key, &"test".into()).await.unwrap();
+        next_frame(&mut c).await;
+        assert!(server.is_client_connected(&key.public()));
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(!server.is_client_connected(&key.public()), "the cancelled connection's client is still registered");
     }
 
     #[tokio::test]
