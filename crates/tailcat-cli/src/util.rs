@@ -2,9 +2,14 @@
 //! dials and proxying, atomic private files, accept loops, shutdown
 //! signals, and finding executables.
 
-use std::net::SocketAddr;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::future::Future;
+use std::io::{self, ErrorKind, Write as _};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{env, process};
 
 use tokio::io::AsyncWriteExt;
 
@@ -52,7 +57,7 @@ fn user_dir(_windows_var: &str, _macos: &str, xdg_var: &str, home_rel: &str) -> 
 
 /// The path in the environment variable `v`, unless it's unset or empty.
 fn env_path(v: &str) -> Option<PathBuf> {
-    std::env::var_os(v).filter(|x| !x.is_empty()).map(PathBuf::from)
+    env::var_os(v).filter(|x| !x.is_empty()).map(PathBuf::from)
 }
 
 /// Atomically replaces `path` with a file of `data` readable only by its
@@ -61,29 +66,29 @@ fn env_path(v: &str) -> Option<PathBuf> {
 /// file) see the old contents or the new, never a partial file, and a
 /// crash leaves one or the other. The new file is owner-only even when
 /// it replaces one that wasn't.
-pub fn replace_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()> {
+pub fn replace_private(path: impl AsRef<Path>, data: &[u8]) -> io::Result<()> {
     let path = path.as_ref();
     let tmp = write_temp_beside(path, data)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| _ = std::fs::remove_file(&tmp))
+    fs::rename(&tmp, path).inspect_err(|_| _ = fs::remove_file(&tmp))
 }
 
 /// Like [`replace_private`], but fails with
-/// [`std::io::ErrorKind::AlreadyExists`] if `path` exists. The check is
+/// [`ErrorKind::AlreadyExists`] if `path` exists. The check is
 /// atomic: of concurrent calls, exactly one succeeds.
-pub fn create_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()> {
+pub fn create_private(path: impl AsRef<Path>, data: &[u8]) -> io::Result<()> {
     let path = path.as_ref();
     let tmp = write_temp_beside(path, data)?;
     // Linking, unlike renaming, never replaces an existing file.
-    let linked = std::fs::hard_link(&tmp, path);
-    let _ = std::fs::remove_file(&tmp);
+    let linked = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
     match linked {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists => {
             // A filesystem without hard links: still refuse to replace a
             // file, though a crash can now leave a partial one.
-            let mut opts = std::fs::OpenOptions::new();
+            let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
             owner_only(&mut opts);
-            std::io::Write::write_all(&mut opts.open(path)?, data)
+            opts.open(path)?.write_all(data)
         }
         r => r,
     }
@@ -91,32 +96,33 @@ pub fn create_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()
 
 /// Writes `data` to a new owner-only file in `path`'s directory, synced
 /// to disk, and returns its path.
-fn write_temp_beside(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
-    let name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a file path", path.display()))
-    })?;
-    let mut tmp_name = std::ffi::OsString::from(".");
+fn write_temp_beside(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("{} is not a file path", path.display())))?;
+    let mut tmp_name = OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(format!(".tmp{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    tmp_name.push(format!(".tmp{}-{:016x}", process::id(), rand::random::<u64>()));
     let tmp = path.with_file_name(tmp_name);
-    let mut opts = std::fs::OpenOptions::new();
+    let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     owner_only(&mut opts);
     let mut f = opts.open(&tmp)?;
-    let written = std::io::Write::write_all(&mut f, data).and_then(|()| f.sync_all());
-    written.inspect_err(|_| _ = std::fs::remove_file(&tmp))?;
+    let written = f.write_all(data).and_then(|()| f.sync_all());
+    written.inspect_err(|_| _ = fs::remove_file(&tmp))?;
     Ok(tmp)
 }
 
 /// Makes `opts` create files readable and writable only by their owner.
 #[cfg(unix)]
-fn owner_only(opts: &mut std::fs::OpenOptions) {
-    std::os::unix::fs::OpenOptionsExt::mode(opts, 0o600);
+fn owner_only(opts: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600);
 }
 
 /// Does nothing: files have no Unix mode here.
 #[cfg(not(unix))]
-fn owner_only(_: &mut std::fs::OpenOptions) {}
+fn owner_only(_: &mut OpenOptions) {}
 
 /// Accepts the next connection from `accept` (a listener's accept),
 /// riding out errors: the likely ones (too many open files, a
@@ -126,7 +132,7 @@ fn owner_only(_: &mut std::fs::OpenOptions) {}
 /// up to a second between retries.
 pub async fn accept<T, F>(mut accept: impl FnMut() -> F) -> T
 where
-    F: std::future::Future<Output = std::io::Result<T>>,
+    F: Future<Output = io::Result<T>>,
 {
     let mut delay = Duration::from_millis(5);
     loop {
@@ -144,30 +150,30 @@ where
 /// Dials a local target "host:port". "localhost" (and "*.localhost")
 /// always means loopback: both 127.0.0.1 and ::1 are tried, without
 /// asking DNS, so services bound to either answer.
-pub async fn dial_local(target: &str) -> std::io::Result<tokio::net::TcpStream> {
+pub async fn dial_local(target: &str) -> io::Result<tokio::net::TcpStream> {
     let (host, port) = split_host_port(target)?;
     let lower = host.to_ascii_lowercase();
     let addrs: Vec<SocketAddr> = if lower == "localhost" || lower.ends_with(".localhost") {
-        vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))]
+        vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from((Ipv6Addr::LOCALHOST, port))]
     } else if let Ok(ip) = host.parse() {
         vec![SocketAddr::new(ip, port)]
     } else {
         tokio::net::lookup_host((host.as_str(), port)).await?.collect()
     };
-    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("no addresses for {target}"));
+    let mut last = io::Error::new(ErrorKind::NotFound, format!("no addresses for {target}"));
     for a in addrs {
         match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(a)).await {
             Ok(Ok(c)) => return Ok(c),
             Ok(Err(e)) => last = e,
-            Err(_) => last = std::io::Error::new(std::io::ErrorKind::TimedOut, format!("dial {a} timed out")),
+            Err(_) => last = io::Error::new(ErrorKind::TimedOut, format!("dial {a} timed out")),
         }
     }
     Err(last)
 }
 
 /// Splits "host:port" or "[v6]:port".
-pub fn split_host_port(s: &str) -> std::io::Result<(String, u16)> {
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid host:port {s:?}"));
+pub fn split_host_port(s: &str) -> io::Result<(String, u16)> {
+    let bad = || io::Error::new(ErrorKind::InvalidInput, format!("invalid host:port {s:?}"));
     let (host, port) = match s.strip_prefix('[') {
         Some(rest) => rest.split_once("]:"),
         None => s.rsplit_once(':'),
@@ -200,10 +206,10 @@ pub async fn shutdown_signal() {
 /// Finds an executable in $PATH, like Go's exec.LookPath.
 pub fn which(name: &str) -> Option<String> {
     if name.contains('/') {
-        return std::path::Path::new(name).exists().then(|| name.to_string());
+        return Path::new(name).exists().then(|| name.to_string());
     }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
         let p = dir.join(name);
         if is_executable(&p) {
             return Some(p.to_string_lossy().into_owned());
@@ -217,27 +223,27 @@ pub fn which(name: &str) -> Option<String> {
 
 /// `name` with the `.exe` extension in `dir`, if it exists.
 #[cfg(windows)]
-fn exe_in(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+fn exe_in(dir: &Path, name: &str) -> Option<PathBuf> {
     let p = dir.join(format!("{name}.exe"));
     p.exists().then_some(p)
 }
 
 /// None: executables don't need an extension here.
 #[cfg(not(windows))]
-fn exe_in(_: &std::path::Path, _: &str) -> Option<std::path::PathBuf> {
+fn exe_in(_: &Path, _: &str) -> Option<PathBuf> {
     None
 }
 
 /// Reports whether `p` is a file with any execute bit set.
 #[cfg(unix)]
-fn is_executable(p: &std::path::Path) -> bool {
+fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Reports whether `p` is a file: there are no execute bits here.
 #[cfg(not(unix))]
-fn is_executable(p: &std::path::Path) -> bool {
+fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
@@ -259,11 +265,9 @@ pub async fn proxy_and_drain(c: tailcat::TcpStream, local: tokio::net::TcpStream
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::future::ready;
-    use std::io::{self, ErrorKind};
+    use std::thread;
     use std::time::Instant;
-    use std::{fs, thread};
 
     use hegel::TestCase;
     use hegel::generators as gs;
