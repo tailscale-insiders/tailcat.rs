@@ -296,7 +296,9 @@ impl MagicSock {
             derp_tx,
             tasks: Mutex::default(),
         });
-        ms.ensure_derp_locked(&mut ms.inner.lock().unwrap(), ms.home_region);
+        let mut inner = ms.inner.lock().unwrap();
+        ms.ensure_derp_locked(&mut inner, ms.home_region);
+        drop(inner);
         let weak = Arc::downgrade(&ms);
         let mut tasks = vec![tokio::spawn(derp_recv_loop(weak.clone(), derp_rx))];
         for s in [&ms.udp4, &ms.udp6].into_iter().flatten() {
@@ -490,7 +492,8 @@ impl MagicSock {
         inner.closed = true;
         inner.derp.clear();
         drop(inner);
-        for t in self.tasks.lock().unwrap().drain(..) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for t in tasks {
             t.abort();
         }
     }
@@ -708,16 +711,14 @@ impl MagicSock {
             self.handle_disco(pkt, PathAddr::Udp(src), None);
             return;
         }
-        let peer = {
-            let mut inner = self.inner.lock().unwrap();
-            let peer = inner.by_addr.get(&src).copied();
-            if let Some(k) = peer
-                && let Some(p) = inner.peers.get_mut(&k)
-            {
-                p.last_recv = Some(Instant::now());
-            }
-            peer
-        };
+        let mut inner = self.inner.lock().unwrap();
+        let peer = inner.by_addr.get(&src).copied();
+        if let Some(k) = peer
+            && let Some(p) = inner.peers.get_mut(&k)
+        {
+            p.last_recv = Some(Instant::now());
+        }
+        drop(inner);
         let _ = self.wg_tx.try_send(WireguardPacket { peer, src: PathAddr::Udp(src), data: pkt.to_vec() });
     }
 
@@ -731,13 +732,12 @@ impl MagicSock {
         {
             return;
         }
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(p) = inner.peers.get_mut(&rp.src) {
-                p.derp_seen = Some(rp.region_id);
-                p.last_recv = Some(Instant::now());
-            }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(p) = inner.peers.get_mut(&rp.src) {
+            p.derp_seen = Some(rp.region_id);
+            p.last_recv = Some(Instant::now());
         }
+        drop(inner);
         let _ = self.wg_tx.try_send(WireguardPacket {
             peer: Some(rp.src),
             src: PathAddr::Derp(rp.region_id),
