@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata, OpenOptions, ReadDir};
@@ -89,7 +90,7 @@ fn normalize(cwd: &str, p: &str) -> String {
 
 fn attrs(md: &Metadata) -> FileAttributes {
     let secs = |t: io::Result<cap_std::time::SystemTime>| {
-        t.ok().map(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as u32))
+        t.ok().map(|t| t.into_std().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as u32))
     };
     let mut a = FileAttributes {
         size: Some(md.len()),
@@ -105,6 +106,7 @@ fn attrs(md: &Metadata) -> FileAttributes {
 #[cfg(unix)]
 fn set_owner_attrs(a: &mut FileAttributes, md: &Metadata) {
     use cap_std::fs::MetadataExt;
+
     a.permissions = Some(md.mode());
     a.uid = Some(md.uid());
     a.gid = Some(md.gid());
@@ -122,6 +124,7 @@ fn set_owner_attrs(a: &mut FileAttributes, md: &Metadata) {
 #[cfg(unix)]
 fn permissions(mode: u32) -> Option<cap_std::fs::Permissions> {
     use cap_std::fs::PermissionsExt;
+
     Some(cap_std::fs::Permissions::from_mode(mode & 0o7777))
 }
 
@@ -183,7 +186,7 @@ fn link_new(root: &Dir, from: &str, to: &str) -> io::Result<()> {
 
 /// The current UTC time as YYYYMMDDhhmmss.
 fn utc_timestamp() -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let [y, mo, d, h, m, s] = super::utc_civil(now as i64);
     format!("{y:04}{mo:02}{d:02}{h:02}{m:02}{s:02}")
 }
@@ -291,9 +294,10 @@ impl Sftp {
         }
         if let (Some(at), Some(mt)) = (a.atime, a.mtime) {
             use cap_fs_ext::{DirExt, SystemTimeSpec};
+
             let t = |s: u32| {
                 SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(s.into()),
+                    UNIX_EPOCH + Duration::from_secs(s.into()),
                 ))
             };
             self.root.set_times(p, Some(t(at)), Some(t(mt)))?;
@@ -502,6 +506,7 @@ impl russh_sftp::server::Handler for Sftp {
 #[cfg(unix)]
 fn read_at(f: &cap_std::fs::File, buf: &mut [u8], off: u64) -> io::Result<usize> {
     use cap_std::fs::FileExt;
+
     let mut n = 0;
     while n < buf.len() {
         match f.read_at(&mut buf[n..], off + n as u64)? {
@@ -525,6 +530,7 @@ fn read_at(f: &cap_std::fs::File, buf: &mut [u8], off: u64) -> io::Result<usize>
 #[cfg(windows)]
 fn write_all_at(f: &cap_std::fs::File, mut data: &[u8], mut off: u64) -> io::Result<()> {
     use cap_std::fs::FileExt;
+
     while !data.is_empty() {
         let n = f.seek_write(data, off)?;
         data = &data[n..];
