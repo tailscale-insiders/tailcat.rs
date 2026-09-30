@@ -97,7 +97,7 @@ impl ServerCertVerifier for Verifier {
         name: &ServerName<'_>,
         ocsp: &[u8],
         now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+    ) -> Result<ServerCertVerified, rustls::Error> {
         match &self.check {
             Check::Any => Ok(ServerCertVerified::assertion()),
             Check::Hash(want) => {
@@ -120,7 +120,7 @@ impl ServerCertVerifier for Verifier {
         m: &[u8],
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
     }
 
@@ -129,7 +129,7 @@ impl ServerCertVerifier for Verifier {
         m: &[u8],
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
     }
 
