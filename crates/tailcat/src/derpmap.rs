@@ -543,6 +543,31 @@ pub fn find_region(dm: &DerpMap, s: &str) -> Option<i32> {
     dm.regions.values().find(|r| r.region_name.as_str().to_lowercase().contains(&needle)).map(|r| r.region_id)
 }
 
+/// How a home DERP region is chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionChoice {
+    /// The one with the lowest latency.
+    Nearest,
+    /// A region of the map, by ID.
+    Id(i32),
+    /// A region of the map by code, or by part of its name, as
+    /// [`find_region`] takes.
+    Named(String),
+    /// A region of one's own DERP servers, by host.
+    Custom(Vec<Host>),
+}
+
+impl RegionChoice {
+    /// The region of `dm` this names, if it names one there.
+    pub fn find(&self, dm: &DerpMap) -> Option<i32> {
+        match self {
+            RegionChoice::Id(id) => dm.regions.contains_key(id).then_some(*id),
+            RegionChoice::Named(n) => find_region(dm, n),
+            RegionChoice::Nearest | RegionChoice::Custom(_) => None,
+        }
+    }
+}
+
 /// What a `--region` argument names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionArg {
@@ -688,6 +713,17 @@ mod tests {
         assert!(matches!(&r.region_name, RegionName::Other(s) if s == "Somewhere Else"));
         let back = serde_json::to_string(&r).unwrap();
         assert!(back.contains(r#""RegionCode":"tok","RegionName":"Somewhere Else""#), "{back}");
+    }
+
+    #[test]
+    fn region_choices() {
+        let dm: DerpMap = serde_json::from_str(SAMPLE).unwrap();
+        let find = |c: RegionChoice| c.find(&dm);
+        assert_eq!(find(RegionChoice::Id(302)), Some(302));
+        assert_eq!(find(RegionChoice::Id(301)), None, "not in the map");
+        assert_eq!(find(RegionChoice::Named("SFO".into())), Some(302));
+        assert_eq!(find(RegionChoice::Nearest), None);
+        assert_eq!(find(RegionChoice::Custom(vec!["derp.example".into()])), None);
     }
 
     #[test]
