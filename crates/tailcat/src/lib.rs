@@ -137,6 +137,12 @@ pub enum Error {
     #[cfg(feature = "ssh")]
     #[error("parsing host key {}: {error}", path.display())]
     HostKey { path: PathBuf, error: russh::keys::Error },
+    #[cfg(feature = "ssh")]
+    #[error("authorized keys entry {entry}, line {line}: {error}")]
+    AuthorizedKey { entry: usize, line: usize, error: russh::keys::ssh_key::Error },
+    #[cfg(feature = "ssh")]
+    #[error("authorized keys entry {entry}, line {line}: options are not supported")]
+    KeyOptions { entry: usize, line: usize },
     /// An SFTP request refused with a status.
     #[cfg(feature = "ssh")]
     #[error("SFTP: {0}")]

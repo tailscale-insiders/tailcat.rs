@@ -10,13 +10,13 @@ mod session;
 mod sftp;
 
 use std::collections::HashSet;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use std::{env, fmt};
 
 use base64::Engine as _;
 use russh::keys::PrivateKey;
@@ -92,14 +92,13 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let bad = |msg: &dyn fmt::Display| {
-                Error::other(format!("authorized keys entry {}, line {}: {msg}", ti + 1, li + 1))
-            };
-            let entry: Entry = line.parse().map_err(|e| bad(&e))?;
-            if !entry.config_opts().is_empty() {
-                return Err(bad(&"options are not supported"));
+            let (entry, line_no) = (ti + 1, li + 1);
+            let bad = |error| Error::AuthorizedKey { entry, line: line_no, error };
+            let key: Entry = line.parse().map_err(bad)?;
+            if !key.config_opts().is_empty() {
+                return Err(Error::KeyOptions { entry, line: line_no });
             }
-            allowed.insert(entry.public_key().to_bytes().map_err(|e| bad(&e))?);
+            allowed.insert(key.public_key().to_bytes().map_err(bad)?);
         }
     }
     if allowed.is_empty() {
