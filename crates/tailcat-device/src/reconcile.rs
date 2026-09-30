@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::iter;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use tailcat::NodePublic;
@@ -74,7 +75,7 @@ pub fn reconcile<'a>(
 /// one of ours itself may see that claim differently.
 pub fn contested<'a>(me: &'a NodeRecord, polled: &'a [NodeRecord]) -> Vec<(IpNet, &'a NodeRecord)> {
     let others = polled.iter().filter(|r| r.nodekey != me.nodekey);
-    let chosen = chosen(me, others.chain(std::iter::once(me)), |_| false);
+    let chosen = chosen(me, others.chain(iter::once(me)), |_| false);
     let owner = owners(me, &HashSet::new(), &chosen);
     let mut out: Vec<(IpNet, &NodeRecord)> = Vec::new();
     for (n, _) in claims(me) {
@@ -161,7 +162,7 @@ enum Claim {
 /// A record's claims: its address, then its routes, canonical.
 fn claims(r: &NodeRecord) -> impl Iterator<Item = (IpNet, Claim)> + '_ {
     let routes = r.routes.iter().map(|&n| (canonical(n), Claim::Route));
-    std::iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes)
+    iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes)
 }
 
 /// The prefix with its host bits cleared: `10.42.0.9/24` is
