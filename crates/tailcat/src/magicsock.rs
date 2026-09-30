@@ -459,31 +459,36 @@ impl MagicSock {
     /// endpoints, nudging the peer to try a direct path.
     pub async fn ping(&self, peer: &NodePublic, timeout: Duration) -> Result<PingResult> {
         let (tx, mut rx) = mpsc::channel(1);
-        {
-            let mut inner = self.inner.lock().unwrap();
-            let now = Instant::now();
-            let Some(p) = inner.peers.get(peer) else {
-                return Err(Error::other(format!("unknown peer {}", peer.short_string())));
-            };
-            // Like Tailscale's CLI ping: with a trusted direct path, ping
-            // just that; otherwise ping over DERP and every candidate.
-            let direct = p.best.filter(|_| p.trusted(now));
-            let paths: Vec<PathAddr> = match direct {
-                Some((best, _)) => vec![PathAddr::Udp(best)],
-                None => {
-                    let derp = Some(p.derp_region()).filter(|r| *r != 0).map(PathAddr::Derp);
-                    let udp = p.candidates.keys().filter(|_| self.enable_udp).copied().map(PathAddr::Udp);
-                    derp.into_iter().chain(udp).collect()
-                }
-            };
-            for to in paths {
-                self.send_ping_locked(&mut inner, peer, to, now, Some(tx.clone()));
-            }
-            if direct.is_none() {
-                self.call_me_maybe_locked(&mut inner, peer, now);
-            }
-        }
+        self.start_ping(peer, tx)?;
         tokio::time::timeout(timeout, rx.recv()).await.ok().flatten().ok_or_else(|| Error::Timeout("disco ping".into()))
+    }
+
+    /// Sends [`MagicSock::ping`]'s pings, each reporting its pong to `tx`.
+    fn start_ping(&self, peer: &NodePublic, tx: mpsc::Sender<PingResult>) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let Some(p) = inner.peers.get(peer) else {
+            return Err(Error::other(format!("unknown peer {}", peer.short_string())));
+        };
+        // Like Tailscale's CLI ping: with a trusted direct path, ping
+        // just that; otherwise ping over DERP and every candidate.
+        let direct = p.best.filter(|_| p.trusted(now));
+        let paths: Vec<PathAddr> = match direct {
+            Some((best, _)) => vec![PathAddr::Udp(best)],
+            None => {
+                let derp = Some(p.derp_region()).filter(|r| *r != 0).map(PathAddr::Derp);
+                let udp = p.candidates.keys().filter(|_| self.enable_udp).copied().map(PathAddr::Udp);
+                derp.into_iter().chain(udp).collect()
+            }
+        };
+        for to in paths {
+            self.send_ping_locked(&mut inner, peer, to, now, Some(tx.clone()));
+        }
+        if direct.is_none() {
+            self.call_me_maybe_locked(&mut inner, peer, now);
+        }
+        drop(inner);
+        Ok(())
     }
 
     /// Stops all background work.
