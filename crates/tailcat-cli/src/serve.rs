@@ -110,7 +110,7 @@ impl PortSet {
     /// every port but 0.
     fn tcp_ranges(&self, extra: impl IntoIterator<Item = u16>) -> Vec<PortRange> {
         if self.all {
-            return vec![PortRange { first: 1, last: u16::MAX }];
+            return vec![PortRange::new(1, u16::MAX)];
         }
         let ports: BTreeSet<u16> = self.ports.iter().copied().chain(extra).collect();
         PortRange::coalesce(ports)
@@ -686,9 +686,9 @@ mod tests {
         assert!(!ps.contains(0));
         assert!(ps.contains(65535));
         assert_eq!(ps.services, BTreeSet::from([Service::Perf]));
-        assert_eq!(ps.tcp_ranges([22]), [PortRange { first: 1, last: 65535 }]);
+        assert_eq!(ps.tcp_ranges([22]), [PortRange::new(1, 65535)]);
         let ps = parse_port_set("80,81").unwrap();
-        assert_eq!(ps.tcp_ranges([22, 82, 22]), [PortRange::single(22), PortRange { first: 80, last: 82 }]);
+        assert_eq!(ps.tcp_ranges([22, 82, 22]), [PortRange::single(22), PortRange::new(80, 82)]);
         // SSH services need SSH support.
         assert_eq!(parse_port_set("files").is_ok(), cfg!(feature = "ssh"));
 

@@ -56,10 +56,15 @@ pub struct PortRange {
 }
 
 impl PortRange {
-    pub const ALL: PortRange = PortRange { first: 0, last: 65535 };
+    pub const ALL: PortRange = PortRange::new(0, 65535);
 
-    pub fn single(p: u16) -> Self {
-        PortRange { first: p, last: p }
+    /// The ports from `first` to `last`, both included.
+    pub const fn new(first: u16, last: u16) -> Self {
+        PortRange { first, last }
+    }
+
+    pub const fn single(p: u16) -> Self {
+        PortRange::new(p, p)
     }
 
     pub fn contains(&self, p: u16) -> bool {
@@ -1003,14 +1008,14 @@ mod tests {
     #[test]
     fn coalesce_ports() {
         let r = PortRange::coalesce([22, 80, 81, 82, 443]);
-        assert_eq!(r, vec![PortRange::single(22), PortRange { first: 80, last: 82 }, PortRange::single(443)]);
+        assert_eq!(r, vec![PortRange::single(22), PortRange::new(80, 82), PortRange::single(443)]);
     }
 
     #[test]
     fn port_filters() {
         assert!(PortRange::ALL.contains(0));
         assert!(PortRange::ALL.contains(65535));
-        assert_eq!(PortRange::coalesce([65534, 65535]), vec![PortRange { first: 65534, last: 65535 }]);
+        assert_eq!(PortRange::coalesce([65534, 65535]), vec![PortRange::new(65534, 65535)]);
         assert!(admits(&None, 1));
         let only_ssh = Some(vec![PortRange::single(22)]);
         assert!(admits(&only_ssh, 22));
