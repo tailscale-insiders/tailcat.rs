@@ -1,6 +1,7 @@
 //! Saved keys, in `$CONFIG/tailcat/keys/<name>.private.json` (the same
 //! location and format as the Go implementation, so keys are shared).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -30,7 +31,7 @@ pub fn key_file(k: &KeyArg) -> Result<Option<PathBuf>> {
 
 /// Loads a key file.
 pub fn load(path: &Path) -> Result<PrivateKey> {
-    let j = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let j = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&j).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -57,8 +58,6 @@ pub fn client_key(g: &Global) -> Result<NodePrivate> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     fn global(key: Option<&str>) -> Global {
