@@ -80,7 +80,6 @@ impl ConnHandler {
         if !opts.exec.is_empty() {
             // On top of our own environment, which the command inherits.
             let env = crate::exec::peer_env(self.local, self.remote, peer)
-                .into_iter()
                 .chain(client_env)
                 .chain(raw_cmd.map(|c| ("SSH_ORIGINAL_COMMAND".into(), c)))
                 .collect();

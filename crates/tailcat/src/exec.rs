@@ -20,12 +20,15 @@ use crate::server::{Server, TcpHandler, handler};
 ///   authenticated by the tunnel;
 /// - `TAILCAT_REMOTE_ADDR`: the peer's tailcat IP:port;
 /// - `TAILCAT_LOCAL_ADDR`: the server address:port it connected to.
-pub fn peer_env(local: SocketAddr, remote: SocketAddr, key: Option<NodePublic>) -> Vec<(String, String)> {
+pub fn peer_env(
+    local: SocketAddr,
+    remote: SocketAddr,
+    key: Option<NodePublic>,
+) -> impl Iterator<Item = (String, String)> {
     [("TAILCAT_REMOTE_ADDR", remote.to_string()), ("TAILCAT_LOCAL_ADDR", local.to_string())]
         .into_iter()
         .chain(key.map(|k| ("TAILCAT_PEER_KEY", k.to_string())))
         .map(|(k, v)| (k.to_string(), v))
-        .collect()
 }
 
 impl Server {
@@ -64,7 +67,7 @@ async fn run_conn_command(s: &Server, c: TcpStream, argv: &[String]) -> std::io:
 /// its exit status once it has exited and its output is flushed.
 async fn run_command<R, W>(
     argv: &[String],
-    env: Vec<(String, String)>,
+    env: impl IntoIterator<Item = (String, String)>,
     rd: &mut R,
     wr: &mut W,
 ) -> std::io::Result<ExitStatus>
