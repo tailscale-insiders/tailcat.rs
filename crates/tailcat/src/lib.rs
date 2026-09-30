@@ -122,8 +122,8 @@ impl From<Error> for io::Error {
     }
 }
 
-/// A `Result` with this crate's [`Error`].
-pub type Result<T> = std::result::Result<T, Error>;
+/// A `Result` whose error is this crate's [`Error`] unless it says otherwise.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Sets whether library internals log verbosely (at debug level) about
 /// region selection and path discovery. Logging itself goes through the
