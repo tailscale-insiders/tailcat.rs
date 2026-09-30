@@ -82,6 +82,36 @@ impl Table {
         self.configs.get(k).is_some_and(|(cd, _)| cd == d)
     }
 
+    /// Whether a disco message sealed with one of node `k`'s keys came
+    /// from `a`.
+    fn heard_from(&self, k: &NodePublic, a: SocketAddr) -> bool {
+        self.history[k].iter().any(|d| self.heard.contains(&(a, *d)))
+    }
+
+    /// Our outstanding pings, in a stable order.
+    fn pending_pings(&self) -> Vec<(TxId, NodePublic, PathAddr)> {
+        let inner = self.ms.inner.lock().unwrap();
+        let mut pending: Vec<_> = inner.pending.iter().map(|(tx, pp)| (*tx, pp.peer, pp.to)).collect();
+        pending.sort_by_key(|(tx, ..)| *tx);
+        pending
+    }
+
+    /// The DERP region peer `k` was last heard from.
+    fn derp_seen(&self, k: &NodePublic) -> Option<i32> {
+        self.ms.inner.lock().unwrap().peers[k].derp_seen
+    }
+
+    fn forget_derp_seen(&self, k: &NodePublic) {
+        if let Some(p) = self.ms.inner.lock().unwrap().peers.get_mut(k) {
+            p.derp_seen = None;
+        }
+    }
+
+    /// The peer UDP address `a` maps to.
+    fn mapped(&self, a: &SocketAddr) -> Option<NodePublic> {
+        self.ms.inner.lock().unwrap().by_addr.get(a).copied()
+    }
+
     /// Delivers `msg`, sealed with `from`, over `src`.
     fn deliver(&mut self, from: &DiscoPrivate, msg: &Message, src: PathAddr, derp_src: Option<NodePublic>) {
         let pkt = disco::seal(&from.public(), &from.shared(&self.ms.disco_public()), msg);
@@ -129,24 +159,22 @@ impl Table {
         let from = self.draw_disco(&tc);
         let (src, derp_src) = self.draw_path(&tc);
         let node_key = tc.draw_named("with_node_key", gs::booleans()).then(|| self.draw_node(&tc));
-        if let Some(k) = derp_src
-            && let Some(p) = self.ms.inner.lock().unwrap().peers.get_mut(&k)
-        {
-            p.derp_seen = None;
+        if let Some(k) = derp_src {
+            self.forget_derp_seen(&k);
         }
-        let tx_id = rand::random();
-        self.deliver(&from, &Message::Ping { tx_id, node_key, padding: 0 }, src, derp_src);
+
+        let ping = Message::Ping { tx_id: rand::random(), node_key, padding: 0 };
+        self.deliver(&from, &ping, src, derp_src);
+
         if let Some(k) = derp_src
             && self.holds(&k, &from.public())
         {
-            let seen = self.ms.inner.lock().unwrap().peers[&k].derp_seen;
-            assert_eq!(seen, Some(REGION), "a DERP ping from its holder was not attributed to it");
+            assert_eq!(self.derp_seen(&k), Some(REGION), "a DERP ping from its holder was not attributed to it");
         }
         if let (PathAddr::Udp(a), Some(k)) = (src, node_key)
             && self.holds(&k, &from.public())
         {
-            let mapped = self.ms.inner.lock().unwrap().by_addr.get(&a).copied();
-            assert_eq!(mapped, Some(k), "a UDP ping naming its holder was not attributed to it");
+            assert_eq!(self.mapped(&a), Some(k), "a UDP ping naming its holder was not attributed to it");
         }
     }
 
@@ -155,14 +183,14 @@ impl Table {
     /// DERP, comes from that peer).
     #[rule]
     fn pong(&mut self, tc: TestCase) {
-        let mut pending: Vec<(TxId, NodePublic, PathAddr)> =
-            self.ms.inner.lock().unwrap().pending.iter().map(|(tx, pp)| (*tx, pp.peer, pp.to)).collect();
+        let pending = self.pending_pings();
         tc.assume(!pending.is_empty());
-        pending.sort_by_key(|(tx, ..)| *tx);
         let (tx_id, pinged, to) = pending[tc.draw_named("ping", gs::integers::<usize>().max_value(pending.len() - 1))];
         let from = self.draw_disco(&tc);
         let (src, derp_src) = self.draw_path(&tc);
+
         self.deliver(&from, &Message::Pong { tx_id, src: addrs()[0] }, src, derp_src);
+
         let genuine = self.holds(&pinged, &from.public()) && derp_src.is_none_or(|k| k == pinged);
         let inner = self.ms.inner.lock().unwrap();
         assert_eq!(!inner.pending.contains_key(&tx_id), genuine, "genuine pong: {genuine}");
@@ -230,8 +258,7 @@ impl Table {
         }
         for (a, k) in &inner.by_addr {
             assert!(inner.peers.contains_key(k), "{a} maps to removed peer {k:?}");
-            let heard = self.history[k].iter().any(|d| self.heard.contains(&(*a, *d)));
-            assert!(heard, "{a} maps to {k:?} without a disco message from there");
+            assert!(self.heard_from(k, *a), "{a} maps to {k:?} without a disco message from there");
         }
     }
 
@@ -243,9 +270,8 @@ impl Table {
         for (k, p) in &inner.peers {
             let advertised = self.advertised.get(k).map_or(&[][..], |v| v);
             for a in p.candidates.keys() {
-                let ok = self.configs.get(k).is_some_and(|(_, eps)| eps.contains(a))
-                    || advertised.contains(a)
-                    || self.history[k].iter().any(|d| self.heard.contains(&(*a, *d)));
+                let configured = self.configs.get(k).is_some_and(|(_, eps)| eps.contains(a));
+                let ok = configured || advertised.contains(a) || self.heard_from(k, *a);
                 assert!(ok, "{k:?} still has candidate {a}");
             }
         }

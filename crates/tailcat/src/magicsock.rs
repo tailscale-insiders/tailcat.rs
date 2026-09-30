@@ -975,6 +975,8 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use tokio::time::{sleep, timeout};
+
     use super::*;
     use crate::derp::server::DevDerp;
 
@@ -1010,7 +1012,7 @@ mod tests {
     }
 
     async fn recv(rx: &mut mpsc::Receiver<WireguardPacket>) -> WireguardPacket {
-        tokio::time::timeout(T, rx.recv()).await.unwrap().unwrap()
+        timeout(T, rx.recv()).await.unwrap().unwrap()
     }
 
     #[tokio::test]
@@ -1018,29 +1020,47 @@ mod tests {
         let dev = DevDerp::start_local().await.unwrap();
         let (a, _a_rx) = sock(&dev, false).await;
         let (b, mut b_rx) = sock(&dev, false).await;
+        let b_key = b.public_key();
         let stranger = NodePrivate::generate().public();
-        assert!(a.ping(&b.public_key(), T).await.is_err(), "pinged an unknown peer");
+        assert!(a.ping(&b_key, T).await.is_err(), "pinged an unknown peer");
         introduce(&a, &b);
 
-        let r = a.ping(&b.public_key(), T).await.unwrap();
+        let r = a.ping(&b_key, T).await.unwrap();
         assert_eq!(r.via, PathAddr::Derp(1));
-        let path = a.peer_path(&b.public_key()).unwrap();
-        assert!(path.best.is_none() && !path.direct_trusted && path.candidates.is_empty());
+        let path = a.peer_path(&b_key).unwrap();
+        assert!(path.best.is_none());
+        assert!(!path.direct_trusted);
+        assert!(path.candidates.is_empty());
         assert_eq!(path.home_region, 1);
 
-        a.send_wireguard(&b.public_key(), b"not really WireGuard").unwrap();
+        a.send_wireguard(&b_key, b"not really WireGuard").unwrap();
         let p = recv(&mut b_rx).await;
-        assert_eq!(
-            (p.peer, p.src, p.data.as_slice()),
-            (Some(a.public_key()), PathAddr::Derp(1), &b"not really WireGuard"[..])
-        );
+        assert_eq!(p.peer, Some(a.public_key()));
+        assert_eq!(p.src, PathAddr::Derp(1));
+        assert_eq!(p.data, b"not really WireGuard");
         assert!(b.peer_path(&a.public_key()).unwrap().last_recv.is_some());
         assert!(a.send_wireguard(&stranger, b"x").is_err());
 
-        assert!(a.remove_peer(&b.public_key()));
-        assert!(!a.remove_peer(&b.public_key()));
-        assert!(a.peer_path(&b.public_key()).is_none());
-        assert!(a.ping(&b.public_key(), T).await.is_err());
+        assert!(a.remove_peer(&b_key));
+        assert!(!a.remove_peer(&b_key));
+        assert!(a.peer_path(&b_key).is_none());
+        assert!(a.ping(&b_key, T).await.is_err());
+    }
+
+    /// Pings `b` from `a` until `a` trusts a direct path to it, returning
+    /// that path.
+    async fn direct_path(a: &MagicSock, b: &MagicSock) -> SocketAddr {
+        let trusted = async {
+            loop {
+                let _ = a.ping(&b.public_key(), Duration::from_secs(1)).await;
+                if let Some(PeerPath { best: Some((addr, _)), direct_trusted: true, .. }) = a.peer_path(&b.public_key())
+                {
+                    return addr;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        timeout(T, trusted).await.expect("no direct path")
     }
 
     #[tokio::test]
@@ -1051,17 +1071,7 @@ mod tests {
         introduce(&a, &b);
         // STUN against the local relay finds each side's loopback address,
         // which CallMeMaybe then hands to the other.
-        let direct = async {
-            loop {
-                let _ = a.ping(&b.public_key(), Duration::from_secs(1)).await;
-                if a.peer_path(&b.public_key()).is_some_and(|p| p.direct_trusted) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
-        tokio::time::timeout(T, direct).await.expect("no direct path");
-        let (best, _) = a.peer_path(&b.public_key()).unwrap().best.unwrap();
+        let best = direct_path(&a, &b).await;
         assert!(!a.endpoints().is_empty());
 
         // With a trusted path, pings and packets go only that way.
@@ -1071,19 +1081,16 @@ mod tests {
         a.send_wireguard(&b.public_key(), b"direct").unwrap();
         let p = recv(&mut b_rx).await;
         assert!(matches!(p.src, PathAddr::Udp(_)), "came via {}", p.src);
-        assert_eq!((p.peer, p.data.as_slice()), (Some(a.public_key()), &b"direct"[..]));
+        assert_eq!(p.peer, Some(a.public_key()));
+        assert_eq!(p.data, b"direct");
     }
 
     #[test]
     fn peer_derp_region_falls_back_to_where_it_was_heard() {
         let k = NodePrivate::generate();
-        let cfg = PeerConfig {
-            node_key: k.public(),
-            disco_key: k.disco_private().public(),
-            home_region: 0,
-            endpoints: vec![],
-        };
-        let mut p = Peer::new(cfg, Arc::new(k.disco_private().shared(&k.disco_private().public())));
+        let disco = k.disco_private();
+        let cfg = PeerConfig { node_key: k.public(), disco_key: disco.public(), home_region: 0, endpoints: vec![] };
+        let mut p = Peer::new(cfg, Arc::new(disco.shared(&disco.public())));
         assert_eq!(p.derp_region(), 0);
         p.derp_seen = Some(7);
         assert_eq!(p.derp_region(), 7);
@@ -1104,19 +1111,22 @@ mod tests {
         let pubv4: SocketAddr = "203.0.113.1:1".parse().unwrap();
         let pubv4b: SocketAddr = "203.0.113.2:1".parse().unwrap();
         let lan: SocketAddr = "192.168.1.2:1".parse().unwrap();
-        let ms = Duration::from_millis;
-        assert!(better_addr((pubv4, ms(10)), None));
-        assert!(better_addr((pubv4, ms(10)), Some((pubv4b, ms(50)))));
-        assert!(better_addr((pubv4, ms(49)), Some((pubv4b, ms(50)))));
-        assert!(!better_addr((pubv4, ms(51)), Some((pubv4b, ms(50)))));
-        assert!(better_addr((lan, ms(12)), Some((pubv4, ms(10)))));
-        assert!(!better_addr((pubv4, ms(10)), Some((pubv4, ms(50)))));
-        // IPv6 earns a bonus too, but less than being local.
         let pubv6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
-        assert!(better_addr((pubv6, ms(10)), Some((pubv4, ms(10)))));
-        assert!(!better_addr((pubv4, ms(10)), Some((pubv6, ms(10)))));
-        assert!(!better_addr((pubv6, ms(10)), Some((lan, ms(10)))));
+        let ms = Duration::from_millis;
+        // Whether `a` at `a_ms` beats `b` at `b_ms`.
+        let better = |a, a_ms, b, b_ms| better_addr((a, ms(a_ms)), Some((b, ms(b_ms))));
+
+        assert!(better_addr((pubv4, ms(10)), None));
+        assert!(better(pubv4, 10, pubv4b, 50));
+        assert!(better(pubv4, 49, pubv4b, 50));
+        assert!(!better(pubv4, 51, pubv4b, 50));
+        assert!(better(lan, 12, pubv4, 10));
+        assert!(!better(pubv4, 10, pubv4, 50));
+        // IPv6 earns a bonus too, but less than being local.
+        assert!(better(pubv6, 10, pubv4, 10));
+        assert!(!better(pubv4, 10, pubv6, 10));
+        assert!(!better(pubv6, 10, lan, 10));
         // Equal scores fall back to raw latency, zero included.
-        assert!(!better_addr((pubv4, ms(0)), Some((pubv4b, ms(0)))));
+        assert!(!better(pubv4, 0, pubv4b, 0));
     }
 }
