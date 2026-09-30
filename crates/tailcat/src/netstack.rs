@@ -8,14 +8,16 @@
 //! that decide, per flow, whether to accept, reset or drop them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
+use std::future::{self, Future};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
+use std::{fmt, mem};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
@@ -41,7 +43,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(120);
 /// the last segment received, so an idle peer would look like a dead one.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// The ephemeral port range for outbound flows.
-const EPHEMERAL: std::ops::RangeInclusive<u16> = 32768..=60999;
+const EPHEMERAL: RangeInclusive<u16> = 32768..=60999;
 
 /// What to do with a new inbound TCP connection.
 pub enum TcpDecision {
@@ -266,7 +268,7 @@ impl State {
         });
 
         let delay = self.iface.poll_delay(self.now(), &self.sockets);
-        Polled { out: std::mem::take(&mut self.device.tx), delay, accepted, closed: self.closed }
+        Polled { out: mem::take(&mut self.device.tx), delay, accepted, closed: self.closed }
     }
 
     fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
@@ -380,7 +382,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap()
     }
 }
@@ -561,7 +563,7 @@ impl Stack {
     /// Opens a TCP connection from `local_ip` to `remote`.
     pub async fn dial_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
         let stream = self.open_tcp(local_ip, remote)?;
-        std::future::poll_fn(|cx| stream.poll_connected(cx)).await?;
+        future::poll_fn(|cx| stream.poll_connected(cx)).await?;
         Ok(stream)
     }
 
@@ -789,8 +791,8 @@ impl TcpStream {
     }
 }
 
-impl std::fmt::Debug for TcpStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TcpStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "TcpStream({} -> {})", self.local, self.remote)
     }
 }
@@ -984,8 +986,8 @@ impl Drop for UdpConn {
     }
 }
 
-impl std::fmt::Debug for UdpConn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for UdpConn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "UdpConn({} <-> {})", self.local, self.remote)
     }
 }
