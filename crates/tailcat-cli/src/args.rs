@@ -335,7 +335,13 @@ impl FromStr for FilesArg {
 /// A perf `--bytes` count: more than zero, with an optional K, M, or G
 /// suffix (powers of 1000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteCount(pub i64);
+pub struct ByteCount(i64);
+
+impl ByteCount {
+    pub fn bytes(self) -> i64 {
+        self.0
+    }
+}
 
 impl FromStr for ByteCount {
     type Err = String;

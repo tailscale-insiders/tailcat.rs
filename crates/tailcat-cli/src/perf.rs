@@ -1281,7 +1281,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
         interval: a.interval,
     };
     if let Some(b) = a.bytes {
-        p.bytes = b.0;
+        p.bytes = b.bytes();
         p.duration = Duration::ZERO;
     }
     if let Some(b) = a.bitrate {
