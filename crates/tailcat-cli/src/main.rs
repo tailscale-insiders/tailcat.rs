@@ -371,7 +371,7 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             forward::run_forward(g, &bind, &addr, &mappings, open_browser).await?;
         }
         Some(Cmd::Browse { addr }) => {
-            let port_80 = args::ForwardArg { local: 0, remote: args::Dest::Port(80) };
+            let port_80 = args::ForwardArg::new(0, args::Dest::Port(80));
             forward::run_forward(g, "127.0.0.1", &addr, &[port_80], true).await?
         }
         Some(Cmd::Parse { addr }) => {

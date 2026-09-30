@@ -162,19 +162,28 @@ pub struct ForwardArg {
     pub remote: Dest,
 }
 
+impl ForwardArg {
+    /// Forwards local port `local` (0 for any free one) to `remote`.
+    pub fn new(local: u16, remote: Dest) -> Self {
+        ForwardArg { local, remote }
+    }
+
+    /// Forwards port `p` here to the same port on the server.
+    pub fn same_port(p: u16) -> Self {
+        ForwardArg::new(p, Dest::Port(p))
+    }
+}
+
 impl FromStr for ForwardArg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
         let port =
             |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| format!("invalid local port {p:?}"));
-        let Some((local, remote)) = s.split_once(':') else {
-            let p = port(s)?;
-            return Ok(ForwardArg { local: p, remote: Dest::Port(p) });
-        };
+        let Some((local, remote)) = s.split_once(':') else { return port(s).map(ForwardArg::same_port) };
         let local = if local == "0" { 0 } else { port(local)? };
         let remote = remote.parse().map_err(|_| format!("remote target {remote:?} is not a port or address:port"))?;
-        Ok(ForwardArg { local, remote })
+        Ok(ForwardArg::new(local, remote))
     }
 }
 
@@ -440,11 +449,11 @@ mod tests {
     fn forward_args() {
         let fwd = |s: &str| s.parse::<ForwardArg>();
         let via = |a: &str| Dest::Via(a.parse().unwrap());
-        assert_eq!(fwd("8080"), Ok(ForwardArg { local: 8080, remote: Dest::Port(8080) }));
-        assert_eq!(fwd("18080:8080"), Ok(ForwardArg { local: 18080, remote: Dest::Port(8080) }));
-        assert_eq!(fwd("0:80"), Ok(ForwardArg { local: 0, remote: Dest::Port(80) }));
-        assert_eq!(fwd("13306:192.168.1.10:3306"), Ok(ForwardArg { local: 13306, remote: via("192.168.1.10:3306") }));
-        assert_eq!(fwd("8080:[fd7a::1]:80"), Ok(ForwardArg { local: 8080, remote: via("[fd7a::1]:80") }));
+        assert_eq!(fwd("8080"), Ok(ForwardArg::same_port(8080)));
+        assert_eq!(fwd("18080:8080"), Ok(ForwardArg::new(18080, Dest::Port(8080))));
+        assert_eq!(fwd("0:80"), Ok(ForwardArg::new(0, Dest::Port(80))));
+        assert_eq!(fwd("13306:192.168.1.10:3306"), Ok(ForwardArg::new(13306, via("192.168.1.10:3306"))));
+        assert_eq!(fwd("8080:[fd7a::1]:80"), Ok(ForwardArg::new(8080, via("[fd7a::1]:80"))));
         for bad in ["", "0", ":80", "x:80", "65536", "80:0", "80:65536", "80:nope", "80:host:22", "00:80"] {
             assert!(fwd(bad).is_err(), "{bad:?} parsed");
         }
