@@ -545,9 +545,7 @@ impl MagicSock {
 
     fn send_udp(&self, a: SocketAddr, pkt: &[u8]) {
         let sock = if a.is_ipv4() { &self.udp4 } else { &self.udp6 };
-        if let Some(s) = sock
-            && let Err(e) = s.try_send_to(pkt, a)
-        {
+        if let Some(Err(e)) = sock.as_ref().map(|s| s.try_send_to(pkt, a)) {
             trace!("magicsock: send to {a}: {e}");
         }
     }
@@ -736,9 +734,7 @@ impl MagicSock {
         }
         let mut inner = self.inner.lock().unwrap();
         let peer = inner.by_addr.get(&src).copied();
-        if let Some(k) = peer
-            && let Some(p) = inner.peers.get_mut(&k)
-        {
+        if let Some(p) = peer.and_then(|k| inner.peers.get_mut(&k)) {
             p.last_recv = Some(Instant::now());
         }
         drop(inner);
@@ -750,9 +746,7 @@ impl MagicSock {
             self.handle_disco(&rp.data, PathAddr::Derp(rp.region_id), Some(rp.src));
             return;
         }
-        if let Some(h) = &self.on_derp_recv
-            && h(rp.region_id, rp.src, &rp.data)
-        {
+        if self.on_derp_recv.as_ref().is_some_and(|h| h(rp.region_id, rp.src, &rp.data)) {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
