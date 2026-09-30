@@ -556,6 +556,38 @@ impl Net {
         }
     }
 
+    /// Whether connection `i` is the latest on its 4-tuple, and our socket
+    /// for it is in TIME-WAIT.
+    fn time_wait(&self, i: usize) -> bool {
+        let Some(key) = self.conns[i].key else { return false };
+        let st = self.stack.shared.lock();
+        self.live.get(&key) == Some(&i)
+            && st.tuples.get(&key).is_some_and(|&h| st.sockets.get::<tcp::Socket>(h).state() == tcp::State::TimeWait)
+    }
+
+    /// A delayed duplicate of connection `j`'s SYN arrives while our
+    /// socket for the latest connection on its 4-tuple, `i`, is in
+    /// TIME-WAIT. It starts below where `i` ended, so it's old: it opens
+    /// no connection, and `i`'s socket keeps the 4-tuple.
+    fn replay_syn(&mut self, i: usize, j: usize) {
+        let key = self.conns[i].key.unwrap();
+        assert_eq!(
+            self.conns[j].key,
+            Some(key),
+            "{} isn't on {}'s 4-tuple",
+            self.conns[j].name(),
+            self.conns[i].name()
+        );
+        let socket = |net: &Net| net.stack.shared.lock().tuples.get(&key).copied();
+        let (before, stack_isn) = (socket(self), self.conns[i].stack_isn);
+        self.inject(segment(key.1, key.0, TcpControl::Syn, self.conns[j].isn, None, &[]));
+        self.settle();
+        let name = self.conns[i].name();
+        assert_eq!(self.conns[i].stack_isn, stack_isn, "{name}: an old SYN was answered with a SYN-ACK");
+        assert_eq!(socket(self), before, "{name}: an old SYN took the 4-tuple from its TIME-WAIT socket");
+        assert!(self.time_wait(i), "{name}: an old SYN ended TIME-WAIT");
+    }
+
     /// Whether stream `i` has nothing left to send.
     fn drained(&self, i: usize) -> bool {
         let c = &self.conns[i];
@@ -675,6 +707,17 @@ impl Net {
         self.close_write(i);
     }
 
+    /// We close a connection and the remote closes back, leaving our side
+    /// in TIME-WAIT: rare as two separate steps.
+    #[rule]
+    fn close_both_rule(&mut self, tc: TestCase) {
+        let i = self.pick(&tc, |c| c.stream.is_some() && c.established && c.talking() && !c.fin && !c.write_closed);
+        self.close_write(i);
+        if self.conns[i].talking() {
+            self.remote_send(i, TcpControl::Fin, &[]);
+        }
+    }
+
     #[rule]
     fn abort_rule(&mut self, tc: TestCase) {
         let i = self.pick(&tc, |c| c.stream.is_some());
@@ -692,6 +735,17 @@ impl Net {
     fn close_rule(&mut self, tc: TestCase) {
         tc.assume(!self.closed);
         self.close();
+    }
+
+    /// A remote's delayed duplicate of an earlier SYN arrives, on a 4-tuple
+    /// our side holds in TIME-WAIT.
+    #[rule]
+    fn replay_syn_rule(&mut self, tc: TestCase) {
+        let waiting: Vec<usize> = (0..self.conns.len()).filter(|&i| self.time_wait(i)).collect();
+        tc.assume(!waiting.is_empty());
+        let i = waiting[tc.draw(gs::integers::<usize>().max_value(waiting.len() - 1))];
+        let j = self.pick(&tc, |c| c.key == self.conns[i].key);
+        self.replay_syn(i, j);
     }
 
     /// Time passes.
@@ -839,6 +893,7 @@ impl Net {
         assert!(unowned <= dials, "{unowned} sockets belong to nobody");
         assert!(st.tuples.values().all(|h| live.contains(h)), "a flow's socket was removed");
         assert!(st.ends.keys().all(|h| live.contains(h)), "a removed socket's end is kept");
+        assert!(st.fins.keys().all(|h| live.contains(h)), "a removed socket's FIN is kept");
         assert!(st.orphans.iter().all(|(h, _)| live.contains(h)), "a removed socket is an orphan");
         let t = st.now();
         let State { iface, sockets, .. } = &mut *st;
@@ -1020,6 +1075,27 @@ fn tuple_reused_after_time_wait() {
     net.complete(second);
     net.remote_send(second, TcpControl::Psh, b"hello");
     assert_eq!(net.conns[second].received, b"hello");
+}
+
+/// A delayed duplicate of a connection's SYN, arriving while our side of
+/// it is in TIME-WAIT, is old: it starts below where the connection
+/// ended. Since a SYN on a finished connection's 4-tuple could take the
+/// flow, the duplicate went to the policy and opened a new connection. A
+/// real new connection from the remote still gets through.
+#[test]
+fn old_syn_in_time_wait_is_a_duplicate() {
+    let mut net = Net::new();
+    let first = net.open(SOURCE_PORTS[0]);
+    net.complete(first);
+    net.remote_send(first, TcpControl::Psh, b"hello");
+    net.close_write(first);
+    net.remote_send(first, TcpControl::Fin, &[]);
+    assert!(net.time_wait(first));
+    net.replay_syn(first, first);
+    let second = net.open(SOURCE_PORTS[0]);
+    net.complete(second);
+    net.remote_send(second, TcpControl::Psh, b"again");
+    assert_eq!(net.conns[second].received, b"again");
 }
 
 /// Waiting for a busy connection to drain doesn't spin: drain_tcp woke

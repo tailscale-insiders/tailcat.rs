@@ -394,6 +394,7 @@ impl Net {
         }
         assert!(st.tuples.values().all(|h| live.contains(h)), "a flow's socket was removed");
         assert!(st.ends.keys().all(|h| live.contains(h)), "a removed socket's end is kept");
+        assert!(st.fins.keys().all(|h| live.contains(h)), "a removed socket's FIN is kept");
     }
 }
 

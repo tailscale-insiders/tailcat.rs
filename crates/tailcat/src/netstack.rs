@@ -21,7 +21,8 @@ use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle,
 use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket, UdpRepr,
+    HardwareAddress, IpAddress, IpCidr, IpProtocol, IpRepr, Ipv4Packet, Ipv6Packet, TcpPacket, TcpSeqNumber, UdpPacket,
+    UdpRepr,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
@@ -163,6 +164,9 @@ struct State {
     /// How connections ended, where the socket's state doesn't say: a
     /// closed socket may have had a FIN, a RST or an abort.
     ends: HashMap<SocketHandle, End>,
+    /// Where the peer's side of each connection it closed ended: the
+    /// sequence number just past its FIN.
+    fins: HashMap<SocketHandle, TcpSeqNumber>,
     /// Sockets no longer referenced by a TcpStream, and since when;
     /// they're removed once they finish closing.
     orphans: Vec<(SocketHandle, tokio::time::Instant)>,
@@ -205,7 +209,7 @@ impl State {
     /// How the connection on socket `h` ended, if its receive side has.
     fn end(&self, h: SocketHandle) -> Option<End> {
         match self.sockets.get::<tcp::Socket>(h).state() {
-            tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait => Some(End::Fin),
+            s if peer_closed(s) => Some(End::Fin),
             // smoltcp closes a socket by itself only on a RST, which
             // `ingress` records, or when the peer times out.
             tcp::State::Closed => Some(self.ends.get(&h).copied().unwrap_or(End::TimedOut)),
@@ -214,30 +218,39 @@ impl State {
     }
 
     /// Feeds the queued packets to smoltcp one at a time, recording how
-    /// connections end. A smoltcp socket in Listen takes a SYN from any
-    /// peer, so an accepted socket waits closed, listens only while its
-    /// own flow's SYN is processed, and is closed again if it's still
-    /// listening afterwards (or back to listening, after a RST).
+    /// connections end and where the peer's FIN was. A smoltcp socket in
+    /// Listen takes a SYN from any peer, so an accepted socket waits
+    /// closed, listens only while its own flow's SYN is processed, and is
+    /// closed again if it's still listening afterwards (or back to
+    /// listening, after a RST).
     fn ingress(&mut self, now: smoltcp::time::Instant) {
         while let Some(pkt) = self.device.rx.front() {
             let flow = tcp_flow(pkt);
-            let h = flow.and_then(|(key, _)| self.tuples.get(&key).copied());
-            if let (Some(((local, _), true)), Some(h)) = (flow, h)
+            let h = flow.and_then(|(key, ..)| self.tuples.get(&key).copied());
+            if let (Some(((local, _), true, _)), Some(h)) = (flow, h)
                 && self.accepting.contains_key(&h)
             {
                 let s = self.sockets.get_mut::<tcp::Socket>(h);
                 if s.state() == tcp::State::Closed && s.listen(local).is_ok() {
                     self.ends.remove(&h);
+                    self.fins.remove(&h);
                 }
             }
+            let fin_end = flow.and_then(|(.., end)| end);
             let before = h.map(|h| self.sockets.get::<tcp::Socket>(h).state());
             self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets);
             let (Some(h), Some(before)) = (h, before) else { continue };
             let s = self.sockets.get_mut::<tcp::Socket>(h);
             match s.state() {
                 tcp::State::Listen => s.close(),
-                tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait => {
+                state if peer_closed(state) => {
                     self.ends.entry(h).or_insert(End::Fin);
+                    // This segment's FIN closed the peer's side.
+                    if !peer_closed(before)
+                        && let Some(end) = fin_end
+                    {
+                        self.fins.insert(h, end);
+                    }
                 }
                 tcp::State::Closed if before != tcp::State::Closed => {
                     self.ends.entry(h).or_insert(End::Reset);
@@ -264,12 +277,19 @@ fn parse_ip(pkt: &[u8]) -> Option<(IpAddr, IpAddr, IpProtocol, &[u8])> {
     Some((src, dst, proto, &pkt[off.min(pkt.len())..]))
 }
 
-/// A TCP segment's flow, and whether it's a connection's opening SYN.
-fn tcp_flow(pkt: &[u8]) -> Option<(FlowKey, bool)> {
+/// A TCP segment's flow, whether it's a connection's opening SYN, and,
+/// if it carries a FIN, the sequence number just past it.
+fn tcp_flow(pkt: &[u8]) -> Option<(FlowKey, bool, Option<TcpSeqNumber>)> {
     let (src, dst, IpProtocol::Tcp, body) = parse_ip(pkt)? else { return None };
     let tcp = TcpPacket::new_checked(body).ok()?;
     let key = (SocketAddr::new(dst, tcp.dst_port()), SocketAddr::new(src, tcp.src_port()));
-    Some((key, tcp.syn() && !tcp.ack() && !tcp.rst()))
+    let fin_end = tcp.fin().then(|| tcp.seq_number() + tcp.segment_len());
+    Some((key, tcp.syn() && !tcp.ack() && !tcp.rst(), fin_end))
+}
+
+/// Whether a socket in `state` has had the peer's FIN.
+fn peer_closed(state: tcp::State) -> bool {
+    matches!(state, tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait)
 }
 
 fn socket_addr(ep: smoltcp::wire::IpEndpoint) -> SocketAddr {
@@ -328,6 +348,7 @@ impl Stack {
                 accepting: HashMap::new(),
                 tuples: HashMap::new(),
                 ends: HashMap::new(),
+                fins: HashMap::new(),
                 orphans: Vec::new(),
                 udp: HashMap::new(),
                 next_port: rand::Rng::gen_range(&mut rand::thread_rng(), EPHEMERAL),
@@ -367,16 +388,25 @@ impl Stack {
             let (s, d) = (SocketAddr::new(src, tcp.src_port()), SocketAddr::new(dst, tcp.dst_port()));
             // A SYN on the 4-tuple of a connection that's over starts a new
             // one; the old socket stays with its stream until it's dropped.
-            // In TIME-WAIT it would swallow the SYN, so it's aborted: the
-            // peer ignores its RST, which has the old connection's numbers.
+            // In TIME-WAIT, the SYN must start past the end of the peer's
+            // side of the old connection, as RFC 1122 (4.2.2.13) has it and
+            // Linux checks; an older one is a delayed duplicate, for the
+            // socket to answer. (Timestamps would tell too, but smoltcp
+            // doesn't negotiate them.) The socket would swallow a new SYN,
+            // so it's aborted: the peer ignores its RST, which has the old
+            // connection's numbers.
             if let Some(&h) = st.tuples.get(&(d, s))
                 && tcp.syn()
                 && !tcp.ack()
                 && !st.accepting.contains_key(&h)
             {
-                let old = st.sockets.get_mut::<tcp::Socket>(h);
-                if matches!(old.state(), tcp::State::Closed | tcp::State::TimeWait) {
-                    old.abort();
+                let over = match st.sockets.get::<tcp::Socket>(h).state() {
+                    tcp::State::Closed => true,
+                    tcp::State::TimeWait => st.fins.get(&h).is_some_and(|&end| tcp.seq_number() > end),
+                    _ => false,
+                };
+                if over {
+                    st.sockets.get_mut::<tcp::Socket>(h).abort();
                     st.tuples.remove(&(d, s));
                 }
             }
@@ -584,7 +614,7 @@ async fn poll_loop(shared: Weak<Shared>) {
             // Reap closed sockets nobody holds any more, and abort ones that
             // take too long to close: a live peer that never sends its FIN
             // would keep one in FIN-WAIT-2 forever.
-            let State { sockets, tuples, ends, orphans, .. } = st;
+            let State { sockets, tuples, ends, fins, orphans, .. } = st;
             orphans.retain(|&(h, since)| {
                 let s = sockets.get_mut::<tcp::Socket>(h);
                 // An aborted socket keeps its peer until it has sent the RST.
@@ -594,6 +624,7 @@ async fn poll_loop(shared: Weak<Shared>) {
                     sockets.remove(h);
                     tuples.retain(|_, v| *v != h);
                     ends.remove(&h);
+                    fins.remove(&h);
                 } else if since.elapsed() > TCP_TIMEOUT {
                     s.abort();
                 }
