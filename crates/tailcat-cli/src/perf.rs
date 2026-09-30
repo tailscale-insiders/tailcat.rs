@@ -684,6 +684,7 @@ impl Test {
     }
 
     async fn run(self: Arc<Self>) -> Result<PerfResult, String> {
+        let _ending = Ending(&self);
         tokio::spawn(self.clone().read_control());
         if let Err(e) = self.wait_ready().await {
             self.fail(e.clone());
@@ -1010,7 +1011,7 @@ pub struct Server {
 impl Server {
     /// Registers `t` until the returned [`Registration`] drops, unless
     /// another test is running.
-    #[must_use = "dropping the Registration at once ends the test"]
+    #[must_use = "dropping the Registration at once frees the server"]
     fn register(&self, t: &Arc<Test>) -> Option<Registration<'_>> {
         let mut tests = self.tests.lock().unwrap();
         let registered = tests.is_empty() && tests.insert(t.id, t.clone()).is_none();
@@ -1105,9 +1106,19 @@ impl Server {
     }
 }
 
-/// A test's place on the server. Dropping it ends the test and frees
-/// the server for the next, however the test ends: finished, failed or
-/// cancelled.
+/// Ends a test when dropped, so its tasks stop and drop their references
+/// to it, closing its connections, however [`Test::run`] ends: finished,
+/// failed or cancelled.
+struct Ending<'a>(&'a Test);
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        self.0.done.set();
+    }
+}
+
+/// A test's place on the server. Dropping it frees the server for the
+/// next, however the test ends: finished, failed or cancelled.
 struct Registration<'a> {
     server: &'a Server,
     test: Arc<Test>,
@@ -1115,7 +1126,6 @@ struct Registration<'a> {
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        self.test.done.set();
         self.server.tests.lock().unwrap().remove(&self.test.id);
     }
 }
@@ -1157,11 +1167,7 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
         };
         t.attach(i, sc);
     }
-    // Once done, the test's tasks drop their references to it, closing
-    // its connections.
-    let r = t.clone().run().await;
-    t.done.set();
-    r.map_err(|e| anyhow!(e))
+    t.run().await.map_err(|e| anyhow!(e))
 }
 
 // ---------------------------------------------------------------------

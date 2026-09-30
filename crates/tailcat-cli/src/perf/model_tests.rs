@@ -170,14 +170,19 @@ async fn side(t: Arc<Test>, crash: Option<Flag>) -> Outcome {
         assert_eq!(t.err.lock().unwrap().clone(), None, "the test failed after it succeeded");
     }
     let elapsed = start.elapsed();
-    t.done.set();
+    assert_released(&t).await;
+    Outcome { result, elapsed }
+}
+
+/// Asserts that `t`'s tasks let go of it soon, as they must once it's
+/// over, rather than hold its connections open.
+async fn assert_released(t: &Arc<Test>) {
     let released = async {
-        while Arc::strong_count(&t) > 1 {
+        while Arc::strong_count(t) > 1 {
             sleep(Duration::from_millis(1)).await;
         }
     };
     timeout(Duration::from_secs(1), released).await.expect("the test's tasks outlived it");
-    Outcome { result, elapsed }
 }
 
 /// Runs a client and a server test against each other, over links that
@@ -279,6 +284,35 @@ fn tests_finish_and_agree(tc: TestCase) {
     if p.direction != Direction::Upload {
         check_transfer(&p, [&cr.server_sent, &cr.client_received], [&sr.server_sent, &sr.client_received], cut);
     }
+}
+
+/// A test cancelled partway, over links that stay up, still ends.
+#[tokio::test]
+async fn a_cancelled_test_ends() {
+    let p = Params {
+        proto: Proto::Tcp,
+        direction: Direction::Bidirectional,
+        duration: Duration::from_secs(10),
+        bytes: 0,
+        streams: 2,
+        length: 1024,
+        bitrate: 0,
+        interval: MIN_INTERVAL,
+    };
+    let (cc, sc) = intact_link();
+    let client = Test::new(p.clone(), [7; 8], false, ctrl(cc), None);
+    let server = Test::new(p.clone(), [7; 8], true, ctrl(sc), None);
+    for i in 0..p.streams {
+        let (c, s) = intact_link();
+        attach(&client, i, c);
+        attach(&server, i, s);
+    }
+    tokio::spawn(server.run());
+
+    let run = timeout(Duration::from_millis(200), client.clone().run()).await;
+    assert!(run.is_err(), "the test ended early");
+
+    assert_released(&client).await;
 }
 
 /// A stream task that panics fails the test, and the others' results
