@@ -65,7 +65,9 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub use addr::{Addr, ConnInfo, PrivateKey};
 pub use client::{Client, ClientOptions, DiscoPingResult, PingResult};
-pub use derpmap::{DEFAULT_DERP_MAP_URL, DerpMap, DerpMapCache, DerpNode, DerpRegion, FetchMode, FetchOptions};
+pub use derpmap::{
+    DEFAULT_DERP_MAP_URL, DerpMap, DerpMapCache, DerpNode, DerpRegion, FetchMode, FetchOptions, RegionArg,
+};
 pub use exec::peer_env;
 pub use http::client as shared_client;
 pub use key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
