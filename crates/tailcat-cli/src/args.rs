@@ -3,7 +3,8 @@
 
 use std::fmt;
 #[cfg(feature = "ssh")]
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -69,30 +70,61 @@ impl fmt::Display for KeyArg {
     }
 }
 
-/// Where `ssh -p` or `cp -P` connects through the server: a port on the
-/// server, or an IP:port its exit node reaches, where a bare IP means
-/// its port 22.
-#[cfg(feature = "ssh")]
+/// Where a connection through the server goes: a port on the server, or
+/// an IP:port its exit node reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SshTarget {
+pub enum Dest {
     Port(u16),
     Via(SocketAddr),
 }
+
+impl Dest {
+    /// Dials it through `cl`.
+    pub async fn dial(self, cl: &tailcat::Client) -> std::io::Result<tailcat::TcpStream> {
+        match self {
+            Dest::Port(p) => cl.dial_tcp_port(p).await,
+            Dest::Via(a) => cl.dial_tcp(a).await,
+        }
+    }
+}
+
+impl FromStr for Dest {
+    type Err = String;
+
+    fn from_str(v: &str) -> Result<Self, String> {
+        if let Ok(p @ 1..) = v.parse::<u16>() {
+            return Ok(Dest::Port(p));
+        }
+        match v.parse::<SocketAddr>() {
+            Ok(a) if a.port() != 0 => Ok(Dest::Via(a)),
+            _ => Err(format!("invalid port or IP:port {v:?}")),
+        }
+    }
+}
+
+impl fmt::Display for Dest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dest::Port(p) => write!(f, "{p}"),
+            Dest::Via(a) => write!(f, "{a}"),
+        }
+    }
+}
+
+/// Where `ssh -p` or `cp -P` connects through the server: a [`Dest`],
+/// where a bare IP also means its port 22.
+#[cfg(feature = "ssh")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshTarget(pub Dest);
 
 #[cfg(feature = "ssh")]
 impl FromStr for SshTarget {
     type Err = String;
 
     fn from_str(v: &str) -> Result<Self, String> {
-        if let Ok(p @ 1..) = v.parse::<u16>() {
-            return Ok(SshTarget::Port(p));
-        }
-        if let Ok(ip) = v.parse::<IpAddr>() {
-            return Ok(SshTarget::Via(SocketAddr::new(ip, 22)));
-        }
-        match v.parse::<SocketAddr>() {
-            Ok(a) if a.port() != 0 => Ok(SshTarget::Via(a)),
-            _ => Err(format!("invalid port or IP:port {v:?}")),
+        match v.parse::<IpAddr>() {
+            Ok(ip) => Ok(SshTarget(Dest::Via(SocketAddr::new(ip, 22)))),
+            Err(_) => v.parse().map(SshTarget),
         }
     }
 }
@@ -100,10 +132,7 @@ impl FromStr for SshTarget {
 #[cfg(feature = "ssh")]
 impl fmt::Display for SshTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SshTarget::Port(p) => write!(f, "{p}"),
-            SshTarget::Via(a) => write!(f, "{a}"),
-        }
+        self.0.fmt(f)
     }
 }
 
@@ -275,6 +304,16 @@ mod tests {
         ] {
             let k: KeyArg = s.parse().unwrap();
             assert_eq!((&k, k.to_string()), (&want, s.to_string()));
+        }
+    }
+
+    #[test]
+    fn dests() {
+        let dest = |s: &str| s.parse::<Dest>();
+        assert_eq!(dest("80"), Ok(Dest::Port(80)));
+        assert_eq!(dest("10.0.0.1:53"), Ok(Dest::Via("10.0.0.1:53".parse().unwrap())));
+        for bad in ["0", "10.0.0.1", "10.0.0.1:0", "host:22", ""] {
+            assert!(dest(bad).is_err(), "{bad:?} parsed");
         }
     }
 

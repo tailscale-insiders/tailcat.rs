@@ -1,12 +1,13 @@
 //! Client modes: the stdin/stdout pipe and `tailcat ping`.
 
 use std::io::Read;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use tailcat::{Addr, Client, ClientOptions, Via};
+
+use crate::args::Dest;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -32,24 +33,13 @@ pub fn new_client(g: &Global, addr: Addr, key: tailcat::NodePrivate) -> Client {
 pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Result<()> {
     let addr = crate::addrarg::tailcat_addr_arg(addr_arg).await?;
     let cl = new_client(g, addr, crate::keys::client_key(g)?);
-    enum Dest {
-        Port(u16),
-        Via(SocketAddr),
-    }
     let d = match dest {
         None => Dest::Port(1),
-        Some(s) if !s.contains(':') => Dest::Port(s.parse().map_err(|_| usagef!("invalid port number {s:?}"))?),
-        Some(s) => Dest::Via(s.parse().map_err(|_| usagef!("invalid IP:port {s:?}"))?),
+        Some(s) => s.parse().map_err(|e| usagef!("{e}"))?,
     };
     let pi = cl.ping().await.map_err(|e| anyhow!("tailcat Ping: {e}"))?;
     tracing::debug!("got ping: {pi:?}");
-    let dial = async {
-        match d {
-            Dest::Port(p) => cl.dial_tcp_port(p).await,
-            Dest::Via(a) => cl.dial_tcp(a).await,
-        }
-    };
-    let c = tokio::time::timeout(Duration::from_secs(10), dial)
+    let c = tokio::time::timeout(Duration::from_secs(10), d.dial(&cl))
         .await
         .map_err(|_| anyhow!("Dial: timed out"))?
         .map_err(|e| anyhow!("Dial: {e}"))?;
