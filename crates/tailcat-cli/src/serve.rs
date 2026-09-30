@@ -15,6 +15,8 @@ use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 use crate::args::KeyArg;
+#[cfg(feature = "ssh")]
+use crate::args::{FilesArg, FilesMode};
 use crate::perf::PORT as PERF_PORT;
 use crate::{Global, ServeFlags};
 
@@ -387,8 +389,9 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
             eprintln!("# SSH sessions run only {}", a.join(" "));
         }
         if has(Service::Files) {
-            let (fs, mode_name) = parse_files_flag(flags.files.as_deref().unwrap_or(""))?;
-            eprintln!("# Serving files from {} ({mode_name})", fs.dir.display());
+            let files = flags.files.clone().unwrap_or_else(|| FilesArg { dir: ".".into(), mode: FilesMode::ReadOnly });
+            let fs = file_service(&files)?;
+            eprintln!("# Serving files from {} ({})", fs.dir.display(), files.mode.name());
             opts.files = Some(fs);
         }
         Some(tailcat::ssh::conn_handler(me.clone(), opts)?)
@@ -635,26 +638,15 @@ fn is_executable(p: &std::path::Path) -> bool {
     p.is_file()
 }
 
-/// Parses --files: a directory with an optional :ro, :rw, :wo or :wo+ suffix.
+/// The file service --files asks for, once its directory checks out.
 #[cfg(feature = "ssh")]
-pub fn parse_files_flag(v: &str) -> Result<(tailcat::ssh::FileService, &'static str)> {
-    use tailcat::ssh::FileServeMode as M;
-    let (dir, mode, name) = [
-        (":ro", M::ReadOnly, "read-only"),
-        (":rw", M::ReadWrite, "read-write"),
-        (":wo+", M::WriteOnlyTree, "recursive write-only"),
-        (":wo", M::WriteOnly, "flat write-only"),
-    ]
-    .into_iter()
-    .find_map(|(suffix, mode, name)| Some((v.strip_suffix(suffix)?, mode, name)))
-    .unwrap_or((v, M::ReadOnly, "read-only"));
-    let dir = if dir.is_empty() { "." } else { dir };
-    let abs = std::path::absolute(dir)?;
+pub fn file_service(a: &FilesArg) -> Result<tailcat::ssh::FileService> {
+    let abs = std::path::absolute(&a.dir)?;
     let md = std::fs::metadata(&abs).map_err(|e| anyhow!("--files: {}: {e}", abs.display()))?;
     if !md.is_dir() {
         return Err(crate::usagef!("--files: {} is not a directory", abs.display()));
     }
-    Ok((tailcat::ssh::FileService { dir: abs, mode }, name))
+    Ok(tailcat::ssh::FileService { dir: abs, mode: a.mode.into() })
 }
 
 #[cfg(test)]
@@ -773,28 +765,18 @@ mod tests {
 
         use tailcat::ssh::FileServeMode as M;
 
+        let service = |s: &str| file_service(&s.parse().unwrap());
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path().display();
-        for (suffix, mode, name) in [
-            ("", M::ReadOnly, "read-only"),
-            (":ro", M::ReadOnly, "read-only"),
-            (":rw", M::ReadWrite, "read-write"),
-            (":wo", M::WriteOnly, "flat write-only"),
-            (":wo+", M::WriteOnlyTree, "recursive write-only"),
-        ] {
-            let (svc, n) = parse_files_flag(&format!("{d}{suffix}")).unwrap();
-            assert_eq!((svc.dir.as_path(), svc.mode, n), (dir.path(), mode, name));
-        }
-
-        let (cwd, _) = parse_files_flag(":rw").unwrap();
-        assert_eq!(cwd.dir, env::current_dir().unwrap());
+        let svc = service(&format!("{}:wo+", dir.path().display())).unwrap();
+        assert_eq!((svc.dir.as_path(), svc.mode), (dir.path(), M::WriteOnlyTree));
+        assert_eq!(service(":rw").unwrap().dir, env::current_dir().unwrap());
 
         let file = dir.path().join("f");
         fs::write(&file, "").unwrap();
-        let e = parse_files_flag(file.to_str().unwrap()).unwrap_err();
+        let e = service(file.to_str().unwrap()).unwrap_err();
         assert!(e.is::<crate::UsageError>());
 
         let missing = dir.path().join("missing");
-        assert!(parse_files_flag(missing.to_str().unwrap()).is_err());
+        assert!(service(missing.to_str().unwrap()).is_err());
     }
 }

@@ -107,6 +107,70 @@ impl fmt::Display for SshTarget {
     }
 }
 
+/// A `--files` argument: a directory, the current one if empty, and
+/// how it's served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesArg {
+    pub dir: PathBuf,
+    pub mode: FilesMode,
+}
+
+/// How `--files` serves its directory, by its suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesMode {
+    /// `:ro`, or no suffix.
+    ReadOnly,
+    /// `:rw`.
+    ReadWrite,
+    /// `:wo`: a flat write-only drop box.
+    WriteOnly,
+    /// `:wo+`: a recursive write-only drop box.
+    WriteOnlyTree,
+}
+
+impl FilesMode {
+    const SUFFIXES: [(&str, FilesMode); 4] = [
+        (":ro", FilesMode::ReadOnly),
+        (":rw", FilesMode::ReadWrite),
+        (":wo+", FilesMode::WriteOnlyTree),
+        (":wo", FilesMode::WriteOnly),
+    ];
+
+    /// What it's called when the server says what it serves.
+    pub fn name(self) -> &'static str {
+        match self {
+            FilesMode::ReadOnly => "read-only",
+            FilesMode::ReadWrite => "read-write",
+            FilesMode::WriteOnly => "flat write-only",
+            FilesMode::WriteOnlyTree => "recursive write-only",
+        }
+    }
+}
+
+#[cfg(feature = "ssh")]
+impl From<FilesMode> for tailcat::ssh::FileServeMode {
+    fn from(m: FilesMode) -> Self {
+        match m {
+            FilesMode::ReadOnly => Self::ReadOnly,
+            FilesMode::ReadWrite => Self::ReadWrite,
+            FilesMode::WriteOnly => Self::WriteOnly,
+            FilesMode::WriteOnlyTree => Self::WriteOnlyTree,
+        }
+    }
+}
+
+impl FromStr for FilesArg {
+    type Err = String;
+
+    fn from_str(v: &str) -> Result<Self, String> {
+        let (dir, mode) = FilesMode::SUFFIXES
+            .into_iter()
+            .find_map(|(suffix, mode)| Some((v.strip_suffix(suffix)?, mode)))
+            .unwrap_or((v, FilesMode::ReadOnly));
+        Ok(FilesArg { dir: if dir.is_empty() { ".".into() } else { dir.into() }, mode })
+    }
+}
+
 /// A perf `--bytes` count: more than zero, with an optional K, M, or G
 /// suffix (powers of 1000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +238,18 @@ mod tests {
         for bad in ["0", "10.0.0.1:0", "host:22"] {
             assert!(target(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn files_args() {
+        let arg = |s: &str| s.parse::<FilesArg>().unwrap();
+        let files = |dir: &str, mode| FilesArg { dir: dir.into(), mode };
+        assert_eq!(arg("/srv"), files("/srv", FilesMode::ReadOnly));
+        assert_eq!(arg("/srv:ro"), files("/srv", FilesMode::ReadOnly));
+        assert_eq!(arg("/srv:rw"), files("/srv", FilesMode::ReadWrite));
+        assert_eq!(arg("/srv:wo"), files("/srv", FilesMode::WriteOnly));
+        assert_eq!(arg("/srv:wo+"), files("/srv", FilesMode::WriteOnlyTree));
+        assert_eq!(arg(":rw"), files(".", FilesMode::ReadWrite));
     }
 
     #[test]

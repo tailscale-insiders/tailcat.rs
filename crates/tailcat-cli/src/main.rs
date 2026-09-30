@@ -57,7 +57,7 @@ pub struct ServeFlags {
     /// (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive
     /// write-only drop box) suffix. Giving --files implies the 'files' service.
     #[arg(long, value_name = "DIR[:MODE]")]
-    pub files: Option<String>,
+    pub files: Option<args::FilesArg>,
     /// Comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal
     /// OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys).
     #[arg(long, value_name = "SOURCES")]
@@ -344,8 +344,8 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             if flags.files.is_some() {
                 return Err(usagef!("recv takes the directory as an argument, not --files"));
             }
-            let dir = dir.as_deref().unwrap_or(".");
-            flags.files = Some(format!("{dir}{}", if accept_dirs { ":wo+" } else { ":wo" }));
+            let mode = if accept_dirs { args::FilesMode::WriteOnlyTree } else { args::FilesMode::WriteOnly };
+            flags.files = Some(args::FilesArg { dir: dir.as_deref().unwrap_or(".").into(), mode });
             serve::server(g, &flags, serve::PortSet::default(), None).await?;
         }
         #[cfg(feature = "ssh")]
