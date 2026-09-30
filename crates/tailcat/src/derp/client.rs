@@ -1,6 +1,7 @@
 //! A DERP client that stays connected to one region, reconnecting with
 //! backoff, and hands received packets to a channel.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +45,7 @@ pub async fn dial_tls(n: &DerpNode) -> Result<TlsStream<TcpStream>> {
 }
 
 /// The name a node is dialed by, which it can't be without.
-fn node_host(n: &DerpNode) -> Result<std::borrow::Cow<'_, str>> {
+fn node_host(n: &DerpNode) -> Result<Cow<'_, str>> {
     n.host_name.dialable().ok_or_else(|| Error::Derp(format!("DERP node {} has no hostname", n.name)))
 }
 
