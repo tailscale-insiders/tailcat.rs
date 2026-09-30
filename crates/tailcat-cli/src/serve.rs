@@ -85,9 +85,7 @@ impl PortSet {
     /// Serves `port` by proxying it to `target`, unless it's already
     /// mapped elsewhere.
     fn map_port(&mut self, port: u16, target: String) -> Result<()> {
-        if let Some(prev) = self.targets.get(&port)
-            && *prev != target
-        {
+        if let Some(prev) = self.targets.get(&port).filter(|p| **p != target) {
             bail!("port {port} is mapped to both {prev} and {target}");
         }
         self.ports.insert(port);
@@ -320,10 +318,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     };
     // Saved keys remember whether they use a PSK.
     let use_psk = flags.psk.unwrap_or(new_key || !ci.preshared_key.is_zero());
-    if use_psk
-        && ci.preshared_key.is_zero()
-        && let Some(path) = &key_file
-    {
+    if let Some(path) = key_file.as_ref().filter(|_| use_psk && ci.preshared_key.is_zero()) {
         bail!("key file {} has no WireGuard pre-shared key", path.display());
     }
     let psk = if use_psk { ci.preshared_key } else { PresharedKey::default() };
@@ -431,14 +426,10 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     b = b.on_tcp({
         let (me, exec_h) = (me.clone(), exec_h.clone());
         let route = move |port| {
-            if port == 22
-                && let Some(h) = &ssh_handler
-            {
-                return Some(h.clone());
+            if port == 22 && ssh_handler.is_some() {
+                return ssh_handler.clone();
             }
-            if port == PERF_PORT
-                && let Some(p) = &perf_srv
-            {
+            if let Some(p) = perf_srv.as_ref().filter(|_| port == PERF_PORT) {
                 let p = p.clone();
                 return Some(handler(move |c| p.clone().handle_tcp(c)));
             }
