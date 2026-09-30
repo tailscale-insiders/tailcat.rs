@@ -104,6 +104,12 @@ pub enum Error {
     Timeout(String),
     #[error("{0}")]
     Other(String),
+    #[error("TLS: {0}")]
+    Tls(#[from] rustls::Error),
+    #[error("TLS verifier: {0}")]
+    Verifier(#[from] rustls::client::VerifierBuilderError),
+    #[error("certificate: {0}")]
+    Certificate(#[from] rcgen::Error),
 }
 
 impl Error {

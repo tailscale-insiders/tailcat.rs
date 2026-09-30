@@ -1,12 +1,11 @@
 //! TLS configuration for DERP connections, using the ring crypto provider.
 
-use std::fmt::Display;
 use std::sync::Arc;
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
@@ -17,17 +16,9 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn derp_err(e: impl Display) -> Error {
-    Error::Derp(e.to_string())
-}
-
-fn other_err(e: impl Display) -> Error {
-    Error::other(e.to_string())
-}
-
 /// Parses a hostname or IP literal as a TLS server name.
 pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>> {
-    ServerName::try_from(host.to_string()).map_err(|e| derp_err(format!("invalid DERP hostname {host:?}: {e}")))
+    ServerName::try_from(host.to_string()).map_err(|e| Error::Derp(format!("invalid DERP hostname {host:?}: {e}")))
 }
 
 /// Builds the TLS client configuration for a DERP node: standard web PKI
@@ -38,11 +29,10 @@ pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfi
     let check = match &n.cert_name {
         _ if n.insecure_for_tests => Check::Any,
         CertName::Sha256(hash) => Check::Hash(*hash),
-        CertName::BadSha256(s) => return Err(derp_err(format!("CertName sha256-raw:{s} isn't a SHA-256 in hex"))),
+        CertName::BadSha256(s) => return Err(Error::Derp(format!("CertName sha256-raw:{s} isn't a SHA-256 in hex"))),
         other => {
             let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-            let webpki =
-                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build().map_err(derp_err)?;
+            let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build()?;
             let name = match other {
                 CertName::Name(n) => Some(server_name(n)?),
                 _ => None,
@@ -51,8 +41,7 @@ pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfi
         }
     };
     Ok(rustls::ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(derp_err)?
+        .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(Verifier { check, provider: provider() }))
         .with_no_client_auth())
@@ -62,14 +51,13 @@ pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfi
 /// development DERP relay.
 pub(crate) fn self_signed_server_config(names: &[&str]) -> Result<rustls::ServerConfig> {
     let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
-    let cert = rcgen::generate_simple_self_signed(names).map_err(other_err)?;
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).map_err(other_err)?;
-    rustls::ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(other_err)?
+    let cert = rcgen::generate_simple_self_signed(names)?;
+    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_single_cert(vec![cert.cert.der().clone()], key)
-        .map_err(other_err)
+        .with_single_cert(vec![cert.cert.der().clone()], key.into())?;
+    Ok(config)
 }
 
 /// How a DERP node's certificate is checked.
