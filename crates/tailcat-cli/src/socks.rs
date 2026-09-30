@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::Global;
+use crate::args::ListenArg;
 
 /// Where a SOCKS destination should be dialed.
 #[derive(Debug, PartialEq)]
@@ -98,29 +99,7 @@ impl Dialer {
     }
 }
 
-/// Normalizes --listen: a bare port means localhost; a bare host means
-/// an OS-assigned port; ":1080" means all interfaces.
-pub fn normalize_listen(s: &str) -> String {
-    if let Ok(p) = s.parse::<u16>() {
-        return format!("127.0.0.1:{p}");
-    }
-    // Before the ":port" check, which "::1" would otherwise match.
-    if s.parse::<std::net::Ipv6Addr>().is_ok() {
-        return format!("[{s}]:0");
-    }
-    if let Some(port) = s.strip_prefix(':') {
-        return format!("0.0.0.0:{}", if port.is_empty() { "0" } else { port });
-    }
-    if crate::util::split_host_port(s).is_ok() {
-        return s.to_string();
-    }
-    if let Some(h) = s.strip_suffix(':') {
-        return format!("{h}:0");
-    }
-    format!("{s}:0")
-}
-
-pub async fn socks_mode(g: &Global, listen: &str, mut args: Vec<String>) -> Result<ExitCode> {
+pub async fn socks_mode(g: &Global, listen: &ListenArg, mut args: Vec<String>) -> Result<ExitCode> {
     // The address argument is optional: tailcat address hostnames are
     // dialed directly, so a fixed server is only needed for
     // server.tailcat and exit-node destinations.
@@ -138,7 +117,7 @@ pub async fn socks_mode(g: &Global, listen: &str, mut args: Vec<String>) -> Resu
         tracing::debug!("got ping: {pi:?}");
     }
     let dialer = Arc::new(Dialer { g: g.clone(), key, default, clients: Mutex::default() });
-    let ln = TcpListener::bind(normalize_listen(listen)).await?;
+    let ln = TcpListener::bind(listen.to_string()).await?;
     let socks_addr = format!("socks5h://{}", ln.local_addr()?);
     let serve = tokio::spawn(serve(ln, dialer));
     let Some((cmd, cmd_args)) = args.split_first() else {
@@ -508,19 +487,6 @@ mod tests {
         assert_eq!(target("::ffff:10.1.2.3", 22).await, via("10.1.2.3:22"));
         assert_eq!(target("fd7a::1", 22).await, via("[fd7a::1]:22"));
         assert_eq!(target("localhost", 22).await, via("127.0.0.1:22"));
-    }
-
-    #[test]
-    fn listen_addrs() {
-        assert_eq!(normalize_listen("1080"), "127.0.0.1:1080");
-        assert_eq!(normalize_listen(":1080"), "0.0.0.0:1080");
-        assert_eq!(normalize_listen(":"), "0.0.0.0:0");
-        assert_eq!(normalize_listen("127.0.0.1:0"), "127.0.0.1:0");
-        assert_eq!(normalize_listen("0.0.0.0"), "0.0.0.0:0");
-        assert_eq!(normalize_listen("localhost:"), "localhost:0");
-        assert_eq!(normalize_listen("[::1]:5"), "[::1]:5");
-        assert_eq!(normalize_listen("::1"), "[::1]:0");
-        assert_eq!(normalize_listen("fd7a::1"), "[fd7a::1]:0");
     }
 
     #[test]

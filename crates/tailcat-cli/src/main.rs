@@ -131,7 +131,7 @@ enum Cmd {
         /// SOCKS5 proxy listen [address]:port; a bare port means localhost, a bare address means an OS-assigned
         /// port.
         #[arg(long, default_value = "127.0.0.1:0")]
-        listen: String,
+        listen: args::ListenArg,
         /// [<tc-addr>] [<cmd> [args...]]
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

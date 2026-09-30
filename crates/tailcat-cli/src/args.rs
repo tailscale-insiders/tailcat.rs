@@ -111,6 +111,48 @@ impl fmt::Display for Dest {
     }
 }
 
+/// A socks `--listen` address, `[host]:port`: a bare port means
+/// 127.0.0.1, a bare host (or `host:`) an OS-assigned port, and `:port`
+/// every interface. The host is left for binding to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenArg {
+    pub host: String,
+    pub port: u16,
+}
+
+impl FromStr for ListenArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let listen = |host: &str, port| Ok(ListenArg { host: host.into(), port });
+        let bad_port = |p: &str| format!("invalid port {p:?} in listen address {s:?}");
+        if let Ok(p) = s.parse::<u16>() {
+            return listen("127.0.0.1", p);
+        }
+        // Before the ":port" check, which "::1" would otherwise match.
+        if s.parse::<std::net::Ipv6Addr>().is_ok() {
+            return listen(s, 0);
+        }
+        if let Some(p) = s.strip_prefix(':') {
+            return listen("0.0.0.0", if p.is_empty() { 0 } else { p.parse().map_err(|_| bad_port(p))? });
+        }
+        if let Ok((host, port)) = crate::util::split_host_port(s) {
+            return listen(&host, port);
+        }
+        match s.strip_suffix(':') {
+            Some(host) => listen(host, 0),
+            None if s.contains(':') => Err(format!("invalid listen address {s:?}")),
+            None => listen(s, 0),
+        }
+    }
+}
+
+impl fmt::Display for ListenArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&crate::util::join_host_port(&self.host, self.port))
+    }
+}
+
 /// A `tailcat forward` mapping: `port`, the same port here and on the
 /// server; `local:port`; or `local:ip:port`, through the server's exit
 /// node. With a remote given, a local port of 0 takes any free one.
@@ -330,6 +372,26 @@ mod tests {
             let k: KeyArg = s.parse().unwrap();
             assert_eq!((&k, k.to_string()), (&want, s.to_string()));
         }
+    }
+
+    #[test]
+    fn listen_args() {
+        let listen = |s: &str| s.parse::<ListenArg>().map(|l| l.to_string());
+        for (s, want) in [
+            ("1080", "127.0.0.1:1080"),
+            (":1080", "0.0.0.0:1080"),
+            (":", "0.0.0.0:0"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("0.0.0.0", "0.0.0.0:0"),
+            ("localhost:", "localhost:0"),
+            ("[::1]:5", "[::1]:5"),
+            ("::1", "[::1]:0"),
+            ("fd7a::1", "[fd7a::1]:0"),
+        ] {
+            assert_eq!(listen(s), Ok(want.into()), "{s:?}");
+        }
+        assert!(listen(":abc").is_err());
+        assert!(listen("host:abc").is_err());
     }
 
     #[test]
