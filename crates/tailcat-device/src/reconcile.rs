@@ -321,7 +321,8 @@ mod tests {
     }
 
     /// Our address and routes are never a peer's, and a record at either
-    /// is ignored.
+    /// is ignored. A prefix around them is still the peer's; the engine,
+    /// which knows ours, keeps them out of it.
     #[test]
     fn what_we_claim_is_ours() {
         let squatter = record(3, 0, 1, 0);

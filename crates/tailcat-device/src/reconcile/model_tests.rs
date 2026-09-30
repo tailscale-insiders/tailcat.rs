@@ -10,13 +10,16 @@
 //!   such record outranks at their address.
 //! - A packet goes to the peer with the most specific claim (its address,
 //!   or one of its routes) containing the destination, leaving out claims
-//!   to our own address and routes. Where several peers claim that
-//!   prefix, the one at that address wins, then the best-ranked.
+//!   to our own address and routes; but nowhere if one of our own claims
+//!   containing it is as specific, since it's for us. Where several peers
+//!   claim that prefix, the one at that address wins, then the
+//!   best-ranked.
 //!
 //! What the implementation installs is routed the way tailcat's
 //! WireGuard engine routes (`Peers::owner` in `wg.rs`): the most
-//! specific allowed IP, then the lowest key. The model never needs that
-//! tie-break, so the implementation mustn't either.
+//! specific allowed IP, then the lowest key, with our own claims as its
+//! local prefixes, which win ties. The model never needs the tie-break
+//! by key, so the implementation mustn't either.
 
 use std::cmp::Ordering;
 
@@ -133,13 +136,15 @@ fn installed(peers: &Peers) -> Vec<(NodePublic, Vec<IpNet>)> {
     peers.iter().map(|(k, p)| (*k, p.allowed_ips.clone())).collect()
 }
 
-/// Where the WireGuard engine sends a packet for `dst`.
-fn engine_route(installed: &[(NodePublic, Vec<IpNet>)], dst: IpAddr) -> Option<NodePublic> {
-    installed
+/// Where the WireGuard engine sends a packet for `dst`, given our own
+/// prefixes `local`.
+fn engine_route(installed: &[(NodePublic, Vec<IpNet>)], local: &[IpNet], dst: IpAddr) -> Option<NodePublic> {
+    let len = |nets: &[IpNet]| nets.iter().filter(|n| n.contains(&dst)).map(|n| n.prefix_len).max();
+    let (l, k) = installed
         .iter()
-        .filter_map(|(k, nets)| Some((nets.iter().filter(|n| n.contains(&dst)).map(|n| n.prefix_len).max()?, *k)))
-        .max_by(|(la, ka), (lb, kb)| la.cmp(lb).then(kb.cmp(ka)))
-        .map(|(_, k)| k)
+        .filter_map(|(k, nets)| Some((len(nets)?, *k)))
+        .max_by(|(la, ka), (lb, kb)| la.cmp(lb).then(kb.cmp(ka)))?;
+    (len(local) < Some(l)).then_some(k)
 }
 
 /// Whether two prefixes are the same, however they're written.
@@ -212,6 +217,10 @@ impl Model<'_> {
             .filter(|(n, ..)| n.contains(&dst) && !self.mine(n))
             .collect();
         let len = candidates.iter().map(|(n, ..)| n.prefix_len).max()?;
+        let ours = claims_of(self.me).into_iter().filter(|(n, _)| n.contains(&dst)).map(|(n, _)| n.prefix_len).max();
+        if ours >= Some(len) {
+            return None;
+        }
         candidates
             .into_iter()
             .filter(|(n, ..)| n.prefix_len == len)
@@ -235,7 +244,12 @@ fn check_model(me: &NodeRecord, peers: &Peers, polled: &[NodeRecord]) {
     assert_eq!(records(peers), want, "the peers of {polled:?}");
     let installed = installed(peers);
     for dst in probes() {
-        assert_eq!(engine_route(&installed, dst), model.route(&want, dst), "the route to {dst} with peers {want:?}");
+        let local = me.allowed_ips();
+        assert_eq!(
+            engine_route(&installed, &local, dst),
+            model.route(&want, dst),
+            "the route to {dst} with peers {want:?}"
+        );
     }
 }
 
@@ -297,7 +311,7 @@ fn our_runs_nodes_agree(tc: TestCase) {
     polled.extend([a.clone(), b.clone()]);
     let (va, vb) = (installed(&from_scratch(&a, &polled)), installed(&from_scratch(&b, &polled)));
     for dst in probes().filter(|d| !viewers.iter().any(|n| n.contains(d))) {
-        assert_eq!(engine_route(&va, dst), engine_route(&vb, dst), "{dst}");
+        assert_eq!(engine_route(&va, &a.allowed_ips(), dst), engine_route(&vb, &b.allowed_ips(), dst), "{dst}");
     }
 }
 

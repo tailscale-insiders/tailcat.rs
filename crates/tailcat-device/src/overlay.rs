@@ -147,6 +147,9 @@ impl Overlay {
         .await
         .context("starting magicsock")?;
         let (engine, inbound) = Engine::start(&private, ms.clone(), wg_rx, None, None);
+        // A peer routed a prefix around our address or routes still
+        // mustn't send from them.
+        engine.set_local_ips(me.allowed_ips());
         info!(overlay_ip = %me.overlay_ip, region = home_region, "overlay: node {} up as {}", me.index, me.nodekey.short_string());
         Ok(Arc::new(Overlay {
             me,

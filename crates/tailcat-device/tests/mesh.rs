@@ -100,6 +100,38 @@ async fn three_node_mesh_routes_ipv4() {
     assert_eq!(st.iter().map(|p| p.index).collect::<Vec<_>>(), [1, 2], "ordered by index");
 }
 
+/// A peer routed the whole overlay can send from its addresses, but not
+/// from ours, nor from inside our routes.
+#[tokio::test]
+async fn a_peer_cannot_send_from_our_prefixes() {
+    let dev = DevDerp::start_local().await.unwrap();
+    let mut me = node(0, &dev).await;
+    let private = NodePrivate::generate();
+    let greedy =
+        NodeRecord { routes: vec!["100.64.0.0/16".into(), "10.42.0.0/16".into()], ..record(1, &private, &dev) };
+    let peer = start(private, greedy.clone()).await;
+    let dm = DerpMap::default();
+    me.overlay.sync(&[greedy], &dm);
+    peer.overlay.sync(&[me.overlay.record().clone()], &dm);
+    let from = |src: [u8; 4], payload: &[u8]| udp(src.into(), me.ip, payload);
+    let ok = from([100, 64, 9, 9], b"from the overlay");
+    let mut got = None;
+    for _ in 0..20 {
+        peer.inject.send(ok.clone()).await.unwrap();
+        if let Ok(Some(p)) = tokio::time::timeout(Duration::from_millis(500), me.delivered.recv()).await {
+            got = Some(p);
+            break;
+        }
+    }
+    assert_eq!(got, Some(ok), "the peer's own prefix");
+    while me.delivered.try_recv().is_ok() {}
+    for src in [[100, 64, 1, 0], [10, 42, 0, 7]] {
+        peer.inject.send(from(src, b"spoofed")).await.unwrap();
+    }
+    let after = tokio::time::timeout(Duration::from_millis(500), me.delivered.recv()).await;
+    assert!(after.is_err(), "took {after:?}");
+}
+
 #[tokio::test]
 async fn peer_updates() {
     let dev = DevDerp::start_local().await.unwrap();
