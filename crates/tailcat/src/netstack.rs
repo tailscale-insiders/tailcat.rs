@@ -375,7 +375,10 @@ impl Stack {
     pub fn inject(&self, pkt: Vec<u8>) {
         let Some((src, dst, proto, body)) = parse_ip(&pkt) else { return };
         match proto {
-            IpProtocol::Udp => return self.inject_udp(body, src, dst),
+            IpProtocol::Udp => {
+                let off = pkt.len() - body.len();
+                return self.inject_udp(pkt, off, src, dst);
+            }
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {}
             _ => return trace!("netstack: dropping protocol {proto}"),
         }
@@ -450,10 +453,14 @@ impl Stack {
         self.shared.wake.notify_one();
     }
 
-    fn inject_udp(&self, body: &[u8], src: IpAddr, dst: IpAddr) {
-        let Ok(udp) = UdpPacket::new_checked(body) else { return };
+    /// Delivers the UDP datagram at `off` in `pkt`.
+    fn inject_udp(&self, mut pkt: Vec<u8>, off: usize, src: IpAddr, dst: IpAddr) {
+        let Ok(udp) = UdpPacket::new_checked(&pkt[off..]) else { return };
         let (s, d) = (SocketAddr::new(src, udp.src_port()), SocketAddr::new(dst, udp.dst_port()));
-        let data = udp.payload().to_vec();
+        // The payload, moved to the front of the packet's own buffer.
+        pkt.truncate(off + udp.len() as usize);
+        pkt.drain(..off + 8);
+        let data = pkt;
         let st = self.shared.lock();
         if st.closed {
             return;
