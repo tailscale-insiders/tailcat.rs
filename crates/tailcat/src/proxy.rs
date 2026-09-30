@@ -1,5 +1,6 @@
 //! Bidirectional copying between connections.
 
+use std::io;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,7 +42,7 @@ where
 
 /// Copies `r` to `w`, counting bytes into `total`, until EOF or an error
 /// on either side, then shuts `w` down; it reports the error, if any.
-async fn copy<R, W>(r: &mut R, w: &mut W, total: &mut u64) -> std::io::Result<()>
+async fn copy<R, W>(r: &mut R, w: &mut W, total: &mut u64) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -94,7 +95,6 @@ pub async fn proxy_packet_conns(a: &UdpConn, b: &tokio::net::UdpSocket, idle: Du
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::net::{IpAddr, SocketAddr};
     use std::pin::Pin;
     use std::sync::Arc;
