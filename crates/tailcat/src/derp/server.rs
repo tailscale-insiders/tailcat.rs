@@ -14,6 +14,7 @@ use tokio::io::{
 };
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinSet;
 use tracing::{debug, trace};
 
 use super::{
@@ -60,14 +61,17 @@ impl Server {
         self.clients.lock().unwrap().contains_key(k)
     }
 
-    /// Serves TLS connections from `ln` until it fails.
+    /// Serves TLS connections from `ln` until it fails, then the ones it
+    /// has until they end. Dropping it ends them all.
     pub async fn serve_tls(self: Arc<Self>, ln: TcpListener, tls: Arc<rustls::ServerConfig>) {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        let mut conns = JoinSet::new();
         while let Ok((tcp, remote)) = ln.accept().await {
+            while conns.try_join_next().is_some() {}
             let _ = tcp.set_nodelay(true);
             let s = self.clone();
             let accept = acceptor.accept(tcp);
-            tokio::spawn(async move {
+            conns.spawn(async move {
                 match tokio::time::timeout(Duration::from_secs(10), accept).await {
                     Ok(Ok(tls)) => {
                         if let Err(e) = s.handle_http(tls, remote).await {
@@ -78,6 +82,7 @@ impl Server {
                 }
             });
         }
+        while conns.join_next().await.is_some() {}
     }
 
     async fn handle_http<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: S, remote: SocketAddr) -> Result<()> {
@@ -386,6 +391,22 @@ mod tests {
         // Dropping a client disconnects it from the relay.
         drop(b);
         wait_until_gone(&dev.server, &kb.public()).await;
+    }
+
+    /// Dropping the relay ends its connections, unregistering their
+    /// clients, rather than leave them relaying.
+    #[tokio::test]
+    async fn dropping_the_relay_ends_its_connections() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let key = NodePrivate::generate();
+        let _client = DerpClient::spawn(dev.region.clone(), key.clone(), &"test".into(), true, tx);
+        assert!(dev.wait_for_client(&key.public(), T).await);
+        let server = dev.server.clone();
+
+        drop(dev);
+
+        wait_until_gone(&server, &key.public()).await;
     }
 
     /// Runs [`Server::handle_http`] on one end of an in-memory pipe and
