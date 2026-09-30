@@ -1,0 +1,11 @@
+[package]
+name = "tailcat-args"
+description = "Command-line argument grammars shared by the tailcat and tailcat-device commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tailcat.workspace = true

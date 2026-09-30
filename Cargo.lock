@@ -4085,6 +4085,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailcat-args"
+version = "0.1.0"
+dependencies = [
+ "tailcat",
+]
+
+[[package]]
 name = "tailcat-cli"
 version = "0.1.0"
 dependencies = [

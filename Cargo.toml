@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tailcat", "crates/tailcat-cli", "crates/tailcat-device"]
+members = ["crates/tailcat", "crates/tailcat-args", "crates/tailcat-cli", "crates/tailcat-device"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/tailscale-insiders/tailcat.rs"
 
 [workspace.dependencies]
 tailcat = { path = "crates/tailcat", version = "0.1.0", default-features = false }
+tailcat-args = { path = "crates/tailcat-args", version = "0.1.0" }
 anyhow = "1"
 base64 = "0.22"
 boringtun = { version = "0.7.1", default-features = false }
