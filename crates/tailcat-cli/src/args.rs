@@ -13,7 +13,7 @@ use tailcat::{KeySet, NodePublic};
 /// An `--allow` list: comma-separated node public keys, where `none`
 /// adds none, so `--allow none` allows no clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AllowArg(pub Vec<NodePublic>);
+pub struct AllowArg(Vec<NodePublic>);
 
 impl FromStr for AllowArg {
     type Err = String;
