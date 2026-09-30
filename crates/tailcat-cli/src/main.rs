@@ -218,16 +218,16 @@ enum Cmd {
     DevDerp {
         /// TCP address for DERP over TLS.
         #[arg(long, default_value = "127.0.0.1:0")]
-        derp: String,
+        derp: std::net::SocketAddr,
         /// UDP address for STUN.
         #[arg(long, default_value = "127.0.0.1:0")]
-        stun: String,
+        stun: std::net::SocketAddr,
         /// The IP address to advertise in the region.
         #[arg(long)]
         advertise: Option<std::net::IpAddr>,
         /// Write the region's JSON to this file once listening.
         #[arg(long)]
-        region_file: Option<String>,
+        region_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -385,11 +385,12 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
         Some(Cmd::Version) => println!("{VERSION}"),
         Some(Cmd::Readme) => print!("{}", help::README),
         Some(Cmd::DevDerp { derp, stun, advertise, region_file }) => {
-            let d = tailcat::derp::server::DevDerp::start(derp.parse()?, stun.parse()?, advertise).await?;
+            let d = tailcat::derp::server::DevDerp::start(derp, stun, advertise).await?;
             let j = serde_json::to_string_pretty(&d.region)?;
             if let Some(f) = region_file {
                 // Atomically: scripts poll for it.
-                util::replace_private(&f, j.as_bytes()).map_err(|e| anyhow::anyhow!("--region-file: {f}: {e}"))?;
+                util::replace_private(&f, j.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("--region-file: {}: {e}", f.display()))?;
             }
             println!("{j}");
             eprintln!("# dev DERP relay running; press Ctrl-C to stop");
