@@ -1,5 +1,8 @@
 //! `tailcat genkey`: generate, list, or delete saved keys.
 
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -51,11 +54,11 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     let mut pick_now = false;
 
     if a.list {
-        let mut names: Vec<String> = match std::fs::read_dir(crate::keys::keys_dir()?) {
+        let mut names: Vec<String> = match fs::read_dir(crate::keys::keys_dir()?) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".private.json").map(String::from))
                 .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
         names.sort();
@@ -70,7 +73,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     let path = crate::keys::key_file(key)?;
     if a.delete {
         match (key, &path) {
-            (KeyArg::Named(_), Some(path)) => std::fs::remove_file(path)?,
+            (KeyArg::Named(_), Some(path)) => fs::remove_file(path)?,
             (KeyArg::Path(_), _) => return Err(usagef!("can't delete key {:?}; it's a path", key.to_string())),
             _ => {
                 return Err(usagef!(
@@ -128,7 +131,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     }
     if let Some(path) = &path {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            fs::create_dir_all(dir)?;
         }
         // Fail early, before any network work; writing checks again.
         if path.exists() && !a.force && !listing {
@@ -152,7 +155,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
             crate::util::create_private(path, json.as_bytes())
         };
         written.map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => exists(path),
+            ErrorKind::AlreadyExists => exists(path),
             _ => anyhow!("writing {}: {e}", path.display()),
         })?;
         eprintln!("# wrote file to {}", path.display());
@@ -229,6 +232,6 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     Ok(())
 }
 
-fn exists(path: &std::path::Path) -> anyhow::Error {
+fn exists(path: &Path) -> anyhow::Error {
     anyhow!("{} already exists; use --force to overwrite", path.display())
 }
