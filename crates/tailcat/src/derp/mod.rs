@@ -177,6 +177,8 @@ pub fn valid_app_name(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+
     use super::*;
 
     #[test]
@@ -195,12 +197,14 @@ mod tests {
     async fn frames_round_trip_and_respect_the_limit() {
         let f = frame(FrameType::SendPacket, &[&[1; 32], b"hi"]);
         assert_eq!(&f[..5], &[0x04, 0, 0, 0, 34]);
+
         let (t, payload) = read_frame(&mut f.as_slice(), 34).await.unwrap();
         assert_eq!(t, FrameType::SendPacket as u8);
-        assert_eq!(split_key(&payload), Some((NodePublic::from_bytes([1; 32]), &b"hi"[..])));
+        let key = NodePublic::from_bytes([1; 32]);
+        assert_eq!(split_key(&payload), Some((key, &b"hi"[..])));
 
         let err = read_frame(&mut f.as_slice(), 33).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
         // A truncated payload is an error, not a short frame.
         assert!(read_frame(&mut &f[..20], 34).await.is_err());
         assert_eq!(frame(FrameType::KeepAlive, &[]), [0x06, 0, 0, 0, 0]);

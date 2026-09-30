@@ -471,24 +471,30 @@ mod tests {
             .collect()
     }
 
+    const NEVER: &[u64] = &[];
+
     #[test]
     fn answered_data_never_stalls() {
         // A request a second, each answered at once.
-        assert_eq!(run(60, |s| (s as usize, s as usize, Some(s), Some(s))), Vec::<u64>::new());
+        let got = run(60, |s| (s as usize, s as usize, Some(s), Some(s)));
+        assert_eq!(got, NEVER);
     }
 
     #[test]
     fn keepalives_answer_one_way_data() {
         // Data a second, answered only by the server's keepalive every
         // 10 seconds (which carries no data).
-        assert_eq!(run(60, |s| (s as usize, 0, Some(s), Some(s / 10 * 10))), Vec::<u64>::new());
+        let got = run(60, |s| (s as usize, 0, Some(s), Some(s / 10 * 10)));
+        assert_eq!(got, NEVER);
     }
 
     #[test]
     fn idle_never_stalls() {
-        // One exchange, then quiet but for our own passive keepalive,
-        // which nothing answers.
-        assert_eq!(run(60, |s| (1, 1, Some(if s < 11 { 1 } else { 11 }), Some(1))), Vec::<u64>::new());
+        // One exchange, then quiet but for our own passive keepalive at
+        // 11 seconds, which nothing answers.
+        let last_send = |s| if s < 11 { 1 } else { 11 };
+        let got = run(60, |s| (1, 1, Some(last_send(s)), Some(1)));
+        assert_eq!(got, NEVER);
     }
 
     #[test]
@@ -496,8 +502,9 @@ mod tests {
         // After an exchange, data every second into the void: it stalls
         // once per timeout, while the data keeps going unanswered.
         let got = run(60, |s| (s as usize, 1, Some(s), Some(1)));
-        assert_eq!(got, vec![17, 33, 49]);
-        // A single unanswered packet stalls once.
-        assert_eq!(run(60, |s| (if s < 5 { 1 } else { 2 }, 1, Some(if s < 5 { 1 } else { 5 }), Some(1))), vec![20]);
+        assert_eq!(got, [17, 33, 49]);
+        // A single unanswered packet, sent at 5 seconds, stalls once.
+        let got = run(60, |s| if s < 5 { (1, 1, Some(1), Some(1)) } else { (2, 1, Some(5), Some(1)) });
+        assert_eq!(got, [20]);
     }
 }

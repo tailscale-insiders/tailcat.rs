@@ -155,6 +155,8 @@ async fn https_latency(n: &DerpNode) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::time::sleep;
+
     use super::*;
     use crate::derpmap::DerpRegion;
 
@@ -165,10 +167,9 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             while let Ok((n, src)) = sock.recv_from(&mut buf).await {
-                if let Some(tx) = stun::parse_binding_request(&buf[..n]) {
-                    tokio::time::sleep(delay).await;
-                    let _ = sock.send_to(&stun::response(tx, src), src).await;
-                }
+                let Some(tx) = stun::parse_binding_request(&buf[..n]) else { continue };
+                sleep(delay).await;
+                let _ = sock.send_to(&stun::response(tx, src), src).await;
             }
         });
         port
@@ -188,11 +189,11 @@ mod tests {
     async fn picks_the_fastest_measurable_region() {
         let fast = stun_server(Duration::ZERO).await;
         let slow = stun_server(Duration::from_millis(100)).await;
-        let dm = DerpMap {
-            regions: [region(1, slow, false), region(2, fast, false), region(3, fast, true)].into(),
-            ..Default::default()
-        };
+        let regions = [region(1, slow, false), region(2, fast, false), region(3, fast, true)];
+        let dm = DerpMap { regions: regions.into(), ..Default::default() };
+
         let rep = report(&dm).await.unwrap();
+
         assert_eq!(rep.region_latency.len(), 2, "{rep:?}");
         assert!(rep.region_latency[&1] > rep.region_latency[&2]);
         assert!(rep.global_v4.unwrap().ip().is_loopback());

@@ -134,29 +134,37 @@ impl ServerCertVerifier for Verifier {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::duplex;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
     use super::*;
 
     /// Handshakes over an in-memory pipe with a fresh self-signed server
     /// for `localhost`, returning the leaf certificate the client saw.
     async fn handshake(n: &DerpNode) -> Result<CertificateDer<'static>> {
-        let (c, s) = tokio::io::duplex(1 << 16);
-        let server = tokio_rustls::TlsAcceptor::from(Arc::new(self_signed_server_config(&["localhost"])?));
+        let (c, s) = duplex(1 << 16);
+        let server = TlsAcceptor::from(Arc::new(self_signed_server_config(&["localhost"])?));
         tokio::spawn(async move {
             let _ = server.accept(s).await;
         });
-        let client = tokio_rustls::TlsConnector::from(Arc::new(client_config_for_node(n)?));
+        let client = TlsConnector::from(Arc::new(client_config_for_node(n)?));
         let tls = client.connect(server_name("localhost")?, c).await?;
-        Ok(tls.get_ref().1.peer_certificates().unwrap()[0].clone().into_owned())
+        let (_, session) = tls.get_ref();
+        let leaf = &session.peer_certificates().unwrap()[0];
+        Ok(leaf.clone().into_owned())
     }
 
-    #[tokio::test]
-    async fn verifies_by_mode() {
-        let node = |insecure_for_tests, cert_name: &str| DerpNode {
+    fn node(insecure_for_tests: bool, cert_name: &str) -> DerpNode {
+        DerpNode {
             host_name: "localhost".into(),
             cert_name: cert_name.into(),
             insecure_for_tests,
             ..Default::default()
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn verifies_by_mode() {
         // Web PKI rejects a self-signed certificate, with or without a name override.
         assert!(handshake(&node(false, "")).await.is_err());
         assert!(handshake(&node(false, "derp.example.com")).await.is_err());
@@ -165,7 +173,8 @@ mod tests {
         // A hash pin accepts only the certificate it names, and each
         // server here has a fresh one.
         let hash = hex::encode_upper(Sha256::digest(cert.as_ref()));
-        assert!(handshake(&node(false, &format!("sha256-raw:{hash}"))).await.is_err());
+        let pinned = node(false, &format!("sha256-raw:{hash}"));
+        assert!(handshake(&pinned).await.is_err());
         let v = Verifier { check: Check::Hash(hash.to_ascii_lowercase()), provider: provider() };
         let name = server_name("localhost").unwrap();
         assert!(v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());

@@ -525,15 +525,36 @@ mod tests {
     const RESOLVED: &str = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYWhudGMzMDJhLmlwbi5kZXZhNG0yMDguMTExLjM5LjM4YTZzMjYwNzpmNzQwOjA6M2Y6OjcyMA";
     const CUSTOM: &str = "tcomFwWCCAIsKOqPUux6ClG2RM4A_vOq4VBzGgHGGjq9OsJuFKSWFygaFhToGhYWhwZGVycC5leGFtcGxlLmNvbQ";
 
+    type Entries = Vec<(Value, Value)>;
+
+    fn int(i: i64) -> Value {
+        Value::Integer(i.into())
+    }
+
+    fn array(items: Vec<Value>) -> Value {
+        Value::Array(items)
+    }
+
+    fn map(entries: Entries) -> Value {
+        Value::Map(entries)
+    }
+
     /// Encodes a raw CBOR address, for hand-built test cases.
-    fn raw_addr(m: Vec<(Value, Value)>) -> Addr {
+    fn raw_addr(m: Entries) -> Addr {
         let mut buf = Vec::new();
-        ciborium::into_writer(&Value::Map(m), &mut buf).unwrap();
+        ciborium::into_writer(&map(m), &mut buf).unwrap();
         Addr::new(format!("tc{}", URL_SAFE_NO_PAD.encode(buf)))
     }
 
-    fn cbor_of(a: &Addr) -> Value {
-        ciborium::from_reader(URL_SAFE_NO_PAD.decode(&a.as_str()[2..]).unwrap().as_slice()).unwrap()
+    /// The top-level CBOR map an address encodes.
+    fn cbor_map_of(a: &Addr) -> Entries {
+        let bytes = URL_SAFE_NO_PAD.decode(&a.as_str()[2..]).unwrap();
+        let v: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        v.into_map().expect("not a map")
+    }
+
+    fn keys(m: &[(Value, Value)]) -> Vec<&str> {
+        m.iter().map(|(k, _)| k.as_text().unwrap()).collect()
     }
 
     fn sample_region() -> DerpRegion {
@@ -561,53 +582,56 @@ mod tests {
         }
     }
 
+    /// A fresh key's connection info, carrying [`sample_region`].
+    fn sample_conn_info() -> ConnInfo {
+        let mut ci = PrivateKey::generate().public;
+        ci.region = vec![sample_region()];
+        ci
+    }
+
     #[test]
     fn parses_upstream_readme_examples() {
-        let ci = Addr::new(SHORT).parse().unwrap();
-        assert_eq!(
-            ci.server_public.to_string(),
-            "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34"
-        );
-        assert_eq!(ci.region_id, 302);
-        assert!(ci.region.is_empty());
+        let short = Addr::new(SHORT).parse().unwrap();
+        let resolved = Addr::new(RESOLVED).parse().unwrap();
+        let custom = Addr::new(CUSTOM).parse_raw_json().unwrap();
 
-        let ci = Addr::new(RESOLVED).parse().unwrap();
-        assert_eq!(ci.region.len(), 1);
-        let n = &ci.region[0].nodes[0];
+        let key = "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34";
+        assert_eq!(short.server_public.to_string(), key);
+        assert_eq!(short.region_id, 302);
+        assert!(short.region.is_empty());
+
+        assert_eq!(resolved.region.len(), 1);
+        let n = &resolved.region[0].nodes[0];
         assert_eq!(n.host_name, "tc302a.ipn.dev");
         assert_eq!(n.ipv4, "208.111.39.38");
         assert_eq!(n.ipv6, "2607:f740:0:3f::720");
         // Restored implicit fields:
-        assert_eq!(ci.region[0].region_id, 1);
+        assert_eq!(resolved.region[0].region_id, 1);
         assert_eq!(n.name, "tc302a.ipn.dev");
 
-        let raw = Addr::new(CUSTOM).parse_raw_json().unwrap();
-        assert_eq!(
-            raw,
-            serde_json::json!({
-                "ServerPublic": "nodekey:8022c28ea8f52ec7a0a51b644ce00fef3aae150731a01c61a3abd3ac26e14a49",
-                "Region": [{"Nodes": [{"HostName": "derp.example.com"}]}]
-            })
-        );
+        let want = serde_json::json!({
+            "ServerPublic": "nodekey:8022c28ea8f52ec7a0a51b644ce00fef3aae150731a01c61a3abd3ac26e14a49",
+            "Region": [{"Nodes": [{"HostName": "derp.example.com"}]}]
+        });
+        assert_eq!(custom, want);
     }
 
     #[test]
     fn short_address_is_byte_identical_to_go() {
         // Re-encoding the Go-produced address gives the same string: same
         // key order, same minimal integer encoding.
-        let ci = Addr::new(SHORT).parse().unwrap();
-        assert_eq!(ci.addr().as_str(), SHORT);
-        let ci = Addr::new(RESOLVED).parse().unwrap();
-        assert_eq!(ci.addr().as_str(), RESOLVED);
+        for s in [SHORT, RESOLVED] {
+            let ci = Addr::new(s).parse().unwrap();
+            assert_eq!(ci.addr().as_str(), s);
+        }
     }
 
     #[test]
     fn round_trips_full_info() {
-        let k = PrivateKey::generate();
-        let mut ci = k.public.clone();
-        ci.region = vec![sample_region()];
-        let a = ci.addr();
-        let back = a.parse().unwrap();
+        let ci = sample_conn_info();
+
+        let back = ci.addr().parse().unwrap();
+
         assert_eq!(back.server_public, ci.server_public);
         assert_eq!(back.server_disco_public, ci.server_disco_public);
         assert_eq!(back.preshared_key, ci.preshared_key);
@@ -626,49 +650,38 @@ mod tests {
 
     #[test]
     fn encodes_in_go_key_order() {
-        let mut ci = PrivateKey::generate().public;
-        ci.region = vec![sample_region()];
+        let mut ci = sample_conn_info();
         ci.region_id = -1;
-        let Value::Map(m) = cbor_of(&ci.addr()) else { panic!() };
-        let keys: Vec<_> = m.iter().map(|(k, _)| k.as_text().unwrap()).collect();
-        assert_eq!(keys, ["p", "k", "q", "r", "i"]);
-        assert_eq!(m[4].1, Value::Integer((-1).into()));
-        let Value::Array(regions) = &m[3].1 else { panic!() };
-        let Value::Map(r) = &regions[0] else { panic!() };
+
+        let m = cbor_map_of(&ci.addr());
+
+        assert_eq!(keys(&m), ["p", "k", "q", "r", "i"]);
+        assert_eq!(m[4].1, int(-1));
+        let regions = m[3].1.as_array().expect("regions not an array");
+        let r = regions[0].as_map().expect("region not a map");
         assert_eq!(r.len(), 1, "only the nodes of a region are encoded");
-        let Value::Array(nodes) = &r[0].1 else { panic!() };
-        let Value::Map(n) = &nodes[0] else { panic!() };
-        let keys: Vec<_> = n.iter().map(|(k, _)| k.as_text().unwrap()).collect();
-        assert_eq!(keys, ["h", "t", "4", "6", "s", "d", "x"]);
+        let nodes = r[0].1.as_array().expect("nodes not an array");
+        let n = nodes[0].as_map().expect("node not a map");
+        assert_eq!(keys(n), ["h", "t", "4", "6", "s", "d", "x"]);
 
         // Zero keys and IDs are omitted entirely.
         let bare = ConnInfo { server_public: NodePublic::from_bytes([1; 32]), ..Default::default() };
-        let Value::Map(m) = cbor_of(&bare.addr()) else { panic!() };
-        assert_eq!(m.len(), 1);
+        assert_eq!(cbor_map_of(&bare.addr()).len(), 1);
     }
 
     #[test]
     fn raw_json_shows_carried_fields_in_order() {
+        let node = map(vec![(text("x"), Value::Bool(true)), (text("s"), int(-1))]);
+        let region = map(vec![(text("m"), text("Name")), (text("i"), int(9)), (text("N"), array(vec![node]))]);
         let a = raw_addr(vec![
             (text("p"), Value::Bytes(vec![1; 32])),
             (text("k"), Value::Bytes(vec![0; 32])),
-            (
-                text("r"),
-                Value::Array(vec![Value::Map(vec![
-                    (text("m"), text("Name")),
-                    (text("i"), Value::Integer(9.into())),
-                    (
-                        text("N"),
-                        Value::Array(vec![Value::Map(vec![
-                            (text("x"), Value::Bool(true)),
-                            (text("s"), Value::Integer((-1).into())),
-                        ])]),
-                    ),
-                ])]),
-            ),
-            (text("i"), Value::Integer(3.into())),
+            (text("r"), array(vec![region])),
+            (text("i"), int(3)),
         ]);
+
         let j = a.parse_raw_json().unwrap();
+
         // An explicit zero key is shown, since the address carries it.
         assert_eq!(j["ServerDiscoPublic"].as_str().unwrap(), format!("discokey:{}", "0".repeat(64)));
         assert!(j.get("PresharedKey").is_none());
@@ -677,8 +690,21 @@ mod tests {
         assert_eq!(r, r#"[{"RegionID":9,"RegionName":"Name","Nodes":[{"STUNPort":-1,"InsecureForTests":true}]}]"#);
         // Explicit region fields survive parsing.
         let ci = a.parse().unwrap();
-        assert_eq!((ci.region[0].region_id, ci.region[0].region_code.as_str()), (9, "9"));
-        assert_eq!(ci.region[0].nodes[0].region_id, 9);
+        let r = &ci.region[0];
+        assert_eq!((r.region_id, r.region_code.as_str()), (9, "9"));
+        assert_eq!(r.nodes[0].region_id, 9);
+    }
+
+    /// A valid server key entry.
+    fn p() -> (Value, Value) {
+        (text("p"), Value::Bytes(vec![1; 32]))
+    }
+
+    /// An address whose one region has one node with just `k: v`.
+    fn with_node_field(k: &str, v: Value) -> Entries {
+        let node = map(vec![(text(k), v)]);
+        let region = map(vec![(text("N"), array(vec![node]))]);
+        vec![p(), (text("r"), array(vec![region]))]
     }
 
     #[test]
@@ -687,26 +713,23 @@ mod tests {
         assert!(Addr::new("tc!!!").parse().is_err());
         assert!(Addr::new("tcoA").parse().is_err()); // empty map: no key
         assert!("tcoA".parse::<Addr>().is_err());
-        let p = || (text("p"), Value::Bytes(vec![1; 32]));
-        let err = |m| raw_addr(m).parse().unwrap_err().to_string();
-        // A null region must be rejected, not dereferenced.
-        assert!(err(vec![p(), (text("r"), Value::Array(vec![Value::Null]))]).contains("region 0 is null"));
-        assert!(err(vec![(text("p"), Value::Bytes(vec![1; 31]))]).contains("length 31"));
-        assert!(err(vec![p(), (text("i"), text("x"))]).contains("region ID is not an integer"));
-        assert!(err(vec![p(), (text("i"), Value::Integer((1i64 << 40).into()))]).contains("out of range"));
-        assert!(err(vec![p(), (text("r"), text("x"))]).contains("regions is not an array"));
-        let node = |k, v| {
-            let n = Value::Map(vec![(text(k), v)]);
-            vec![p(), (text("r"), Value::Array(vec![Value::Map(vec![(text("N"), Value::Array(vec![n]))])]))]
-        };
-        assert!(err(node("h", Value::Integer(1.into()))).contains("region 0 node 0 HostName is not a string"));
+
+        let cases = [
+            // A null region must be rejected, not dereferenced.
+            (vec![p(), (text("r"), array(vec![Value::Null]))], "region 0 is null"),
+            (vec![(text("p"), Value::Bytes(vec![1; 31]))], "length 31"),
+            (vec![p(), (text("i"), text("x"))], "region ID is not an integer"),
+            (vec![p(), (text("i"), int(1 << 40))], "out of range"),
+            (vec![p(), (text("r"), text("x"))], "regions is not an array"),
+            (with_node_field("h", int(1)), "region 0 node 0 HostName is not a string"),
+        ];
+        for (m, want) in cases {
+            let e = raw_addr(m).parse().unwrap_err().to_string();
+            assert!(e.contains(want), "{e}");
+        }
+
         // Unknown and non-text keys are ignored, as are null arrays.
-        let ok = raw_addr(vec![
-            p(),
-            (Value::Integer(1.into()), Value::Null),
-            (text("z"), Value::Null),
-            (text("r"), Value::Null),
-        ]);
+        let ok = raw_addr(vec![p(), (int(1), Value::Null), (text("z"), Value::Null), (text("r"), Value::Null)]);
         assert!(ok.parse().unwrap().region.is_empty());
     }
 
@@ -714,6 +737,7 @@ mod tests {
     async fn expands_from_a_derp_map() {
         let dm = DerpMap { regions: [(7, sample_region())].into(), ..Default::default() };
         let opts = FetchOptions::default();
+
         let mut ci = ConnInfo { region_id: 7, ..Default::default() };
         ci.expand(opts, Some(&dm)).await.unwrap();
         assert_eq!(ci.region, [sample_region()]);
@@ -721,15 +745,13 @@ mod tests {
         ci.expand(opts, Some(&dm)).await.unwrap();
         assert_eq!(ci.region.len(), 1);
 
-        let mut ci = ConnInfo { region_id: 8, ..Default::default() };
-        let e = ci.expand(opts, Some(&dm)).await.unwrap_err().to_string();
+        let mut missing = ConnInfo { region_id: 8, ..Default::default() };
+        let e = missing.expand(opts, Some(&dm)).await.unwrap_err().to_string();
         assert!(e.contains("RegionID 8 but no such region exists in provided DERP map"), "{e}");
 
         // An embedded region gets default IDs.
-        let mut ci = ConnInfo {
-            region: vec![DerpRegion { nodes: vec![DerpNode::default()], ..Default::default() }],
-            ..Default::default()
-        };
+        let embedded = DerpRegion { nodes: vec![DerpNode::default()], ..Default::default() };
+        let mut ci = ConnInfo { region: vec![embedded], ..Default::default() };
         ci.expand(opts, None).await.unwrap();
         assert_eq!((ci.region[0].region_id, ci.region[0].nodes[0].region_id), (1, 1));
 
@@ -747,23 +769,23 @@ mod tests {
     #[test]
     fn private_key_json_matches_go_shape() {
         let k = PrivateKey::generate();
+
         let j = k.to_json_pretty();
+
         assert!(j.contains("\t\"Private\": \"privkey:"));
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
-        assert!(v["Public"]["ServerPublic"].as_str().unwrap().starts_with("nodekey:"));
-        assert!(v["Public"]["PresharedKey"].as_str().unwrap().starts_with("psk:"));
-        assert!(v["Public"].get("Region").is_none());
-        assert!(v["Public"].get("RegionID").is_none());
+        let public = &v["Public"];
+        assert!(public["ServerPublic"].as_str().unwrap().starts_with("nodekey:"));
+        assert!(public["PresharedKey"].as_str().unwrap().starts_with("psk:"));
+        assert!(public.get("Region").is_none());
+        assert!(public.get("RegionID").is_none());
         let back: PrivateKey = serde_json::from_str(&j).unwrap();
         assert_eq!(back.private, k.private);
 
         // A Go client key file (RegionID omitted, zero disco key allowed).
+        let (private, server_public, zeros) = (&k.private, k.private.public(), "0".repeat(64));
         let go = format!(
-            "{{\"Private\":\"{}\",\"Public\":{{\"ServerPublic\":\"{}\",\"ServerDiscoPublic\":\"discokey:{}\",\"PresharedKey\":\"psk:{}\"}}}}",
-            k.private,
-            k.private.public(),
-            "0".repeat(64),
-            "0".repeat(64)
+            "{{\"Private\":\"{private}\",\"Public\":{{\"ServerPublic\":\"{server_public}\",\"ServerDiscoPublic\":\"discokey:{zeros}\",\"PresharedKey\":\"psk:{zeros}\"}}}}"
         );
         let back: PrivateKey = serde_json::from_str(&go).unwrap();
         assert!(back.public.preshared_key.is_zero());

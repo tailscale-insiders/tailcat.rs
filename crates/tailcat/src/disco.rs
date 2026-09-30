@@ -149,18 +149,28 @@ pub fn seal_with(ours: &DiscoPrivate, to: &DiscoPublic, msg: &Message) -> Vec<u8
 mod tests {
     use super::*;
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn node_key(b: u8) -> NodePublic {
+        NodePublic::from_bytes([b; 32])
+    }
+
+    fn no_endpoints() -> Option<Message> {
+        Some(Message::CallMeMaybe { endpoints: vec![] })
+    }
+
     #[test]
     fn round_trips() {
         let a = DiscoPrivate::generate();
         let b = DiscoPrivate::generate();
         let msgs = [
-            Message::Ping { tx_id: [7; 12], node_key: Some(NodePublic::from_bytes([9; 32])), padding: 0 },
+            Message::Ping { tx_id: [7; 12], node_key: Some(node_key(9)), padding: 0 },
             Message::Ping { tx_id: [7; 12], node_key: None, padding: 5 },
-            Message::Pong { tx_id: [1; 12], src: "203.0.113.9:41641".parse().unwrap() },
-            Message::Pong { tx_id: [1; 12], src: "[2001:db8::2]:5".parse().unwrap() },
-            Message::CallMeMaybe {
-                endpoints: vec!["192.0.2.1:1".parse().unwrap(), "[2001:db8::1]:2".parse().unwrap()],
-            },
+            Message::Pong { tx_id: [1; 12], src: addr("203.0.113.9:41641") },
+            Message::Pong { tx_id: [1; 12], src: addr("[2001:db8::2]:5") },
+            Message::CallMeMaybe { endpoints: vec![addr("192.0.2.1:1"), addr("[2001:db8::1]:2")] },
         ];
         for m in msgs {
             let pkt = seal_with(&a, &b.public(), &m);
@@ -172,15 +182,13 @@ mod tests {
     #[test]
     fn go_wire_layout() {
         // Ping: type, version, 12-byte txid, 32-byte node key.
-        let m = Message::Ping { tx_id: [0xaa; 12], node_key: Some(NodePublic::from_bytes([0xbb; 32])), padding: 0 };
-        let e = m.encode();
-        assert_eq!(e.len(), 2 + 12 + 32);
-        assert_eq!(&e[..2], &[1, 0]);
+        let ping = Message::Ping { tx_id: [0xaa; 12], node_key: Some(node_key(0xbb)), padding: 0 }.encode();
+        assert_eq!(ping.len(), 2 + 12 + 32);
+        assert_eq!(&ping[..2], &[1, 0]);
         // Pong: IPv4 addresses are v4-mapped IPv6 on the wire.
-        let m = Message::Pong { tx_id: [0; 12], src: "1.2.3.4:258".parse().unwrap() };
-        let e = m.encode();
-        assert_eq!(&e[14..30], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4]);
-        assert_eq!(&e[30..32], &[1, 2]);
+        let pong = Message::Pong { tx_id: [0; 12], src: addr("1.2.3.4:258") }.encode();
+        assert_eq!(&pong[14..30], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4]);
+        assert_eq!(&pong[30..32], &[1, 2]);
     }
 
     #[test]
@@ -193,32 +201,31 @@ mod tests {
         assert_eq!(Message::decode(&[TYPE_PING, 0, 1, 2]), None);
         let ping = |rest: &[u8]| Message::decode(&[&[TYPE_PING, 0][..], &[5; 12], rest].concat());
         assert_eq!(ping(&[0; 40]), Some(Message::Ping { tx_id: [5; 12], node_key: None, padding: 40 }));
-        let k = NodePublic::from_bytes([1; 32]);
         let got = ping(&[[1; 32].as_slice(), &[0; 3]].concat());
-        assert_eq!(got, Some(Message::Ping { tx_id: [5; 12], node_key: Some(k), padding: 3 }));
+        assert_eq!(got, Some(Message::Ping { tx_id: [5; 12], node_key: Some(node_key(1)), padding: 3 }));
         // A truncated pong.
-        let pong = Message::Pong { tx_id: [1; 12], src: "192.0.2.1:9".parse().unwrap() }.encode();
+        let pong = Message::Pong { tx_id: [1; 12], src: addr("192.0.2.1:9") }.encode();
         assert_eq!(Message::decode(&pong[..pong.len() - 1]), None);
         // Call-me-maybe with a ragged body or unknown version carries no endpoints.
-        let cmm = Message::CallMeMaybe { endpoints: vec!["192.0.2.1:9".parse().unwrap()] }.encode();
-        assert_eq!(Message::decode(&cmm[..cmm.len() - 1]), Some(Message::CallMeMaybe { endpoints: vec![] }));
+        let cmm = Message::CallMeMaybe { endpoints: vec![addr("192.0.2.1:9")] }.encode();
         let mut v1 = cmm.clone();
         v1[1] = 1;
-        assert_eq!(Message::decode(&v1), Some(Message::CallMeMaybe { endpoints: vec![] }));
-        assert_eq!(Message::decode(&cmm[..2]), Some(Message::CallMeMaybe { endpoints: vec![] }));
+        assert_eq!(Message::decode(&cmm[..cmm.len() - 1]), no_endpoints());
+        assert_eq!(Message::decode(&v1), no_endpoints());
+        assert_eq!(Message::decode(&cmm[..2]), no_endpoints());
     }
 
     #[test]
     fn rejects_foreign_packets() {
         let a = DiscoPrivate::generate();
         let b = DiscoPrivate::generate();
-        let m = Message::CallMeMaybe { endpoints: vec![] };
-        let pkt = seal_with(&a, &b.public(), &m);
+        let pkt = seal_with(&a, &b.public(), &Message::CallMeMaybe { endpoints: vec![] });
+        let mut bad = pkt.clone();
+        bad[0] = b'X';
+
         // Not ours to open, too short, or without the magic.
         assert_eq!(open(&a.shared(&a.public()), &pkt), None);
         assert_eq!(source(&pkt[..HEADER_LEN + 23]), None);
-        let mut bad = pkt.clone();
-        bad[0] = b'X';
         assert_eq!(source(&bad), None);
         assert_eq!(open(&b.shared(&a.public()), &bad), None);
     }

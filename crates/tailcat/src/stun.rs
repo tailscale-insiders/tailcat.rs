@@ -176,6 +176,10 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn crc_known_value() {
         assert_eq!(crc32_ieee(b"123456789"), 0xcbf4_3926);
@@ -194,16 +198,15 @@ mod tests {
         // A response isn't a request, and vice versa.
         assert_eq!(parse_response(&req), None);
 
-        for a in ["203.0.113.7:41641", "[2001:db8::1]:3478"] {
-            let a: SocketAddr = a.parse().unwrap();
+        for a in [addr("203.0.113.7:41641"), addr("[2001:db8::1]:3478")] {
             let res = response(tx, a);
             assert_eq!(parse_binding_request(&res), None);
             assert_eq!(parse_response(&res), Some((tx, a)));
         }
         // IPv4-mapped IPv6 addresses are reported as IPv4.
-        let res = response(tx, "[::ffff:192.0.2.1]:5".parse().unwrap());
+        let res = response(tx, addr("[::ffff:192.0.2.1]:5"));
         assert_eq!(res.len(), 20 + 12);
-        assert_eq!(parse_response(&res), Some((tx, "192.0.2.1:5".parse().unwrap())));
+        assert_eq!(parse_response(&res), Some((tx, addr("192.0.2.1:5"))));
     }
 
     #[test]
@@ -227,8 +230,9 @@ mod tests {
         let tx: TxId = [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
         let mut b = header(BINDING_SUCCESS, 12, &tx);
         put_attr(&mut b, ATTR_XOR_MAPPED_ADDRESS, &[0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]);
-        assert_eq!(parse_response(&b), Some((tx, "192.0.2.1:32853".parse().unwrap())));
-        assert_eq!(response(tx, "192.0.2.1:32853".parse().unwrap()), b);
+        let mapped = addr("192.0.2.1:32853");
+        assert_eq!(parse_response(&b), Some((tx, mapped)));
+        assert_eq!(response(tx, mapped), b);
     }
 
     #[test]
@@ -238,7 +242,7 @@ mod tests {
         put_attr(&mut b, 0x7777, &[1, 2, 3]); // unknown, padded to 4
         b.push(0);
         put_attr(&mut b, ATTR_MAPPED_ADDRESS, &[0, 1, 0x12, 0x34, 198, 51, 100, 7]);
-        assert_eq!(parse_response(&b), Some((tx, "198.51.100.7:4660".parse().unwrap())));
+        assert_eq!(parse_response(&b), Some((tx, addr("198.51.100.7:4660"))));
         // An attribute running past the end is rejected.
         let mut b = header(BINDING_SUCCESS, 8, &tx);
         b.extend([0x00, 0x20, 0x00, 0x08, 0, 1, 0, 0]);

@@ -49,14 +49,18 @@ mod tests {
         let n = NodePublic::from_bytes([1; 32]);
         let d = DiscoPublic::from_bytes([2; 32]);
         let p = encode_ping(&n, &d);
-        assert!(is_meow(&p) && !is_meowed(&p));
+        let meowed = encode_meowed();
+        assert!(is_meow(&p));
+        assert!(!is_meowed(&p));
         assert_eq!(parse_ping(&p), Some((n, d)));
-        assert!(is_meowed(&encode_meowed()));
+        assert!(is_meowed(&meowed));
         assert_eq!(parse_ping(&encode_ping(&n, &DiscoPublic::default())), None);
         // Truncated, mistyped, or extended pings.
         assert_eq!(parse_ping(&p[..p.len() - 1]), None);
-        assert_eq!(parse_ping(&encode_meowed()), None);
+        assert_eq!(parse_ping(&meowed), None);
         assert_eq!(parse_ping(&[p.as_slice(), b"more"].concat()), Some((n, d)));
-        assert!(!is_meowed(b"meow") && !is_meow(b"meo") && !is_meowed(b"purr\x02"));
+        assert!(!is_meowed(b"meow"));
+        assert!(!is_meow(b"meo"));
+        assert!(!is_meowed(b"purr\x02"));
     }
 }

@@ -358,6 +358,9 @@ fn nacl_open(b: &crypto_box::SalsaBox, sealed: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Display;
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -379,14 +382,20 @@ mod tests {
         assert!("nodekey:zz".parse::<NodePublic>().is_err());
     }
 
+    /// The error message from parsing `s` as a `T`.
+    fn parse_err<T: FromStr<Err: Display>>(s: &str) -> String {
+        s.parse::<T>().err().expect("parsed").to_string()
+    }
+
     #[test]
     fn parse_errors_name_the_problem() {
-        let e = "discokey:00".parse::<NodePublic>().unwrap_err().to_string();
+        let e = parse_err::<NodePublic>("discokey:00");
         assert_eq!(e, "invalid node public key: missing \"nodekey:\" prefix");
-        let e = format!("psk:{}", "0".repeat(62)).parse::<PresharedKey>().unwrap_err().to_string();
+        let e = parse_err::<PresharedKey>(&format!("psk:{}", "0".repeat(62)));
         assert!(e.starts_with("invalid WireGuard pre-shared key: "), "{e}");
         // Keys of the wrong length don't fit.
-        assert!(format!("nodekey:{}", "ab".repeat(33)).parse::<NodePublic>().is_err());
+        let too_long = format!("nodekey:{}", "ab".repeat(33));
+        assert!(too_long.parse::<NodePublic>().is_err());
         assert!(NodePublic::from_slice(&[0; 31]).is_none());
     }
 
@@ -418,18 +427,20 @@ mod tests {
     fn box_round_trip() {
         let a = NodePrivate::generate();
         let b = NodePrivate::generate();
+        let open_from_a = |sealed: &[u8]| b.open_from(&a.public(), sealed);
+
         let sealed = a.seal_to(&b.public(), b"hello");
         assert_eq!(sealed.len(), NONCE_LEN + BOX_OVERHEAD + 5);
-        assert_eq!(b.open_from(&a.public(), &sealed).unwrap(), b"hello");
+        assert_eq!(open_from_a(&sealed).unwrap(), b"hello");
         assert!(b.open_from(&b.public(), &sealed).is_none());
         // Truncated or tampered boxes don't open.
-        assert!(b.open_from(&a.public(), &sealed[..NONCE_LEN + BOX_OVERHEAD - 1]).is_none());
+        assert!(open_from_a(&sealed[..NONCE_LEN + BOX_OVERHEAD - 1]).is_none());
         let mut bad = sealed.clone();
         *bad.last_mut().unwrap() ^= 1;
-        assert!(b.open_from(&a.public(), &bad).is_none());
+        assert!(open_from_a(&bad).is_none());
         // An empty message still round-trips.
         let empty = a.seal_to(&b.public(), b"");
-        assert_eq!(b.open_from(&a.public(), &empty).unwrap(), b"");
+        assert_eq!(open_from_a(&empty).unwrap(), b"");
 
         let da = a.disco_private();
         let db = b.disco_private();

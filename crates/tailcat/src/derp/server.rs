@@ -300,19 +300,40 @@ impl DevDerp {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{DuplexStream, duplex};
+    use tokio::time::{sleep, timeout};
+
     use super::*;
     use crate::derp::client::{DerpClient, login};
-    use crate::derp::read_frame;
+    use crate::derp::{MAX_PACKET_SIZE, read_frame};
 
     const T: Duration = Duration::from_secs(5);
+    const FAST_START: &str = "GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nDerp-Fast-Start: 1\r\n\r\n";
+    const PING: &[u8] = b"12345678";
+
+    type Conn = BufReader<DuplexStream>;
+
+    /// Waits for the next packet `rx` gets.
+    async fn recv_within<P>(rx: &mut mpsc::Receiver<P>) -> P {
+        timeout(T, rx.recv()).await.expect("nothing arrived").expect("channel closed")
+    }
+
+    /// Waits for `server` to unregister `key`.
+    async fn wait_until_gone(server: &Server, key: &NodePublic) {
+        let gone = async {
+            while server.is_client_connected(key) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+        timeout(T, gone).await.expect("the client is still connected");
+    }
 
     #[tokio::test]
     async fn relays_between_two_clients() {
         let dev = DevDerp::start_local().await.unwrap();
         let (a_tx, mut a_rx) = mpsc::channel(16);
         let (b_tx, mut b_rx) = mpsc::channel(16);
-        let ka = NodePrivate::generate();
-        let kb = NodePrivate::generate();
+        let (ka, kb) = (NodePrivate::generate(), NodePrivate::generate());
         let a = DerpClient::spawn(dev.region.clone(), ka.clone(), "test-a", true, a_tx);
         // Nothing is queued before the connection is up.
         assert!(!a.send(&kb.public(), b"too early"));
@@ -322,74 +343,91 @@ mod tests {
         assert!(dev.wait_for_client(&kb.public(), T).await);
 
         assert!(a.send(&kb.public(), b"hello b"));
-        let got = tokio::time::timeout(T, b_rx.recv()).await.unwrap().unwrap();
+        let got = recv_within(&mut b_rx).await;
         assert_eq!(got.src, ka.public());
         assert_eq!(got.region_id, 1);
         assert_eq!(got.data, b"hello b");
 
         assert!(b.send(&ka.public(), b"hi a"));
-        let got = tokio::time::timeout(T, a_rx.recv()).await.unwrap().unwrap();
+        let got = recv_within(&mut a_rx).await;
         assert_eq!(got.data, b"hi a");
 
         // Oversized packets are refused rather than truncated.
-        assert!(!a.send(&kb.public(), &vec![0; crate::derp::MAX_PACKET_SIZE + 1]));
+        let oversized = vec![0; MAX_PACKET_SIZE + 1];
+        assert!(!a.send(&kb.public(), &oversized));
 
         // Dropping a client disconnects it from the relay.
         drop(b);
-        let gone = async {
-            while dev.server.is_client_connected(&kb.public()) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        tokio::time::timeout(T, gone).await.unwrap();
+        wait_until_gone(&dev.server, &kb.public()).await;
     }
 
     /// Runs [`Server::handle_http`] on one end of an in-memory pipe and
     /// returns the other end, with `request` already written.
-    async fn http(request: &str) -> (Arc<Server>, BufReader<tokio::io::DuplexStream>) {
+    async fn http(request: &str) -> (Arc<Server>, Conn) {
         let server = Server::new();
         let c = connect(&server, request).await;
         (server, c)
     }
 
     /// Like [`http`], on an existing server.
-    async fn connect(server: &Arc<Server>, request: &str) -> BufReader<tokio::io::DuplexStream> {
-        let (near, far) = tokio::io::duplex(1 << 20);
+    async fn connect(server: &Arc<Server>, request: &str) -> Conn {
+        let (near, far) = duplex(1 << 20);
         let s = server.clone();
-        tokio::spawn(async move { s.handle_http(far, SocketAddr::from(([127, 0, 0, 1], 1))).await });
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1));
+        tokio::spawn(async move { s.handle_http(far, peer).await });
         let mut near = BufReader::new(near);
-        near.get_mut().write_all(request.as_bytes()).await.unwrap();
+        write(&mut near, request.as_bytes()).await;
         near
+    }
+
+    async fn write(c: &mut Conn, data: &[u8]) {
+        c.get_mut().write_all(data).await.unwrap();
+    }
+
+    async fn next_frame(c: &mut Conn) -> (u8, Vec<u8>) {
+        read_frame(c, 1 << 10).await.unwrap()
+    }
+
+    /// Reads until the server closes the connection.
+    async fn read_until_closed(c: &mut Conn) -> Vec<u8> {
+        let mut rest = Vec::new();
+        timeout(T, c.read_to_end(&mut rest)).await.expect("the connection is still open").unwrap();
+        rest
     }
 
     async fn response(request: &str) -> String {
         let (_server, mut c) = http(request).await;
-        let mut s = String::new();
-        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_string(&mut c, &mut s)).await.unwrap().unwrap();
-        s
+        String::from_utf8(read_until_closed(&mut c).await).unwrap()
     }
 
     #[tokio::test]
     async fn answers_plain_http() {
-        assert!(response("GET /derp/probe HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response("GET /generate_204 HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 204 "));
-        let r = response("GET /derp HTTP/1.1\r\nUpgrade: websocket\r\n\r\n").await;
-        assert!(r.starts_with("HTTP/1.1 426 ") && r.ends_with("DERP requires connection upgrade"));
+        let probe = response("GET /derp/probe HTTP/1.1\r\n\r\n").await;
+        let generate_204 = response("GET /generate_204 HTTP/1.1\r\n\r\n").await;
+        let websocket = response("GET /derp HTTP/1.1\r\nUpgrade: websocket\r\n\r\n").await;
+
+        assert!(probe.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(generate_204.starts_with("HTTP/1.1 204 "));
+        assert!(websocket.starts_with("HTTP/1.1 426 "));
+        assert!(websocket.ends_with("DERP requires connection upgrade"));
     }
 
     /// A request line or header that never ends, or headers that never
     /// finish, get the connection closed instead of held open.
     #[tokio::test]
     async fn gives_up_on_unfinished_requests() {
-        assert_eq!(response(&"x".repeat(64 << 10)).await, "");
-        assert_eq!(response(&format!("GET /derp HTTP/1.1\r\nX: {}", "x".repeat(64 << 10))).await, "");
+        let endless = "x".repeat(64 << 10);
+        assert_eq!(response(&endless).await, "");
+        assert_eq!(response(&format!("GET /derp HTTP/1.1\r\nX: {endless}")).await, "");
         assert_eq!(response("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\n").await, "");
     }
 
     #[tokio::test]
     async fn fast_start_skips_the_upgrade_response() {
-        let (server, mut c) = http("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nDerp-Fast-Start: 1\r\n\r\n").await;
-        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
+        let (server, mut c) = http(FAST_START).await;
+
+        let (t, payload) = next_frame(&mut c).await;
+
         assert_eq!(t, FrameType::ServerKey as u8);
         assert_eq!(&payload[..8], MAGIC);
         assert_eq!(&payload[8..], server.public_key().as_bytes());
@@ -400,29 +438,35 @@ mod tests {
         let (server, mut c) = http("").await;
         let key = NodePrivate::generate();
         assert_eq!(login(&mut c, "T", &key, "test").await.unwrap(), server.public_key());
-        let (t, sealed) = read_frame(&mut c, 1 << 10).await.unwrap();
+        let (t, sealed) = next_frame(&mut c).await;
         assert_eq!(t, FrameType::ServerInfo as u8);
-        let info: ServerInfo = serde_json::from_slice(&key.open_from(&server.public_key(), &sealed).unwrap()).unwrap();
+        let opened = key.open_from(&server.public_key(), &sealed).unwrap();
+        let info: ServerInfo = serde_json::from_slice(&opened).unwrap();
         assert_eq!(info.version, PROTOCOL_VERSION);
         assert!(server.is_client_connected(&key.public()));
 
         let stranger = NodePrivate::generate().public();
-        c.get_mut().write_all(&frame(FrameType::SendPacket, &[stranger.as_bytes(), b"hello?"])).await.unwrap();
-        c.get_mut().write_all(&frame(FrameType::Ping, &[b"12345678"])).await.unwrap();
-        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
+        write(&mut c, &frame(FrameType::SendPacket, &[stranger.as_bytes(), b"hello?"])).await;
+        write(&mut c, &frame(FrameType::Ping, &[PING])).await;
+
+        let (t, payload) = next_frame(&mut c).await;
         assert_eq!(t, FrameType::PeerGone as u8);
         assert_eq!(payload, [stranger.as_bytes().as_slice(), &[PEER_GONE_NOT_HERE]].concat());
-        let (t, payload) = read_frame(&mut c, 1 << 10).await.unwrap();
-        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, &b"12345678"[..]));
+        let (t, payload) = next_frame(&mut c).await;
+        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, PING));
 
         // Hanging up unregisters the client.
         drop(c);
-        let gone = async {
-            while server.is_client_connected(&key.public()) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        tokio::time::timeout(T, gone).await.unwrap();
+        wait_until_gone(&server, &key.public()).await;
+    }
+
+    /// Connects to `server` and logs in as `key`.
+    async fn logged_in(server: &Arc<Server>, key: &NodePrivate) -> Conn {
+        let mut c = connect(server, "").await;
+        login(&mut c, "T", key, "test").await.unwrap();
+        let (t, _) = next_frame(&mut c).await;
+        assert_eq!(t, FrameType::ServerInfo as u8);
+        c
     }
 
     /// A client that connects again with the same key replaces its older
@@ -431,37 +475,28 @@ mod tests {
     async fn a_new_connection_replaces_the_old_one() {
         let server = Server::new();
         let key = NodePrivate::generate();
-        let mut conns = Vec::new();
-        for _ in 0..2 {
-            let mut c = connect(&server, "").await;
-            login(&mut c, "T", &key, "test").await.unwrap();
-            let (t, _) = read_frame(&mut c, 1 << 10).await.unwrap();
-            assert_eq!(t, FrameType::ServerInfo as u8);
-            conns.push(c);
-        }
-        let [mut old, mut new] = conns.try_into().unwrap();
-        let mut rest = Vec::new();
-        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_end(&mut old, &mut rest))
-            .await
-            .expect("the old connection is still open")
-            .unwrap();
+        let mut old = logged_in(&server, &key).await;
+        let mut new = logged_in(&server, &key).await;
+
+        read_until_closed(&mut old).await;
+
         assert!(server.is_client_connected(&key.public()));
-        new.get_mut().write_all(&frame(FrameType::Ping, &[b"12345678"])).await.unwrap();
-        let (t, payload) = read_frame(&mut new, 1 << 10).await.unwrap();
-        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, &b"12345678"[..]));
+        write(&mut new, &frame(FrameType::Ping, &[PING])).await;
+        let (t, payload) = next_frame(&mut new).await;
+        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, PING));
     }
 
     #[tokio::test]
     async fn rejects_a_bad_client_info_box() {
-        let (server, mut c) = http("GET /derp HTTP/1.1\r\nUpgrade: DERP\r\nDerp-Fast-Start: 1\r\n\r\n").await;
-        read_frame(&mut c, 1 << 10).await.unwrap();
+        let (server, mut c) = http(FAST_START).await;
+        next_frame(&mut c).await;
         let key = NodePrivate::generate();
         // Sealed to the wrong key, so the server can't open it.
         let sealed = key.seal_to(&key.public(), b"{}");
-        c.get_mut().write_all(&frame(FrameType::ClientInfo, &[key.public().as_bytes(), &sealed])).await.unwrap();
-        let mut rest = Vec::new();
-        tokio::time::timeout(T, tokio::io::AsyncReadExt::read_to_end(&mut c, &mut rest)).await.unwrap().unwrap();
-        assert!(rest.is_empty());
+
+        write(&mut c, &frame(FrameType::ClientInfo, &[key.public().as_bytes(), &sealed])).await;
+
+        assert!(read_until_closed(&mut c).await.is_empty());
         assert!(!server.is_client_connected(&key.public()));
     }
 }

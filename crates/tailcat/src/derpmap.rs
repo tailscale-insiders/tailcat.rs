@@ -256,13 +256,24 @@ pub fn find_region(dm: &DerpMap, s: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
     use super::*;
 
     const SAMPLE: &str = r#"{"Regions":{"302":{"RegionID":302,"RegionCode":"sfo","RegionName":"San Francisco","Latitude":37.7775,"Nodes":[{"Name":"302a","RegionID":302,"HostName":"tc302a.ipn.dev","IPv4":"208.111.39.38","IPv6":"2607:f740:0:3f::720","CanPort80":true}]}}}"#;
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn parses_tailcat_dev_format() {
         let dm: DerpMap = serde_json::from_str(SAMPLE).unwrap();
+
         let r = &dm.regions[&302];
         assert_eq!(r.region_code, "sfo");
         assert_eq!(r.nodes[0].host_name, "tc302a.ipn.dev");
@@ -271,11 +282,14 @@ mod tests {
         assert_eq!(find_region(&dm, "SFO"), Some(302));
         assert_eq!(find_region(&dm, "franc"), Some(302));
         assert_eq!(find_region(&dm, "nope"), None);
+
         let back = serde_json::to_string(&dm).unwrap();
         let again: DerpMap = serde_json::from_str(&back).unwrap();
         assert_eq!(dm, again);
         // Zero-valued optional fields are omitted, like Go's omitempty.
-        assert!(!back.contains("Longitude") && !back.contains("STUNPort") && !back.contains("Avoid"));
+        assert!(!back.contains("Longitude"), "{back}");
+        assert!(!back.contains("STUNPort"), "{back}");
+        assert!(!back.contains("Avoid"), "{back}");
     }
 
     #[test]
@@ -293,19 +307,19 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_addrs_prefers_explicit_ips() {
-        let n = DerpNode {
+        let explicit = DerpNode {
             host_name: "does-not-resolve.invalid".into(),
             ipv4: "192.0.2.1".into(),
             ipv6: "2001:db8::1".into(),
             ..Default::default()
         };
-        let got = n.resolve_addrs(443).await;
-        assert_eq!(got, ["192.0.2.1:443".parse().unwrap(), "[2001:db8::1]:443".parse().unwrap()]);
         // "none" disables a family; a mismatched family is ignored.
-        let n = DerpNode { ipv4: "2001:db8::1".into(), ipv6: "none".into(), ..Default::default() };
-        assert!(n.resolve_addrs(443).await.is_empty());
-        let n = DerpNode { host_name: "127.0.0.1".into(), ipv6: "none".into(), ..Default::default() };
-        assert_eq!(n.resolve_addrs(1).await, ["127.0.0.1:1".parse().unwrap()]);
+        let mismatched = DerpNode { ipv4: "2001:db8::1".into(), ipv6: "none".into(), ..Default::default() };
+        let by_name = DerpNode { host_name: "127.0.0.1".into(), ipv6: "none".into(), ..Default::default() };
+
+        assert_eq!(explicit.resolve_addrs(443).await, [addr("192.0.2.1:443"), addr("[2001:db8::1]:443")]);
+        assert!(mismatched.resolve_addrs(443).await.is_empty());
+        assert_eq!(by_name.resolve_addrs(1).await, [addr("127.0.0.1:1")]);
     }
 
     /// A cache whose entries are all `age` old.
@@ -322,11 +336,10 @@ mod tests {
 
     /// Serves one canned HTTP response per connection, returning the URL
     /// and a channel of the requests received.
-    async fn http_server(responses: Vec<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn http_server(responses: Vec<String>) -> (String, mpsc::UnboundedReceiver<String>) {
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/derpmap.json", ln.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             for res in responses {
                 let (mut c, _) = ln.accept().await.unwrap();
@@ -343,6 +356,11 @@ mod tests {
         format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
     }
 
+    /// The next request the server got, lowercased.
+    async fn next_request(reqs: &mut mpsc::UnboundedReceiver<String>) -> String {
+        reqs.recv().await.unwrap().to_ascii_lowercase()
+    }
+
     #[tokio::test]
     async fn fetch_caches_and_revalidates() {
         let (url, mut reqs) = http_server(vec![
@@ -353,10 +371,12 @@ mod tests {
         .await;
         let fresh = MemDerpMapCache::default();
         let opts = FetchOptions { url: Some(&url), mode: FetchMode::Server, cache: Some(&fresh) };
+
         let dm = fetch_derp_map(opts).await.unwrap();
         assert_eq!(dm.regions[&302].region_code, "sfo");
-        let req = reqs.recv().await.unwrap().to_ascii_lowercase();
-        assert!(req.contains("tailcat-mode: server") && !req.contains("if-none-match"), "{req}");
+        let req = next_request(&mut reqs).await;
+        assert!(req.contains("tailcat-mode: server"), "{req}");
+        assert!(!req.contains("if-none-match"), "{req}");
         // A fresh entry is used with no request at all.
         assert_eq!(fetch_derp_map(opts).await.unwrap(), dm);
 
@@ -364,11 +384,12 @@ mod tests {
         let stale = AgedCache(&fresh, DERP_MAP_CACHE_MAX_AGE * 2);
         let opts = FetchOptions { cache: Some(&stale), mode: FetchMode::Client, ..opts };
         assert_eq!(fetch_derp_map(opts).await.unwrap(), dm);
-        let req = reqs.recv().await.unwrap().to_ascii_lowercase();
-        assert!(req.contains("if-none-match: \"v1\"") && req.contains("tailcat-mode: client"), "{req}");
+        let req = next_request(&mut reqs).await;
+        assert!(req.contains("if-none-match: \"v1\""), "{req}");
+        assert!(req.contains("tailcat-mode: client"), "{req}");
         // ...and used as a fallback when the server fails.
         assert_eq!(fetch_derp_map(opts).await.unwrap(), dm);
-        reqs.recv().await.unwrap();
+        next_request(&mut reqs).await;
         // With no cached copy, a failure is an error.
         let empty = MemDerpMapCache::default();
         assert!(fetch_derp_map(FetchOptions { cache: Some(&empty), ..opts }).await.is_err());
@@ -378,9 +399,10 @@ mod tests {
     async fn fetch_rejects_invalid_json() {
         let (url, _reqs) = http_server(vec![ok_response("{not json", "")]).await;
         let cache = MemDerpMapCache::default();
-        let e = fetch_derp_map(FetchOptions { url: Some(&url), cache: Some(&cache), ..Default::default() })
-            .await
-            .unwrap_err();
+        let opts = FetchOptions { url: Some(&url), cache: Some(&cache), ..Default::default() };
+
+        let e = fetch_derp_map(opts).await.unwrap_err();
+
         assert!(e.to_string().contains("invalid DERP map JSON"), "{e}");
         assert!(cache.get(&url).is_none());
     }
