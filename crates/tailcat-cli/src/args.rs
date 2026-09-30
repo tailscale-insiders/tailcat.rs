@@ -214,7 +214,14 @@ impl fmt::Display for SshTarget {
 /// An `--ssh-authorized-keys` list: comma-separated sources of SSH
 /// public keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedKeysArg(pub Vec<KeySource>);
+pub struct AuthorizedKeysArg(Vec<KeySource>);
+
+impl AuthorizedKeysArg {
+    /// Its sources, in the order given.
+    pub fn sources(&self) -> &[KeySource] {
+        &self.0
+    }
+}
 
 /// Where `--ssh-authorized-keys` gets some of its keys.
 #[derive(Debug, Clone, PartialEq, Eq)]

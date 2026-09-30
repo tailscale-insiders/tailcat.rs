@@ -25,7 +25,7 @@ fn looks_like_ssh_public_key(s: &str) -> bool {
 /// authorized_keys file's, or a literal public key line.
 pub async fn load_authorized_keys(list: &AuthorizedKeysArg) -> Result<Vec<String>> {
     let mut texts = Vec::new();
-    for (i, source) in list.0.iter().enumerate() {
+    for (i, source) in list.sources().iter().enumerate() {
         let n = i + 1;
         let text = match source {
             KeySource::Github(user) => {
