@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use tailcat::wg::IpNet;
-use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, NodePrivate};
+use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, NodePrivate, RegionArg};
 use tailcat_device::github::{self, GithubEnv, Scope};
 use tailcat_device::record::{self, DeviceKey, NodeRecord};
 use tailcat_device::source::{GithubSource, Source};
@@ -69,9 +69,9 @@ struct InitArgs {
     #[arg(long = "route")]
     routes: Vec<String>,
     /// Home DERP region: 'auto' (lowest latency), an ID, a region code or name, or comma-separated
-    /// hostnames of your own DERP servers.
+    /// hostnames of your own DERP servers. 'list' lists the regions.
     #[arg(long, default_value = "auto")]
-    region: String,
+    region: RegionArg,
     /// A JSON file holding a DERP region to embed (for example from `tailcat dev-derp --region-file`).
     #[arg(long, conflicts_with = "region")]
     region_file: Option<PathBuf>,
@@ -473,22 +473,26 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 }
 
 /// Picks the home region for `init`.
-async fn pick_region(url: &str, region: &str) -> Result<(i32, Option<DerpRegion>)> {
-    if region.contains('.') {
-        let nodes =
-            region.split(',').map(|h| DerpNode { name: h.into(), host_name: h.into(), ..Default::default() }).collect();
-        return Ok((0, Some(DerpRegion { region_id: 900, region_code: "custom".into(), nodes, ..Default::default() })));
+async fn pick_region(url: &str, region: &RegionArg) -> Result<(i32, Option<DerpRegion>)> {
+    if let RegionArg::Hosts(hosts) = region {
+        let nodes = hosts.iter().map(|h| DerpNode { name: h.clone(), host_name: h.clone(), ..Default::default() });
+        let custom =
+            DerpRegion { region_id: 900, region_code: "custom".into(), nodes: nodes.collect(), ..Default::default() };
+        return Ok((0, Some(custom)));
     }
     let dm = fetch_map(url).await?;
-    let id = if region == "auto" {
-        tailcat::netcheck::pick_best_region(&dm)
+    let id = match region {
+        RegionArg::Auto => tailcat::netcheck::pick_best_region(&dm)
             .await?
-            .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?
-    } else if let Ok(id) = region.parse() {
-        ensure!(dm.regions.contains_key(&id), "no DERP region {id} in the DERP map");
-        id
-    } else {
-        tailcat::derpmap::find_region(&dm, region).ok_or_else(|| anyhow!("no DERP region matching {region:?}"))?
+            .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?,
+        RegionArg::Id(id) => region.find(&dm).ok_or_else(|| anyhow!("no DERP region {id} in the DERP map"))?,
+        RegionArg::Name(n) => region.find(&dm).ok_or_else(|| anyhow!("no DERP region matching {n:?}"))?,
+        RegionArg::List | RegionArg::Hosts(_) => {
+            for r in dm.regions.values() {
+                eprintln!("  {:3} {} {}", r.region_id, r.region_code, r.region_name);
+            }
+            bail!("pass one of these DERP regions to --region");
+        }
     };
     Ok((id, None))
 }
@@ -530,7 +534,8 @@ mod tests {
 
     #[tokio::test]
     async fn custom_region_hostnames() {
-        let (id, region) = pick_region("http://unused.invalid", "a.example,b.example").await.unwrap();
+        let hosts = "a.example,b.example".parse().unwrap();
+        let (id, region) = pick_region("http://unused.invalid", &hosts).await.unwrap();
         let region = region.expect("a custom region");
         assert_eq!((id, region.region_id, region.nodes.len()), (0, 900, 2));
         assert_eq!(region.nodes[1].host_name, "b.example");
