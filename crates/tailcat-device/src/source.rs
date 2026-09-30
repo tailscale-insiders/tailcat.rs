@@ -1,7 +1,10 @@
 //! Where peers' node records come from.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tracing::{debug, warn};
@@ -136,7 +139,7 @@ impl Source {
         let paths = match &mut self.kind {
             Kind::Github(g) => return Ok(dedup(g.poll().await?)),
             Kind::Files(fs) => fs.clone(),
-            Kind::Dir(d) => match std::fs::read_dir(&*d) {
+            Kind::Dir(d) => match fs::read_dir(&*d) {
                 Ok(rd) => {
                     let mut ps: Vec<PathBuf> = rd
                         .filter_map(|e| Some(e.ok()?.path()))
@@ -145,7 +148,7 @@ impl Source {
                     ps.sort();
                     ps
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
                 Err(e) => return Err(e.into()),
             },
         };
@@ -169,16 +172,16 @@ impl Source {
 
 /// Reads a record file, or `None` if there's no such file.
 fn read(p: &Path) -> Result<Option<NodeRecord>> {
-    match std::fs::read(p) {
+    match fs::read(p) {
         Ok(b) => NodeRecord::from_json(&b).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
 /// The time now, in Unix seconds.
 fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Keeps one record per node key, the first.
@@ -189,7 +192,6 @@ fn dedup<'a>(rs: impl IntoIterator<Item = &'a NodeRecord>) -> Vec<NodeRecord> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::{Cursor, Write as _};
     use std::slice;
     use std::sync::{Arc, Mutex};
