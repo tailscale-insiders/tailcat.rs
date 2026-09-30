@@ -116,11 +116,16 @@ impl DerpNode {
             && !self.host_name.is_empty()
             && let Ok(addrs) = tokio::net::lookup_host((self.host_name.as_str(), port)).await
         {
-            out.extend(addrs.filter(|a| if a.is_ipv4() { self.ipv4.is_empty() } else { self.ipv6.is_empty() }));
+            for a in addrs.filter(|a| if a.is_ipv4() { self.ipv4.is_empty() } else { self.ipv6.is_empty() }) {
+                // A lookup can repeat an address, and not always next to
+                // itself, so `dedup` after the sort would miss it.
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
         }
         // Prefer IPv4 first: it's the more commonly working family.
         out.sort_by_key(|a| !a.is_ipv4());
-        out.dedup();
         out
     }
 }
