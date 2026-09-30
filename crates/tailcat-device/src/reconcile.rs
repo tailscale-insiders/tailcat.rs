@@ -8,8 +8,11 @@
 //! prefixes to node `i`. An address or prefix can only route to one
 //! peer, so [`reconcile`] picks a winner for each by a fixed order. That
 //! makes the result depend only on what was polled, never on the order
-//! records arrive in, and a repeated poll changes nothing: peers aren't
-//! torn down and re-added every few seconds.
+//! records arrive in, nor on what was polled before: a repeated poll
+//! changes nothing, so peers aren't torn down and re-added every few
+//! seconds, and a node that restarts or joins late ends up with the same
+//! peers as one that saw every poll. A poll is the whole truth; smoothing
+//! over records that can't be read for a moment is the source's job.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -42,16 +45,22 @@ pub enum Change {
 }
 
 /// Returns the changes that turn `current` into the peers `polled` calls
-/// for, removals first. They are:
-///
-/// - for each overlay address claimed by a polled record, the best of
-///   those records by [`rank`];
-/// - peers missing from the poll (for example while their record file is
-///   being rewritten), where no polled record claims their address.
-///
-/// Records with our node key, or at an address we claim, never become
-/// peers. The prefixes they claim are then shared out, as `assign` says.
+/// for, removals first. For each overlay address claimed by a polled
+/// record, the peer there is the best of those records by [`rank`];
+/// peers missing from the poll are removed. Records with our node key,
+/// or at an address we claim, never become peers. The prefixes the
+/// peers claim are then shared out, as `assign` says.
 pub fn reconcile(me: &NodeRecord, current: &HashMap<NodePublic, Peer>, polled: &[NodeRecord]) -> Vec<Change> {
+    let want = select(me, polled);
+    let mut removed: Vec<NodePublic> = current.keys().filter(|k| !want.contains_key(k)).copied().collect();
+    removed.sort();
+    let mut upserted: Vec<Peer> = want.into_values().filter(|p| current.get(&p.record.nodekey) != Some(p)).collect();
+    upserted.sort_by_key(|p| p.record.nodekey);
+    removed.into_iter().map(Change::Remove).chain(upserted.into_iter().map(Change::Upsert)).collect()
+}
+
+/// The peers `polled` calls for.
+fn select(me: &NodeRecord, polled: &[NodeRecord]) -> HashMap<NodePublic, Peer> {
     let ours: HashSet<IpNet> = claims(me).map(|(n, _)| n).collect();
     let mine = |r: &NodeRecord| r.nodekey == me.nodekey || ours.contains(&IpNet::host(r.overlay_ip));
     let mut by_key: HashMap<NodePublic, &NodeRecord> = HashMap::new();
@@ -62,20 +71,8 @@ pub fn reconcile(me: &NodeRecord, current: &HashMap<NodePublic, Peer>, polled: &
     for r in by_key.values().filter(|r| !mine(r)) {
         offer(me, &mut by_ip, r.overlay_ip, r);
     }
-    let claimed: HashSet<IpAddr> = by_ip.keys().copied().collect();
-    for p in current.values().map(|p| &p.record) {
-        if !by_key.contains_key(&p.nodekey) && !claimed.contains(&p.overlay_ip) && !mine(p) {
-            offer(me, &mut by_ip, p.overlay_ip, p);
-        }
-    }
     let chosen: Vec<&NodeRecord> = by_ip.into_values().collect();
-    let want = assign(me, &ours, &chosen);
-
-    let mut removed: Vec<NodePublic> = current.keys().filter(|k| !want.contains_key(k)).copied().collect();
-    removed.sort();
-    let mut upserted: Vec<Peer> = want.into_values().filter(|p| current.get(&p.record.nodekey) != Some(p)).collect();
-    upserted.sort_by_key(|p| p.record.nodekey);
-    removed.into_iter().map(Change::Remove).chain(upserted.into_iter().map(Change::Upsert)).collect()
+    assign(me, &ours, &chosen)
 }
 
 /// Shares out the prefixes `peers` claim, excluding `ours`: a peer's
@@ -284,19 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_peers_stay_until_their_address_is_claimed() {
+    fn missing_peers_are_removed() {
         let (a, b) = (record(1, 1, 0, 1), record(2, 2, 0, 2));
         let mut peers = HashMap::new();
         poll(&mut peers, &[a.clone(), b.clone()]);
-        assert_eq!(reconcile(&me(), &peers, std::slice::from_ref(&b)), [], "a is kept while its record is missing");
+        assert_eq!(reconcile(&me(), &peers, std::slice::from_ref(&b)), [Change::Remove(a.nodekey)]);
         let a2 = record(3, 1, 0, 1);
         assert_eq!(
-            reconcile(&me(), &peers, std::slice::from_ref(&a2)),
+            reconcile(&me(), &peers, &[a2.clone(), b.clone()]),
             [Change::Remove(a.nodekey), Change::Upsert(peer(&a2, &["100.64.1.1"]))]
         );
         let moved = record(2, 3, 0, 2);
         assert_eq!(
-            reconcile(&me(), &peers, std::slice::from_ref(&moved)),
+            reconcile(&me(), &peers, &[a.clone(), moved.clone()]),
             [Change::Upsert(peer(&moved, &["100.64.1.3"]))]
         );
     }

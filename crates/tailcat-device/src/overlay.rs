@@ -179,7 +179,8 @@ impl Overlay {
     /// [`reconcile`] decides: one peer per overlay address, and each
     /// route to one peer, chosen the same way however often and in
     /// whatever order records are polled. Records whose home region isn't
-    /// known are skipped.
+    /// known are skipped, and peers whose records the poll leaves out are
+    /// removed.
     pub fn sync(&self, polled: &[NodeRecord], dm: &DerpMap) {
         let mut st = self.state.lock().unwrap();
         let usable: Vec<NodeRecord> = polled
@@ -211,7 +212,11 @@ impl Overlay {
         st.region(r, dm)
             .ok_or_else(|| anyhow!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region))?;
         let new = !st.peers.contains_key(&r.nodekey);
-        let changes = reconcile(&self.me, &st.peers, std::slice::from_ref(r));
+        // As if polled with every other peer, less any at its address.
+        let others =
+            st.peers.values().map(|p| &p.record).filter(|p| p.nodekey != r.nodekey && p.overlay_ip != r.overlay_ip);
+        let polled: Vec<NodeRecord> = std::iter::once(r).chain(others).cloned().collect();
+        let changes = reconcile(&self.me, &st.peers, &polled);
         for c in changes {
             self.apply_locked(&mut st, c, dm);
         }

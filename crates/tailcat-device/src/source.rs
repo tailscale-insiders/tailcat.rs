@@ -10,7 +10,14 @@ use crate::github::{self, GithubEnv, Scope, Verifier};
 use crate::record::NodeRecord;
 
 /// A source of node records, polled repeatedly as nodes come up.
-pub enum Source {
+pub struct Source {
+    kind: Kind,
+    /// The last record read from each file, for polls that find it
+    /// half-written.
+    last: HashMap<PathBuf, NodeRecord>,
+}
+
+enum Kind {
     /// Every `*.json` file in a directory.
     Dir(PathBuf),
     /// Specific files.
@@ -90,12 +97,31 @@ impl GithubSource {
 }
 
 impl Source {
-    /// Returns every admitted record found so far, one per node key.
+    /// Every `*.json` file in a directory.
+    pub fn dir(d: PathBuf) -> Source {
+        Source { kind: Kind::Dir(d), last: HashMap::new() }
+    }
+
+    /// Specific files.
+    pub fn files(fs: Vec<PathBuf>) -> Source {
+        Source { kind: Kind::Files(fs), last: HashMap::new() }
+    }
+
+    /// GitHub Actions run artifacts.
+    pub fn github(g: GithubSource) -> Source {
+        Source { kind: Kind::Github(Box::new(g)), last: HashMap::new() }
+    }
+
+    /// Returns every admitted record of a node still there, one per node
+    /// key. Each poll is the whole truth: a record it leaves out is gone,
+    /// and so is its peer. A record file that can't be read for now (for
+    /// example while it's being written) still counts as its last good
+    /// record; one that no longer exists doesn't.
     pub async fn poll(&mut self) -> Result<Vec<NodeRecord>> {
-        let paths = match self {
-            Source::Github(g) => return Ok(dedup(g.poll().await?)),
-            Source::Files(fs) => fs.clone(),
-            Source::Dir(d) => match std::fs::read_dir(&*d) {
+        let paths = match &mut self.kind {
+            Kind::Github(g) => return Ok(dedup(g.poll().await?)),
+            Kind::Files(fs) => fs.clone(),
+            Kind::Dir(d) => match std::fs::read_dir(&*d) {
                 Ok(rd) => {
                     let mut ps: Vec<PathBuf> = rd
                         .filter_map(|e| Some(e.ok()?.path()))
@@ -108,17 +134,30 @@ impl Source {
                 Err(e) => return Err(e.into()),
             },
         };
-        Ok(dedup(paths.iter().filter_map(|p| read(p)).collect()))
+        let mut found = Vec::new();
+        for p in paths {
+            let r = match read(&p) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Half-written, say: it'll be read again next poll.
+                    debug!("{}: {e:#}", p.display());
+                    self.last.get(&p).cloned()
+                }
+            };
+            found.extend(r.map(|r| (p, r)));
+        }
+        self.last = found.iter().cloned().collect();
+        Ok(dedup(found.into_iter().map(|(_, r)| r).collect()))
     }
 }
 
-fn read(p: &Path) -> Option<NodeRecord> {
-    // A record may be half-written; it'll be read again next poll.
-    std::fs::read(p)
-        .map_err(Into::into)
-        .and_then(|b| NodeRecord::from_json(&b))
-        .inspect_err(|e| debug!("{}: {e:#}", p.display()))
-        .ok()
+/// Reads a record file, or `None` if there's no such file.
+fn read(p: &Path) -> Result<Option<NodeRecord>> {
+    match std::fs::read(p) {
+        Ok(b) => NodeRecord::from_json(&b).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Keeps one record per node key.
@@ -235,7 +274,7 @@ mod tests {
             p => bodies.get(p).map_or((404, Vec::new()), |b| (200, b.clone())),
         }))
         .await;
-        let mut src = Source::Github(Box::new(github(base, Scope::Run, "node-1-")));
+        let mut src = Source::github(github(base, Scope::Run, "node-1-"));
 
         // The flaky download is retried; everything else is fetched once.
         assert_eq!(keys(&src.poll().await.unwrap()), keys(&[plain.clone(), zip.clone()]));
@@ -277,7 +316,7 @@ mod tests {
             p => bodies.get(p).map_or((404, Vec::new()), |b| (200, b.clone())),
         }))
         .await;
-        let mut src = Source::Github(Box::new(github(base, Scope::Branch, "node-").with_verifier(s.verifier())));
+        let mut src = Source::github(github(base, Scope::Branch, "node-").with_verifier(s.verifier()));
         assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours.clone(), sibling]));
         assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours]), "a finished run's records are dropped");
     }
@@ -285,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn github_api_errors_fail_the_poll() {
         let (base, _) = fake_github(Box::new(|_, _, _| (403, b"{}".to_vec()))).await;
-        let err = Source::Github(Box::new(github(base, Scope::Run, "node-"))).poll().await.unwrap_err();
+        let err = Source::github(github(base, Scope::Run, "node-")).poll().await.unwrap_err();
         assert!(format!("{err:#}").contains("listing artifacts of run 100"), "{err:#}");
     }
 
@@ -300,10 +339,33 @@ mod tests {
         write("d.json", &NodeRecord { index: 9, ..a.clone() }); // a duplicate key
         std::fs::write(d.path().join("e.json"), b"{\"index\": ").unwrap(); // half-written
 
-        let got = Source::Dir(d.path().into()).poll().await.unwrap();
+        let got = Source::dir(d.path().into()).poll().await.unwrap();
         assert_eq!(got, [a.clone(), b.clone()], "sorted by file name, first record per key wins");
-        let got = Source::Files(vec![d.path().join("missing.json"), d.path().join("b.json")]).poll().await.unwrap();
+        let got = Source::files(vec![d.path().join("missing.json"), d.path().join("b.json")]).poll().await.unwrap();
         assert_eq!(got, [b]);
-        assert!(Source::Dir(d.path().join("missing")).poll().await.unwrap().is_empty());
+        assert!(Source::dir(d.path().join("missing")).poll().await.unwrap().is_empty());
+    }
+
+    /// A record file caught half-written still gives its last record; one
+    /// that's gone gives nothing, in a directory or named.
+    #[tokio::test]
+    async fn unreadable_files_keep_their_record() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (rec("1"), rec("1"));
+        let (pa, pb) = (d.path().join("a.json"), d.path().join("b.json"));
+        a.write(&pa).unwrap();
+        b.write(&pb).unwrap();
+        for mut src in [Source::dir(d.path().into()), Source::files(vec![pa.clone(), pb.clone()])] {
+            a.write(&pa).unwrap();
+            b.write(&pb).unwrap();
+            assert_eq!(src.poll().await.unwrap(), [a.clone(), b.clone()]);
+            std::fs::write(&pa, b"{\"index\": ").unwrap();
+            assert_eq!(src.poll().await.unwrap(), [a.clone(), b.clone()], "a is half-written");
+            std::fs::remove_file(&pb).unwrap();
+            assert_eq!(src.poll().await.unwrap(), std::slice::from_ref(&a), "b is gone");
+            let a2 = NodeRecord { index: 7, ..a.clone() };
+            a2.write(&pa).unwrap();
+            assert_eq!(src.poll().await.unwrap(), [a2], "a is rewritten");
+        }
     }
 }

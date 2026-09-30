@@ -243,6 +243,21 @@ fn polls_match_the_model(tc: TestCase) {
     check_model(&me, &from_scratch(&me, &polled), &polled);
 }
 
+/// A poll's peers are the same whatever came before it: a node that
+/// restarts, or joins late, ends up where one that saw every poll did,
+/// and a record that's gone takes its peer with it.
+#[hegel::test(test_cases = 1000)]
+fn history_does_not_matter(tc: TestCase) {
+    let me = draw_me(&tc);
+    let mut peers = HashMap::new();
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(3)) {
+        poll(&me, &mut peers, &draw_poll(&tc));
+    }
+    let polled = draw_poll(&tc);
+    poll(&me, &mut peers, &polled);
+    check_model(&me, &peers, &polled);
+}
+
 /// No two peers are routed the same prefix, so the engine never has to
 /// break a tie; each peer is routed its own address, and a peer is only
 /// routed what it claims.

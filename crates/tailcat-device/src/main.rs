@@ -285,11 +285,11 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
             Scope::Run => format!("node-{}-", env.run_attempt),
             _ => "node-".into(),
         });
-        Source::Github(Box::new(GithubSource::new(env, a.scope, prefix, a.oidc_audience_prefix)))
+        Source::github(GithubSource::new(env, a.scope, prefix, a.oidc_audience_prefix))
     } else if let Some(d) = a.records {
-        Source::Dir(d)
+        Source::dir(d)
     } else if !a.record.is_empty() {
-        Source::Files(a.record)
+        Source::files(a.record)
     } else {
         bail!("say where peer records come from: --records DIR, --record FILE, or --github");
     };

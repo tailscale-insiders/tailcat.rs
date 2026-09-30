@@ -89,8 +89,9 @@ impl Mesh {
 
 #[hegel::state_machine]
 impl Mesh {
-    /// A poll returns some records, one per key; polling them again
-    /// changes nothing.
+    /// A poll returns some records, one per key; the peers are some of
+    /// them, whatever came before, and polling them again changes
+    /// nothing.
     #[rule]
     fn poll(&mut self, tc: TestCase) {
         let n = tc.draw(gs::integers::<usize>().max_value(6));
@@ -99,6 +100,9 @@ impl Mesh {
         let _rt = self.rt.enter();
         self.overlay.sync(&recs, &self.dm);
         let before = self.peers();
+        for (k, ..) in &before {
+            assert!(keys.contains(k), "{k} is still a peer, but wasn't polled");
+        }
         let mut reversed = recs.clone();
         reversed.reverse();
         self.overlay.sync(&reversed, &self.dm);
