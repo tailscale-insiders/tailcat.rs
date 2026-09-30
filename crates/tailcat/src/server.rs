@@ -859,6 +859,8 @@ impl Server {
 }
 
 #[cfg(test)]
+mod allow_model_tests;
+#[cfg(test)]
 mod model_tests;
 
 #[cfg(test)]
@@ -896,37 +898,6 @@ mod tests {
         task::spawn_blocking(move || barrier.wait()).await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn disconnect_beats_a_pending_allow() {
-        let dev = DevDerp::start_local().await.unwrap();
-        let k = NodePrivate::generate().public();
-        let allow = allowlist(k);
-        // The hook reads the allowlist, then stalls until the test has
-        // revoked the key, like a slow lookup.
-        let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
-        let (check, hook_asked, hook_resume) = (allow.checker(), asked.clone(), resume.clone());
-        let slow_hook = move |k| {
-            let ok = check(k);
-            hook_asked.wait();
-            hook_resume.wait();
-            ok
-        };
-        let server = Server::builder().region(dev.region.clone()).allow_client(slow_hook).start().await.unwrap();
-        let meow = tokio::spawn(server.meow(k));
-        wait_at(&asked).await;
-
-        // The documented revocation, while the hook's stale answer is
-        // still in flight.
-        allow.remove(&k);
-        assert!(!server.disconnect_client(&k));
-        wait_at(&resume).await;
-
-        let acked = meow.await.unwrap();
-        assert!(!acked, "revoked client was acked");
-        assert_eq!(membership(&server, &k), (false, false, false));
-        server.close();
-    }
-
     /// Whether `f` holds within five seconds.
     async fn soon(f: impl Fn() -> bool) -> bool {
         for _ in 0..50 {
@@ -962,35 +933,6 @@ mod tests {
 
         assert!(closed, "the dropped server stayed up for the hook");
         assert!(!meow.await.unwrap(), "the dropped server acked a client");
-    }
-
-    /// A meow cancelled while the allow hook decides leaves the client
-    /// free to be asked about again.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_cancelled_meow_lets_the_client_retry() {
-        let dev = DevDerp::start_local().await.unwrap();
-        let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
-        let (hook_asked, hook_resume) = (asked.clone(), resume.clone());
-        let first = AtomicBool::new(true);
-        let slow_once = move |_| {
-            if first.swap(false, Ordering::Relaxed) {
-                hook_asked.wait();
-                hook_resume.wait();
-            }
-            true
-        };
-        let server = Server::builder().region(dev.region.clone()).allow_client(slow_once).start().await.unwrap();
-        let k = NodePrivate::generate().public();
-        let meow = tokio::spawn(server.meow(k));
-        wait_at(&asked).await;
-
-        meow.abort();
-        assert!(meow.await.unwrap_err().is_cancelled());
-        let retried = server.meow(k).await;
-        wait_at(&resume).await;
-
-        assert!(retried, "the cancelled meow kept the client marked as being asked about");
-        server.close();
     }
 
     /// Asserts that `c` is aborted soon rather than left open.
