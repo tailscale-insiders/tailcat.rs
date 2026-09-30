@@ -10,7 +10,7 @@ use tokio::sync::{OnceCell, watch};
 use tracing::debug;
 
 use crate::addr::{Addr, ConnInfo};
-use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions};
+use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions, RegionCode};
 use crate::key::{NodePrivate, NodePublic};
 use crate::magicsock::{self, MagicSock, PathAddr};
 use crate::netstack::{Stack, StackConfig, TcpDecision, TcpStream, UdpConn};
@@ -43,11 +43,38 @@ pub struct PingResult {
 #[derive(Debug, Clone)]
 pub struct DiscoPingResult {
     pub latency: Duration,
-    /// Set if the pong came over a direct path.
-    pub endpoint: Option<SocketAddr>,
-    /// The relay region, if the pong came through DERP.
-    pub derp_region_id: i32,
-    pub derp_region_code: String,
+    /// The path the pong came back on.
+    pub via: Via,
+}
+
+/// How traffic reaches the other end.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Via {
+    /// A direct UDP path, to this endpoint.
+    Direct(SocketAddr),
+    /// Relayed through a DERP region; its code is `Unset` if the region
+    /// isn't one we know by more than its ID.
+    Derp { region_id: i32, region_code: RegionCode },
+}
+
+impl Via {
+    /// The DERP region relaying, if any: its code, or else its ID.
+    pub fn derp_region(&self) -> Option<String> {
+        match self {
+            Via::Direct(_) => None,
+            Via::Derp { region_id, region_code } if region_code.is_empty() => Some(region_id.to_string()),
+            Via::Derp { region_code, .. } => Some(region_code.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self, self.derp_region()) {
+            (Via::Direct(a), _) => write!(f, "{a}"),
+            (_, r) => write!(f, "DERP({})", r.unwrap_or_default()),
+        }
+    }
 }
 
 struct Running {
@@ -343,14 +370,14 @@ impl Client {
         // Nudge path discovery with some tunnel traffic too.
         r.ms.send_call_me_maybe(&server);
         let res = r.ms.ping(&server, timeout).await?;
-        let (endpoint, derp_region_id) = match res.via {
-            PathAddr::Udp(a) => (Some(a), 0),
-            PathAddr::Derp(rid) => (None, rid),
+        let via = match res.via {
+            PathAddr::Udp(a) => Via::Direct(a),
+            PathAddr::Derp(region_id) => {
+                let region = r.ci.region.iter().find(|x| x.region_id == region_id);
+                Via::Derp { region_id, region_code: region.map(|x| x.region_code.clone()).unwrap_or_default() }
+            }
         };
-        // Region IDs are never 0 once expanded, so direct pongs get no code.
-        let region = r.ci.region.iter().find(|x| x.region_id == derp_region_id);
-        let derp_region_code = region.map(|x| x.region_code.to_string()).unwrap_or_default();
-        Ok(DiscoPingResult { latency: res.latency, endpoint, derp_region_id, derp_region_code })
+        Ok(DiscoPingResult { latency: res.latency, via })
     }
 
     /// Opens a TCP connection to a port on the server.

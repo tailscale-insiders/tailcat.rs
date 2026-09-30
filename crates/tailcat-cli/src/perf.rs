@@ -1200,34 +1200,50 @@ fn parse_si(s: &str) -> Result<i64> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(into = "PathJson")]
 struct PathInfo {
+    via: tailcat::Via,
+    rtt: Duration,
+}
+
+impl PathInfo {
+    fn direct(&self) -> bool {
+        matches!(self.via, tailcat::Via::Direct(_))
+    }
+}
+
+/// How a [`PathInfo`] is written.
+#[derive(Serialize)]
+struct PathJson {
     direct: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    endpoint: String,
-    #[serde(rename = "derpRegion", skip_serializing_if = "String::is_empty")]
-    derp_region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<std::net::SocketAddr>,
+    #[serde(rename = "derpRegion", skip_serializing_if = "Option::is_none")]
+    derp_region: Option<String>,
     #[serde(with = "nanos")]
     rtt: Duration,
 }
 
+impl From<PathInfo> for PathJson {
+    fn from(p: PathInfo) -> PathJson {
+        let endpoint = match p.via {
+            tailcat::Via::Direct(a) => Some(a),
+            tailcat::Via::Derp { .. } => None,
+        };
+        PathJson { direct: p.direct(), endpoint, derp_region: p.via.derp_region(), rtt: p.rtt }
+    }
+}
+
 impl std::fmt::Display for PathInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.direct {
-            write!(f, "direct via {}, rtt {}", self.endpoint, fmt_rtt(self.rtt))
-        } else {
-            write!(f, "relayed via DERP({}), rtt {}", self.derp_region, fmt_rtt(self.rtt))
-        }
+        let how = if self.direct() { "direct" } else { "relayed" };
+        write!(f, "{how} via {}, rtt {}", self.via, fmt_rtt(self.rtt))
     }
 }
 
 async fn probe_path(cl: &tailcat::Client, timeout: Duration) -> tailcat::Result<PathInfo> {
     let r = cl.disco_ping(timeout).await?;
-    Ok(PathInfo {
-        direct: r.endpoint.is_some(),
-        endpoint: r.endpoint.map(|e| e.to_string()).unwrap_or_default(),
-        derp_region: if r.endpoint.is_some() { String::new() } else { crate::client::derp_region_name(&r) },
-        rtt: r.latency,
-    })
+    Ok(PathInfo { via: r.via, rtt: r.latency })
 }
 
 async fn wait_for_direct_path(cl: &tailcat::Client, timeout: Duration) -> Result<PathInfo> {
@@ -1242,7 +1258,7 @@ async fn wait_for_direct_path(cl: &tailcat::Client, timeout: Duration) -> Result
             }
             Ok(Err(e)) => return Err(e.into()),
         };
-        if p.direct || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
+        if p.direct() || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
             return Ok(p);
         }
         tokio::time::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed())).await;
@@ -1301,7 +1317,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
     let cl = crate::client::new_client(g, addr, crate::keys::client_key(g)?);
     let before = wait_for_direct_path(&cl, a.timeout).await.map_err(|e| anyhow!("perf: {e}"))?;
     eprintln!("# path: {before}");
-    if !before.direct {
+    if !before.direct() {
         if !a.via_derp {
             bail!(
                 "perf: no direct path to the server after {}; refusing to run a throughput test through a DERP relay (--via-derp allows it, for a relay you run yourself)",
@@ -1361,7 +1377,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
         println!("{l}");
     }
     if let Some(a) = after
-        && a.direct != before.direct
+        && a.direct() != before.direct()
     {
         eprintln!("# path changed during the test, now: {a}");
     }
@@ -1650,6 +1666,17 @@ mod tests {
         let short: Message = serde_json::from_str(r#"{"type":"ok","id":"0102"}"#).unwrap();
         assert_eq!(short.id, None);
         assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
+
+        // A path is written as before its Via: direct, or a DERP region by
+        // code, else by ID.
+        let rtt = Duration::from_millis(2);
+        let json = |via| serde_json::to_string(&PathInfo { via, rtt }).unwrap();
+        let direct = tailcat::Via::Direct("192.0.2.1:41641".parse().unwrap());
+        assert_eq!(json(direct), r#"{"direct":true,"endpoint":"192.0.2.1:41641","rtt":2000000}"#);
+        let sfo = tailcat::Via::Derp { region_id: 302, region_code: "sfo".into() };
+        assert_eq!(json(sfo), r#"{"direct":false,"derpRegion":"sfo","rtt":2000000}"#);
+        let unnamed = tailcat::Via::Derp { region_id: 9, region_code: Default::default() };
+        assert_eq!(json(unnamed), r#"{"direct":false,"derpRegion":"9","rtt":2000000}"#);
 
         // A type from a newer peer is kept as sent.
         let novel: Message = serde_json::from_str(r#"{"type":"novel"}"#).unwrap();

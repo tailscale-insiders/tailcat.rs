@@ -64,7 +64,7 @@ mod tls;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub use addr::{Addr, ConnInfo, PrivateKey};
-pub use client::{Client, ClientOptions, DiscoPingResult, PingResult};
+pub use client::{Client, ClientOptions, DiscoPingResult, PingResult, Via};
 pub use derpmap::{
     DEFAULT_DERP_MAP_URL, DerpMap, DerpMapCache, DerpNode, DerpRegion, FetchMode, FetchOptions, NodeIp, RegionArg,
     RegionCode, RegionName, StunTestIp,

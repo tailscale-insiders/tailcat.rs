@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use tailcat::{Addr, Client, ClientOptions, DiscoPingResult};
+use tailcat::{Addr, Client, ClientOptions, Via};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -112,12 +112,6 @@ async fn upload(
     Ok(())
 }
 
-/// The name of the DERP region a pong came through: its code, or else
-/// its ID.
-pub fn derp_region_name(r: &DiscoPingResult) -> String {
-    if r.derp_region_code.is_empty() { r.derp_region_id.to_string() } else { r.derp_region_code.clone() }
-}
-
 /// `tailcat ping [--until-direct] <tc-addr>`.
 pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_arg: &str) -> Result<()> {
     let addr = crate::addrarg::tailcat_addr_arg(addr_arg).await?;
@@ -133,9 +127,8 @@ pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_a
             Ok(Err(e)) => bail!("ping: {e}"),
             Err(_) => bail!("ping: timed out"),
         };
-        let via = res.endpoint.map_or_else(|| format!("DERP({})", derp_region_name(&res)), |ep| ep.to_string());
-        println!("pong in {} via {via}", crate::util::fmt_duration(res.latency));
-        if res.endpoint.is_some() || !until_direct {
+        println!("pong in {} via {}", crate::util::fmt_duration(res.latency), res.via);
+        if matches!(res.via, Via::Direct(_)) || !until_direct {
             return Ok(());
         }
         if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
