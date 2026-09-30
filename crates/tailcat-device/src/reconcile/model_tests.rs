@@ -22,6 +22,7 @@
 //! by key, so the implementation mustn't either.
 
 use std::cmp::Ordering;
+use std::iter;
 
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -139,12 +140,14 @@ fn installed(peers: &Peers) -> Vec<(NodePublic, Vec<IpNet>)> {
 /// Where the WireGuard engine sends a packet for `dst`, given our own
 /// prefixes `local`.
 fn engine_route(installed: &[(NodePublic, Vec<IpNet>)], local: &[IpNet], dst: IpAddr) -> Option<NodePublic> {
-    let len = |nets: &[IpNet]| nets.iter().filter(|n| n.contains(&dst)).map(|n| n.prefix_len).max();
-    let (l, k) = installed
+    let longest_match = |nets: &[IpNet]| nets.iter().filter(|n| n.contains(&dst)).map(|n| n.prefix_len).max();
+    let (len, k) = installed
         .iter()
-        .filter_map(|(k, nets)| Some((len(nets)?, *k)))
+        .filter_map(|(k, nets)| Some((longest_match(nets)?, *k)))
+        // The most specific, then the lowest key.
         .max_by(|(la, ka), (lb, kb)| la.cmp(lb).then(kb.cmp(ka)))?;
-    (len(local) < Some(l)).then_some(k)
+    // Our own prefixes win ties.
+    (longest_match(local) < Some(len)).then_some(k)
 }
 
 /// Whether two prefixes are the same, however they're written.
@@ -162,7 +165,12 @@ enum Claim {
 /// A node's claims, as written: its address, then its routes.
 fn claims_of(r: &NodeRecord) -> Vec<(IpNet, Claim)> {
     let routes = r.routes.iter().filter_map(|s| s.parse().ok()).map(|n| (n, Claim::Route));
-    std::iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes).collect()
+    iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes).collect()
+}
+
+/// Whether `r` claims `n`, however either is written.
+fn claims(r: &NodeRecord, n: &IpNet) -> bool {
+    claims_of(r).iter().any(|(c, _)| same(c, n))
 }
 
 /// The reference model, as seen by the node with record `me`.
@@ -189,7 +197,7 @@ impl Model<'_> {
 
     /// Whether `n` is one of our own claims.
     fn mine(&self, n: &IpNet) -> bool {
-        claims_of(self.me).iter().any(|(m, _)| same(m, n))
+        claims(self.me, n)
     }
 
     /// The peers `polled` calls for.
@@ -268,7 +276,8 @@ fn polls_match_the_model(tc: TestCase) {
 fn history_does_not_matter(tc: TestCase) {
     let me = draw_me(&tc);
     let mut peers = HashMap::new();
-    for _ in 0..tc.draw(gs::integers::<usize>().max_value(3)) {
+    let earlier_polls = tc.draw(gs::integers::<usize>().max_value(3));
+    for _ in 0..earlier_polls {
         poll(&me, &mut peers, &draw_poll(&tc));
     }
     let polled = draw_poll(&tc);
@@ -289,7 +298,7 @@ fn every_claim_is_routed_once(tc: TestCase) {
         let r = &peers[k].record;
         assert!(nets.contains(&IpNet::host(r.overlay_ip)), "{k} isn't routed its address: {nets:?}");
         for n in nets {
-            assert!(claims_of(r).iter().any(|(c, _)| same(c, n)), "{k} is routed {n}, which it doesn't claim");
+            assert!(claims(r, n), "{k} is routed {n}, which it doesn't claim");
             assert!(!seen.iter().any(|s| same(s, n)), "{n} is routed twice: {installed:?}");
             seen.push(*n);
         }
@@ -309,9 +318,15 @@ fn our_runs_nodes_agree(tc: TestCase) {
         .filter(|r| !viewers.iter().any(|n| same(n, &IpNet::host(r.overlay_ip))))
         .collect();
     polled.extend([a.clone(), b.clone()]);
-    let (va, vb) = (installed(&from_scratch(&a, &polled)), installed(&from_scratch(&b, &polled)));
-    for dst in probes().filter(|d| !viewers.iter().any(|n| n.contains(d))) {
-        assert_eq!(engine_route(&va, &a.allowed_ips(), dst), engine_route(&vb, &b.allowed_ips(), dst), "{dst}");
+
+    let routes_a = installed(&from_scratch(&a, &polled));
+    let routes_b = installed(&from_scratch(&b, &polled));
+
+    let elsewhere = probes().filter(|d| !viewers.iter().any(|n| n.contains(d)));
+    for dst in elsewhere {
+        let via_a = engine_route(&routes_a, &a.allowed_ips(), dst);
+        let via_b = engine_route(&routes_b, &b.allowed_ips(), dst);
+        assert_eq!(via_a, via_b, "{dst}");
     }
 }
 
@@ -331,16 +346,17 @@ fn contested_claims_are_routed_elsewhere(tc: TestCase) {
         .filter(|r| ![me.nodekey, viewer.nodekey].contains(&r.nodekey) && r.overlay_ip != viewer.overlay_ip)
         .collect();
     polled.extend([me.clone(), viewer.clone()]);
+
     let seen = installed(&from_scratch(&viewer, &polled));
     let got = contested(&me, &polled);
-    let ours = claims_of(&me);
-    for (n, _) in &ours {
+
+    for (n, _) in &claims_of(&me) {
         let routed = seen.iter().find(|(_, nets)| nets.iter().any(|m| same(m, n))).map(|(k, _)| *k);
         let listed = got.iter().find(|(m, _)| same(m, n)).map(|(_, r)| r.nodekey);
         assert_eq!(listed, routed.filter(|k| *k != me.nodekey), "{n}, polling {polled:?}");
     }
     for (n, r) in &got {
-        assert!(ours.iter().any(|(m, _)| same(m, n)), "{n} isn't ours");
+        assert!(claims(&me, n), "{n} isn't ours");
         assert!(polled.contains(r), "{r:?} wasn't polled");
     }
 }
@@ -355,22 +371,28 @@ fn repeated_polls_change_nothing(tc: TestCase) {
     assert_eq!(reconcile(&me, &peers, &polled), [], "second poll of {polled:?}");
 }
 
+/// `v` in an order drawn from `tc`.
+fn shuffled(tc: &TestCase, v: &[NodeRecord]) -> Vec<NodeRecord> {
+    let mut v = v.to_vec();
+    for i in (1..v.len()).rev() {
+        v.swap(i, tc.draw(gs::integers::<usize>().max_value(i)));
+    }
+    v
+}
+
 /// Neither the order of a poll nor repeats within it matter.
 #[hegel::test(test_cases = 500)]
 fn a_poll_is_a_set(tc: TestCase) {
     let me = draw_me(&tc);
     let peers = from_scratch(&me, &draw_poll(&tc));
     let polled = draw_poll(&tc);
-    let mut shuffled = polled.clone();
-    for i in (1..shuffled.len()).rev() {
-        shuffled.swap(i, tc.draw(gs::integers::<usize>().max_value(i)));
-    }
+    let mut reordered = shuffled(&tc, &polled);
     if let Some(r) = polled.first()
         && tc.draw(gs::booleans())
     {
-        shuffled.push(r.clone());
+        reordered.push(r.clone());
     }
-    assert_eq!(reconcile(&me, &peers, &polled), reconcile(&me, &peers, &shuffled));
+    assert_eq!(reconcile(&me, &peers, &polled), reconcile(&me, &peers, &reordered));
 }
 
 /// A record that shares nothing with any other, nor with us, is added
@@ -378,11 +400,13 @@ fn a_poll_is_a_set(tc: TestCase) {
 #[hegel::test(test_cases = 500)]
 fn an_unrelated_record_disturbs_nobody(tc: TestCase) {
     let me = draw_me(&tc);
-    let polled = draw_poll(&tc);
+    let mut polled = draw_poll(&tc);
     let peers = from_scratch(&me, &polled);
     let loner = NodeRecord { overlay_ip: [100, 64, 3, 1].into(), ..record(9, 0, 1, 0, &["10.99.0.0/24"]) };
-    let mut more = polled.clone();
-    more.push(loner.clone());
+
+    polled.push(loner.clone());
+    let changes = reconcile(&me, &peers, &polled);
+
     let allowed_ips = vec![IpNet::host(loner.overlay_ip), "10.99.0.0/24".parse().unwrap()];
-    assert_eq!(reconcile(&me, &peers, &more), [Change::Upsert(Peer { record: loner, allowed_ips })]);
+    assert_eq!(changes, [Change::Upsert(Peer { record: loner, allowed_ips })]);
 }

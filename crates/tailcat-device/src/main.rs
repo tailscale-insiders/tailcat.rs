@@ -495,7 +495,14 @@ async fn pick_region(url: &str, region: &str) -> Result<(i32, Option<DerpRegion>
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    /// Parses `tailcat-device <args>`.
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["tailcat-device"].iter().chain(args))
+    }
 
     #[test]
     fn durations() {
@@ -512,24 +519,20 @@ mod tests {
 
     #[test]
     fn cli_parses() {
-        use clap::CommandFactory;
         Cli::command().debug_assert();
-        let cli =
-            Cli::try_parse_from(["tailcat-device", "up", "--records", "d", "--nodes", "3", "--wait", "60s"]).unwrap();
+        let cli = parse(&["up", "--records", "d", "--nodes", "3", "--wait", "60s"]).unwrap();
         let Cmd::Up(a) = cli.cmd else { panic!("not up") };
         assert_eq!((a.records, a.nodes, a.wait), (Some("d".into()), Some(3), Duration::from_secs(60)));
-        assert!(Cli::try_parse_from(["tailcat-device", "up", "--records", "d", "--github"]).is_err());
-        assert!(
-            Cli::try_parse_from(["tailcat-device", "init", "--index", "0", "--region", "1", "--region-file", "f"])
-                .is_err()
-        );
+        assert!(parse(&["up", "--records", "d", "--github"]).is_err(), "--records and --github conflict");
+        let both_regions = parse(&["init", "--index", "0", "--region", "1", "--region-file", "f"]);
+        assert!(both_regions.is_err(), "--region and --region-file conflict");
     }
 
     #[tokio::test]
     async fn custom_region_hostnames() {
-        let (id, r) = pick_region("http://unused.invalid", "a.example,b.example").await.unwrap();
-        let r = r.unwrap();
-        assert_eq!((id, r.region_id, r.nodes.len()), (0, 900, 2));
-        assert_eq!(r.nodes[1].host_name, "b.example");
+        let (id, region) = pick_region("http://unused.invalid", "a.example,b.example").await.unwrap();
+        let region = region.expect("a custom region");
+        assert_eq!((id, region.region_id, region.nodes.len()), (0, 900, 2));
+        assert_eq!(region.nodes[1].host_name, "b.example");
     }
 }

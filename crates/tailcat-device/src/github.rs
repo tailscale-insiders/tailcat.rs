@@ -308,8 +308,24 @@ pub fn admit(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hegel::TestCase;
+    use hegel::generators as gs;
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::traits::PublicKeyParts;
+    use serde_json::{Value, json};
     use tailcat::NodePrivate;
+
+    use super::*;
+
+    pub const P: &str = "tailcat-device:";
 
     pub fn genv() -> GithubEnv {
         GithubEnv {
@@ -335,46 +351,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// The JSON object `base`, with `extra`'s fields laid over it.
+    fn merged(mut base: Value, extra: Value) -> Value {
+        let Value::Object(extra) = extra else { panic!("not an object") };
+        base.as_object_mut().unwrap().extend(extra);
+        base
+    }
+
+    /// `jwt`, with a byte of its signature changed.
+    fn tampered(jwt: &str) -> String {
+        let mut b = jwt.as_bytes().to_vec();
+        let i = b.len() - 10; // inside the signature
+        b[i] = if b[i] == b'A' { b'B' } else { b'A' };
+        String::from_utf8(b).unwrap()
+    }
+
     #[test]
     fn run_scope_admission() {
         let e = genv();
-        assert!(admit(&rec("1"), "100", &e, Scope::Run, None, "p:").is_ok());
-        assert!(admit(&rec(""), "100", &e, Scope::Run, None, "p:").is_ok(), "no attempt recorded");
-        assert!(admit(&rec("2"), "100", &e, Scope::Run, None, "p:").is_err(), "stale attempt");
-        assert!(admit(&rec("1"), "99", &e, Scope::Run, None, "p:").is_err(), "another run");
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, None, "p:");
+        assert!(admit(&rec("1"), "100", Scope::Run).is_ok());
+        assert!(admit(&rec(""), "100", Scope::Run).is_ok(), "no attempt recorded");
+        assert!(admit(&rec("2"), "100", Scope::Run).is_err(), "stale attempt");
+        assert!(admit(&rec("1"), "99", Scope::Run).is_err(), "another run");
         let claims_another = NodeRecord { run_id: "99".into(), ..rec("1") };
-        assert!(admit(&claims_another, "100", &e, Scope::Run, None, "p:").is_err(), "says it's from another run");
-        assert!(admit(&rec("1"), "100", &e, Scope::Branch, None, "p:").is_err(), "no token outside run scope");
-        assert!(admit(&rec("1"), "100", &e, Scope::Pr, None, "p:").is_err(), "no token outside run scope");
-        let mut r = rec("1");
-        r.jwt = "x.y.z".into();
-        assert!(admit(&r, "100", &e, Scope::Run, None, "p:").is_err(), "a token but no verifier");
+        assert!(admit(&claims_another, "100", Scope::Run).is_err(), "says it's from another run");
+        assert!(admit(&rec("1"), "100", Scope::Branch).is_err(), "no token outside run scope");
+        assert!(admit(&rec("1"), "100", Scope::Pr).is_err(), "no token outside run scope");
+        let tokened = NodeRecord { jwt: "x.y.z".into(), ..rec("1") };
+        assert!(admit(&tokened, "100", Scope::Run).is_err(), "a token but no verifier");
     }
 
     /// Signs GitHub-shaped OIDC tokens with a local key.
     pub(crate) struct Signer {
-        enc: jsonwebtoken::EncodingKey,
-        jwks: jsonwebtoken::jwk::JwkSet,
+        enc: EncodingKey,
+        jwks: JwkSet,
         pub now: u64,
     }
 
     impl Signer {
         pub fn new() -> Signer {
-            use base64::Engine as _;
-            use rsa::pkcs1::EncodeRsaPrivateKey;
-            use rsa::traits::PublicKeyParts;
-
-            let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
-            let b64 = |b: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-            let jwks = serde_json::from_value(serde_json::json!({
-                "keys": [{"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
-                          "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be())}]
-            }))
-            .unwrap();
+            let key = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+            let b64 = |b: Vec<u8>| URL_SAFE_NO_PAD.encode(b);
+            let (n, e) = (b64(key.n().to_bytes_be()), b64(key.e().to_bytes_be()));
+            let jwk = json!({"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig", "n": n, "e": e});
+            let der = key.to_pkcs1_der().unwrap();
             Signer {
-                enc: jsonwebtoken::EncodingKey::from_rsa_der(key.to_pkcs1_der().unwrap().as_bytes()),
-                jwks,
-                now: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                enc: EncodingKey::from_rsa_der(der.as_bytes()),
+                jwks: serde_json::from_value(json!({ "keys": [jwk] })).unwrap(),
+                now: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             }
         }
 
@@ -384,39 +409,29 @@ pub(crate) mod tests {
         }
 
         /// Signs `claims` over a valid default set for run 100 of repo 42.
-        pub fn sign(&self, kid: Option<&str>, claims: serde_json::Value) -> String {
-            let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-            h.kid = kid.map(Into::into);
-            let mut c = serde_json::json!({
+        pub fn sign(&self, kid: Option<&str>, claims: Value) -> String {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = kid.map(Into::into);
+            let defaults = json!({
                 "iss": OIDC_ISSUER, "exp": self.now + 600, "iat": self.now,
                 "repository_id": "42", "ref": "refs/heads/main", "run_id": "100", "run_attempt": "1",
             });
-            c.as_object_mut().unwrap().extend(claims.as_object().unwrap().clone());
-            jsonwebtoken::encode(&h, &c, &self.enc).unwrap()
+            jsonwebtoken::encode(&header, &merged(defaults, claims), &self.enc).unwrap()
         }
 
         /// A record for a fresh key with a token for it, plus `claims`.
         /// The record says it's from the token's run and attempt.
-        pub fn rec(&self, claims: serde_json::Value) -> NodeRecord {
-            let mut r = rec("1");
-            let mut c = serde_json::json!({ "aud": audience_for(P, &r.nodekey) });
-            c.as_object_mut().unwrap().extend(claims.as_object().unwrap().clone());
-            for (field, claim) in [(&mut r.run_id, "run_id"), (&mut r.run_attempt, "run_attempt")] {
-                if let Some(v) = c[claim].as_str() {
-                    *field = v.into();
-                }
-            }
-            r.jwt = self.sign(Some("k1"), c);
-            r
+        pub fn rec(&self, claims: Value) -> NodeRecord {
+            let r = rec("1");
+            let claims = merged(json!({ "aud": audience_for(P, &r.nodekey) }), claims);
+            let claim = |name: &str, default: &str| claims[name].as_str().unwrap_or(default).to_string();
+            let (run_id, run_attempt) = (claim("run_id", &r.run_id), claim("run_attempt", &r.run_attempt));
+            NodeRecord { run_id, run_attempt, jwt: self.sign(Some("k1"), claims), ..r }
         }
     }
 
-    pub const P: &str = "tailcat-device:";
-
     #[test]
     fn oidc_admission() {
-        use serde_json::json;
-
         let s = Signer::new();
         let v = s.verifier();
         let e = genv();
@@ -426,12 +441,12 @@ pub(crate) mod tests {
         admit(&r, "100", Scope::Run).unwrap();
 
         // A token for another node's key doesn't transfer.
-        let mut stolen = rec("1");
-        stolen.jwt = r.jwt.clone();
+        let stolen = NodeRecord { jwt: r.jwt.clone(), ..rec("1") };
         assert!(admit(&stolen, "100", Scope::Run).is_err());
 
         // Run scope wants this very run and attempt.
-        assert!(admit(&s.rec(json!({"run_attempt": "2"})), "100", Scope::Run).is_err(), "other attempt");
+        let other_attempt = s.rec(json!({"run_attempt": "2"}));
+        assert!(admit(&other_attempt, "100", Scope::Run).is_err(), "other attempt");
 
         // Branch scope admits another run on the same ref, not another ref.
         let sib = s.rec(json!({"run_id": "99"}));
@@ -441,7 +456,8 @@ pub(crate) mod tests {
         assert!(admit(&posing, "99", Scope::Branch).is_err(), "says it's from our run");
         let retried = NodeRecord { run_attempt: "2".into(), ..sib.clone() };
         assert!(admit(&retried, "99", Scope::Branch).is_err(), "says it's from another attempt");
-        assert!(admit(&s.rec(json!({"run_id": "99", "ref": "refs/heads/evil"})), "99", Scope::Branch).is_err());
+        let other_ref = s.rec(json!({"run_id": "99", "ref": "refs/heads/evil"}));
+        assert!(admit(&other_ref, "99", Scope::Branch).is_err(), "other ref");
 
         // Another repository's token fails in every scope.
         let foreign = s.rec(json!({"repository_id": "7"}));
@@ -450,19 +466,16 @@ pub(crate) mod tests {
         }
 
         // Expired, forged, keyless and unknown-key tokens fail.
-        assert!(admit(&s.rec(json!({"exp": s.now - 3600})), "100", Scope::Run).is_err(), "expired");
-        assert!(admit(&s.rec(json!({"iss": "https://evil.example"})), "100", Scope::Run).is_err(), "issuer");
-        let mut forged = r.clone();
-        let mut b = forged.jwt.into_bytes();
-        let i = b.len() - 10; // inside the signature
-        b[i] = if b[i] == b'A' { b'B' } else { b'A' };
-        forged.jwt = String::from_utf8(b).unwrap();
+        let expired = s.rec(json!({"exp": s.now - 3600}));
+        assert!(admit(&expired, "100", Scope::Run).is_err(), "expired");
+        let misissued = s.rec(json!({"iss": "https://evil.example"}));
+        assert!(admit(&misissued, "100", Scope::Run).is_err(), "issuer");
+        let forged = NodeRecord { jwt: tampered(&r.jwt), ..r.clone() };
         assert!(admit(&forged, "100", Scope::Run).is_err(), "forged");
-        let mut keyless = r.clone();
-        keyless.jwt = s.sign(None, json!({"aud": audience_for(P, &r.nodekey)}));
+        let aud = json!({"aud": audience_for(P, &r.nodekey)});
+        let keyless = NodeRecord { jwt: s.sign(None, aud.clone()), ..r.clone() };
         assert!(admit(&keyless, "100", Scope::Run).is_err(), "no key ID");
-        let mut unknown = r.clone();
-        unknown.jwt = s.sign(Some("k2"), json!({"aud": audience_for(P, &r.nodekey)}));
+        let unknown = NodeRecord { jwt: s.sign(Some("k2"), aud), ..r };
         assert!(admit(&unknown, "100", Scope::Run).is_err(), "unknown key ID");
     }
 
@@ -470,9 +483,8 @@ pub(crate) mod tests {
     /// admitted record's must be true: the run whose artifacts held it,
     /// and the run and attempt its token was minted in.
     #[hegel::test(test_cases = 300)]
-    fn admitted_records_are_from_the_run_they_say(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        static SIGNER: std::sync::OnceLock<Signer> = std::sync::OnceLock::new();
+    fn admitted_records_are_from_the_run_they_say(tc: TestCase) {
+        static SIGNER: OnceLock<Signer> = OnceLock::new();
         let s = SIGNER.get_or_init(Signer::new);
         let runs = || gs::sampled_from(vec!["100", "99", ""]);
         let attempts = || gs::sampled_from(vec!["1", "2", ""]);
@@ -480,31 +492,32 @@ pub(crate) mod tests {
         let from_run = tc.draw(gs::sampled_from(vec!["100", "99"]));
         let token = tc.draw(gs::booleans()).then(|| (tc.draw(runs()), tc.draw(attempts())));
         let mut r = match token {
-            Some((run, attempt)) => s.rec(serde_json::json!({"run_id": run, "run_attempt": attempt})),
+            Some((run, attempt)) => s.rec(json!({"run_id": run, "run_attempt": attempt})),
             None => rec("1"),
         };
         r.run_id = tc.draw(runs()).into();
         r.run_attempt = tc.draw(attempts()).into();
-        if admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P).is_ok() {
-            assert_eq!(r.run_id, from_run);
-            if let Some((run, attempt)) = token {
-                assert_eq!((r.run_id.as_str(), r.run_attempt.as_str()), (run, attempt));
-            }
+
+        let Ok(()) = admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P) else { return };
+        assert_eq!(r.run_id, from_run);
+        if let Some((run, attempt)) = token {
+            assert_eq!((r.run_id.as_str(), r.run_attempt.as_str()), (run, attempt));
         }
     }
 
     #[test]
     fn pr_scope_admission() {
-        use serde_json::json;
-
         let s = Signer::new();
-        let pr = GithubEnv { git_ref: "refs/pull/5/merge".into(), head_ref: "feature".into(), ..genv() };
         let v = s.verifier();
+        let pr = GithubEnv { git_ref: "refs/pull/5/merge".into(), head_ref: "feature".into(), ..genv() };
         let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, "99", e, Scope::Pr, Some(&v), P);
 
-        admit(&s.rec(json!({"run_id": "99", "ref": "refs/pull/5/merge"})), &pr).unwrap();
-        assert!(admit(&s.rec(json!({"run_id": "99", "ref": "refs/pull/6/merge"})), &pr).is_err(), "other PR");
+        let same_pr = s.rec(json!({"run_id": "99", "ref": "refs/pull/5/merge"}));
+        admit(&same_pr, &pr).unwrap();
+        let other_pr = s.rec(json!({"run_id": "99", "ref": "refs/pull/6/merge"}));
+        assert!(admit(&other_pr, &pr).is_err(), "other PR");
         // Branch refs never pass PR scope, even when they match ours.
-        assert!(admit(&s.rec(json!({"run_id": "99"})), &genv()).is_err(), "not a PR ref");
+        let on_branch = s.rec(json!({"run_id": "99"}));
+        assert!(admit(&on_branch, &genv()).is_err(), "not a PR ref");
     }
 }

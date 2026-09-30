@@ -204,7 +204,36 @@ pub fn overlay_ip(prefix: &IpNet, attempt: u32, index: u32) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+    use serde_json::{Value, json};
+    use tailcat::DerpMap;
+
     use super::*;
+
+    /// A record for a fresh key: node `index`, at `ip`.
+    fn fresh(index: u32, ip: &str) -> NodeRecord {
+        NodeRecord::new(index, &NodePrivate::generate(), ip.parse().unwrap())
+    }
+
+    /// A fresh key, with its record as node 1.
+    fn device_key() -> DeviceKey {
+        let private = NodePrivate::generate();
+        DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private }
+    }
+
+    fn file_names(dir: &Path) -> Vec<OsString> {
+        fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect()
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn overlay_ips() {
@@ -234,8 +263,8 @@ mod tests {
             run_attempt: "1".into(),
             ..NodeRecord::new(3, &k, "100.64.1.3".parse().unwrap())
         };
-        let j = serde_json::to_vec(&r).unwrap();
-        assert_eq!(NodeRecord::from_json(&j).unwrap(), r);
+        let json = serde_json::to_vec(&r).unwrap();
+        assert_eq!(NodeRecord::from_json(&json).unwrap(), r);
         assert_eq!(r.allowed_ips(), ["100.64.1.3/32".parse().unwrap(), "10.42.3.0/24".parse().unwrap()]);
         let aud = audience_for("tailcat-device:", &k.public());
         assert_eq!(aud.len(), "tailcat-device:".len() + 64);
@@ -243,8 +272,7 @@ mod tests {
 
     #[test]
     fn minimal_record_omits_empty_fields() {
-        let r = NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap());
-        let v = serde_json::to_value(&r).unwrap();
+        let v = serde_json::to_value(fresh(0, "100.64.1.0")).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(keys, ["discokey", "index", "nodekey", "overlay_ip"]);
@@ -252,28 +280,30 @@ mod tests {
 
     #[test]
     fn rejects_bad_records() {
-        let good =
-            serde_json::to_value(NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap())).unwrap();
-        let with = |k: &str, v: serde_json::Value| {
+        let good = serde_json::to_value(fresh(0, "100.64.1.0")).unwrap();
+        // `good`, but with field `k` set to `v`.
+        let with = |k: &str, v: Value| {
             let mut j = good.clone();
             j[k] = v;
             NodeRecord::from_json(&serde_json::to_vec(&j).unwrap())
         };
+        let zeros = "0".repeat(64);
         assert!(with("index", 7.into()).is_ok());
-        assert!(with("nodekey", format!("nodekey:{}", "0".repeat(64)).into()).is_err(), "zero node key");
-        assert!(with("discokey", format!("discokey:{}", "0".repeat(64)).into()).is_err(), "zero disco key");
-        assert!(with("routes", serde_json::json!(["10.0.0.0/8", "bogus"])).is_err(), "bad route");
+        assert!(with("nodekey", format!("nodekey:{zeros}").into()).is_err(), "zero node key");
+        assert!(with("discokey", format!("discokey:{zeros}").into()).is_err(), "zero disco key");
+        assert!(with("routes", json!(["10.0.0.0/8", "bogus"])).is_err(), "bad route");
         assert!(with("overlay_ip", "not-an-ip".into()).is_err());
         assert!(NodeRecord::from_json(b"{\"index\": 1").is_err(), "half-written");
     }
 
     #[test]
     fn home_region_prefers_embedded() {
-        let mut dm = tailcat::DerpMap::default();
-        dm.regions.insert(5, DerpRegion { region_id: 5, region_code: "map".into(), ..Default::default() });
-        let mut r = NodeRecord { derp_region: 5, ..NodeRecord::new(0, &NodePrivate::generate(), [0; 4].into()) };
+        let region = |region_id, code: &str| DerpRegion { region_id, region_code: code.into(), ..Default::default() };
+        let mut dm = DerpMap::default();
+        dm.regions.insert(5, region(5, "map"));
+        let mut r = NodeRecord { derp_region: 5, ..fresh(0, "0.0.0.0") };
         assert_eq!(r.home_region(&dm).unwrap().region_code, "map");
-        r.derp = Some(DerpRegion { region_id: 900, region_code: "own".into(), ..Default::default() });
+        r.derp = Some(region(900, "own"));
         assert_eq!(r.home_region(&dm).unwrap().region_code, "own");
         r.derp = None;
         r.derp_region = 6;
@@ -284,8 +314,7 @@ mod tests {
     fn device_key_save_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key");
-        let private = NodePrivate::generate();
-        let k = DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private };
+        let k = device_key();
         k.save(&path, false).unwrap();
         assert_private(&path);
         let back = DeviceKey::load(&path).unwrap();
@@ -302,14 +331,7 @@ mod tests {
         other.save(&path, true).unwrap();
         assert!(DeviceKey::load(&path).is_err());
         assert!(DeviceKey::load(&dir.path().join("missing")).is_err());
-        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, ["key"], "no temporary files left");
-    }
-
-    #[cfg(unix)]
-    fn mode(p: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        assert_eq!(file_names(dir.path()), ["key"], "no temporary files left");
     }
 
     /// Asserts that only its owner may read or write `p`.
@@ -327,13 +349,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replaced_key_is_private() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key");
-        std::fs::write(&path, b"old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let private = NodePrivate::generate();
-        let k = DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private };
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let k = device_key();
         k.save(&path, true).unwrap();
         assert_eq!(mode(&path), 0o600);
         assert_eq!(DeviceKey::load(&path).unwrap().private, k.private);
@@ -343,26 +363,25 @@ mod tests {
     fn records_are_written_whole() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node-1-0.json");
-        let r = NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap());
-        std::fs::write(&path, b"{\"index\": ").unwrap();
+        let r = fresh(0, "100.64.1.0");
+        fs::write(&path, b"{\"index\": ").unwrap();
         r.write(&path).unwrap();
-        assert_eq!(NodeRecord::from_json(&std::fs::read(&path).unwrap()).unwrap(), r);
-        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, ["node-1-0.json"]);
+        let written = fs::read(&path).unwrap();
+        assert_eq!(NodeRecord::from_json(&written).unwrap(), r);
+        assert_eq!(file_names(dir.path()), ["node-1-0.json"]);
     }
 
     /// Distinct attempts and indexes never share a default overlay IP.
     #[hegel::test(test_cases = 500)]
-    fn default_overlay_ips_are_distinct(tc: hegel::TestCase) {
-        use hegel::generators as gs;
+    fn default_overlay_ips_are_distinct(tc: TestCase) {
         let prefix_len = tc.draw(gs::integers::<u8>().min_value(8).max_value(24));
         let prefix = IpNet::new([100, 64, 0, 0].into(), prefix_len);
         let n = || gs::integers::<u32>().max_value(1000);
         let (a, b) = ((tc.draw(n()), tc.draw(n())), (tc.draw(n()), tc.draw(n())));
         tc.assume(a != b);
-        if let (Ok(x), Ok(y)) = (overlay_ip(&prefix, a.0, a.1), overlay_ip(&prefix, b.0, b.1)) {
-            assert_ne!(x, y, "{a:?} and {b:?} both get {x} in {prefix}");
-            assert!(prefix.contains(&x) && prefix.contains(&y));
-        }
+        let (Ok(x), Ok(y)) = (overlay_ip(&prefix, a.0, a.1), overlay_ip(&prefix, b.0, b.1)) else { return };
+        assert_ne!(x, y, "{a:?} and {b:?} both get {x} in {prefix}");
+        assert!(prefix.contains(&x), "{x} is outside {prefix}");
+        assert!(prefix.contains(&y), "{y} is outside {prefix}");
     }
 }

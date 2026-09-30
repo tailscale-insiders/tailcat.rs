@@ -215,18 +215,26 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use tailcat::DiscoPublic;
 
     use super::*;
+
+    type Peers = HashMap<NodePublic, Peer>;
+
+    /// Our run, and another.
+    const OURS: u8 = 0;
+    const THEIRS: u8 = 1;
 
     fn key(n: u8) -> NodePublic {
         format!("nodekey:{:064x}", n as u32 + 1).parse().unwrap()
     }
 
-    /// Key `k` at 100.64.1.`ip`, from run 100 + `run`.
-    fn record(k: u8, ip: u8, run: u8, index: u32) -> NodeRecord {
+    /// Key `k` at 100.64.1.`ip` (its index too), from run 100 + `run`.
+    fn record(k: u8, ip: u8, run: u8) -> NodeRecord {
         NodeRecord {
-            index,
+            index: ip.into(),
             nodekey: key(k),
             discokey: format!("discokey:{:064x}", k as u32 + 1).parse::<DiscoPublic>().unwrap(),
             overlay_ip: IpAddr::from([100, 64, 1, ip]),
@@ -248,7 +256,7 @@ mod tests {
 
     /// At 100.64.1.0, routing 10.42.9.0/24 and 100.64.1.9.
     fn me() -> NodeRecord {
-        routing(record(0, 0, 0, 0), &["10.42.9.0/24", "100.64.1.9"])
+        routing(record(0, 0, OURS), &["10.42.9.0/24", "100.64.1.9"])
     }
 
     /// `r` as a peer routed `nets`.
@@ -256,53 +264,67 @@ mod tests {
         Peer { record: r.clone(), allowed_ips: nets.iter().map(|n| n.parse().unwrap()).collect() }
     }
 
-    fn poll(peers: &mut HashMap<NodePublic, Peer>, polled: &[NodeRecord]) {
-        let changes = reconcile(&me(), peers, polled);
+    /// What polling `polled` would change about `peers`.
+    fn changes(peers: &Peers, polled: &[NodeRecord]) -> Vec<Change> {
+        reconcile(&me(), peers, polled)
+    }
+
+    fn poll(peers: &mut Peers, polled: &[NodeRecord]) {
+        let changes = changes(peers, polled);
         apply(peers, changes);
     }
 
-    fn from_scratch(polled: &[NodeRecord]) -> Vec<Peer> {
-        let mut peers = HashMap::new();
-        poll(&mut peers, polled);
-        let mut v: Vec<Peer> = peers.into_values().collect();
+    /// `peers`, in key order.
+    fn sorted(peers: &Peers) -> Vec<Peer> {
+        let mut v: Vec<Peer> = peers.values().cloned().collect();
         v.sort_by_key(|p| p.record.nodekey);
         v
     }
 
+    /// The peers a first poll of `polled` makes, in key order.
+    fn from_scratch(polled: &[NodeRecord]) -> Vec<Peer> {
+        let mut peers = Peers::new();
+        poll(&mut peers, polled);
+        sorted(&peers)
+    }
+
     #[test]
     fn duplicate_addresses_do_not_flap() {
-        let (a, b) = (record(1, 1, 0, 1), record(2, 1, 0, 1));
-        let mut peers = HashMap::new();
+        let (a, b) = (record(1, 1, OURS), record(2, 1, OURS));
+        let mut peers = Peers::new();
         for _ in 0..3 {
             poll(&mut peers, &[a.clone(), b.clone()]);
-            assert_eq!(peers.values().collect::<Vec<_>>(), [&peer(&a, &["100.64.1.1"])], "the lower key wins");
+            assert_eq!(sorted(&peers), [peer(&a, &["100.64.1.1"])], "the lower key wins");
         }
-        assert_eq!(reconcile(&me(), &peers, &[b.clone(), a.clone()]), []);
+        assert_eq!(changes(&peers, &[b, a]), []);
     }
 
     #[test]
     fn our_own_run_wins_an_address() {
-        let ours = record(5, 1, 0, 1);
-        let theirs = record(1, 1, 1, 1);
-        assert_eq!(from_scratch(&[theirs, ours.clone()]), [peer(&ours, &["100.64.1.1"])]);
+        let ours = record(5, 1, OURS);
+        let theirs = record(1, 1, THEIRS);
+        let peers = from_scratch(&[theirs, ours.clone()]);
+        assert_eq!(peers, [peer(&ours, &["100.64.1.1"])]);
     }
 
     /// An earlier attempt of our run is another run: its nodes are gone.
     #[test]
     fn our_own_attempt_wins_an_address() {
-        let ours = record(5, 1, 0, 1);
-        let earlier = NodeRecord { run_attempt: "0".into(), ..record(1, 1, 0, 1) };
-        assert_eq!(from_scratch(&[earlier, ours.clone()]), [peer(&ours, &["100.64.1.1"])]);
+        let ours = record(5, 1, OURS);
+        let earlier = NodeRecord { run_attempt: "0".into(), ..record(1, 1, OURS) };
+        let peers = from_scratch(&[earlier, ours.clone()]);
+        assert_eq!(peers, [peer(&ours, &["100.64.1.1"])]);
     }
 
     /// Node 1 of our run and node 2 of another both route 10.42.1.0/24:
     /// ours gets it, where the engine alone would pick the lower key.
     #[test]
     fn our_own_run_wins_a_route() {
-        let ours = routing(record(5, 1, 0, 1), &["10.42.1.0/24"]);
-        let theirs = routing(record(1, 2, 1, 2), &["10.42.1.0/24", "10.42.2.0/24"]);
+        let ours = routing(record(5, 1, OURS), &["10.42.1.0/24"]);
+        let theirs = routing(record(1, 2, THEIRS), &["10.42.1.0/24", "10.42.2.0/24"]);
+        let peers = from_scratch(&[theirs.clone(), ours.clone()]);
         assert_eq!(
-            from_scratch(&[theirs.clone(), ours.clone()]),
+            peers,
             [peer(&theirs, &["100.64.1.2", "10.42.2.0/24"]), peer(&ours, &["100.64.1.1", "10.42.1.0/24"])]
         );
     }
@@ -311,11 +333,12 @@ mod tests {
     /// two rank; and one prefix written two ways is still one prefix.
     #[test]
     fn addresses_beat_routes() {
-        let a = record(5, 3, 1, 3);
-        let b = routing(record(1, 1, 0, 1), &["100.64.1.3/32", "10.42.0.9/24"]);
-        let c = routing(record(2, 2, 0, 2), &["10.42.0.0/24"]);
+        let a = record(5, 3, THEIRS);
+        let b = routing(record(1, 1, OURS), &["100.64.1.3/32", "10.42.0.9/24"]);
+        let c = routing(record(2, 2, OURS), &["10.42.0.0/24"]);
+        let peers = from_scratch(&[a.clone(), b.clone(), c.clone()]);
         assert_eq!(
-            from_scratch(&[a.clone(), b.clone(), c.clone()]),
+            peers,
             [peer(&b, &["100.64.1.1", "10.42.0.0/24"]), peer(&c, &["100.64.1.2"]), peer(&a, &["100.64.1.3"])]
         );
     }
@@ -325,13 +348,11 @@ mod tests {
     /// which knows ours, keeps them out of it.
     #[test]
     fn what_we_claim_is_ours() {
-        let squatter = record(3, 0, 1, 0);
-        let at_our_route = record(4, 9, 0, 9);
-        let greedy = routing(record(1, 1, 0, 1), &["100.64.1.0", "10.42.9.0/24", "10.42.0.0/16"]);
-        assert_eq!(
-            from_scratch(&[me(), squatter, at_our_route, greedy.clone()]),
-            [peer(&greedy, &["100.64.1.1", "10.42.0.0/16"])]
-        );
+        let squatter = record(3, 0, THEIRS);
+        let at_our_route = record(4, 9, OURS);
+        let greedy = routing(record(1, 1, OURS), &["100.64.1.0", "10.42.9.0/24", "10.42.0.0/16"]);
+        let peers = from_scratch(&[me(), squatter, at_our_route, greedy.clone()]);
+        assert_eq!(peers, [peer(&greedy, &["100.64.1.1", "10.42.0.0/16"])]);
     }
 
     /// Our run's nodes give our address to a better record there, and our
@@ -339,51 +360,49 @@ mod tests {
     #[test]
     fn contested_claims() {
         let net = |s: &str| s.parse::<IpNet>().unwrap();
-        let me = routing(record(5, 0, 0, 0), &["10.42.9.0/24", "100.64.1.9"]);
+        let me = routing(record(5, 0, OURS), &["10.42.9.0/24", "100.64.1.9"]);
         let stale = NodeRecord { index: 7, ..me.clone() };
-        let foreign = record(1, 0, 1, 0);
-        let higher = routing(record(6, 2, 0, 2), &["10.42.9.0/24"]);
-        assert_eq!(
-            contested(&me, &[stale.clone(), foreign.clone(), higher.clone()]),
-            [],
-            "another run is its own mesh"
-        );
+        let foreign = record(1, 0, THEIRS);
+        let higher = routing(record(6, 2, OURS), &["10.42.9.0/24"]);
+        let other_runs = [stale, foreign.clone(), higher.clone()];
+        assert_eq!(contested(&me, &other_runs), [], "another run is its own mesh");
 
-        let lower = routing(record(2, 1, 0, 1), &["10.42.9.0/24"]);
-        let at_route = record(7, 9, 0, 9);
+        let lower = routing(record(2, 1, OURS), &["10.42.9.0/24"]);
+        let at_route = record(7, 9, OURS);
+        let rivals = [me.clone(), lower.clone(), at_route.clone(), higher.clone()];
         assert_eq!(
-            contested(&me, &[me.clone(), lower.clone(), at_route.clone(), higher.clone()]),
+            contested(&me, &rivals),
             [(net("10.42.9.0/24"), &lower), (net("100.64.1.9/32"), &at_route)],
             "a lower key takes a route, and an address beats a route"
         );
 
         // Our address goes, and with it our routes, to whoever else claims them.
-        let squatter = record(3, 0, 0, 0);
-        assert_eq!(
-            contested(&me, &[squatter.clone(), higher.clone(), lower.clone()]),
-            [(net("100.64.1.0/32"), &squatter), (net("10.42.9.0/24"), &lower)]
-        );
+        let squatter = record(3, 0, OURS);
+        let with_squatter = [squatter.clone(), higher, lower.clone()];
+        assert_eq!(contested(&me, &with_squatter), [(net("100.64.1.0/32"), &squatter), (net("10.42.9.0/24"), &lower)]);
 
         // Outside GitHub Actions, the lower key wins.
         let me = NodeRecord { run_id: String::new(), run_attempt: String::new(), ..me };
-        assert_eq!(contested(&me, std::slice::from_ref(&foreign)), [(net("100.64.1.0/32"), &foreign)]);
+        assert_eq!(contested(&me, slice::from_ref(&foreign)), [(net("100.64.1.0/32"), &foreign)]);
     }
 
     #[test]
     fn missing_peers_are_removed() {
-        let (a, b) = (record(1, 1, 0, 1), record(2, 2, 0, 2));
-        let mut peers = HashMap::new();
+        let (a, b) = (record(1, 1, OURS), record(2, 2, OURS));
+        let mut peers = Peers::new();
         poll(&mut peers, &[a.clone(), b.clone()]);
-        assert_eq!(reconcile(&me(), &peers, std::slice::from_ref(&b)), [Change::Remove(a.nodekey)]);
-        let a2 = record(3, 1, 0, 1);
-        assert_eq!(
-            reconcile(&me(), &peers, &[a2.clone(), b.clone()]),
-            [Change::Remove(a.nodekey), Change::Upsert(peer(&a2, &["100.64.1.1"]))]
-        );
-        let moved = record(2, 3, 0, 2);
-        assert_eq!(
-            reconcile(&me(), &peers, &[a.clone(), moved.clone()]),
-            [Change::Upsert(peer(&moved, &["100.64.1.3"]))]
-        );
+
+        let a_gone = changes(&peers, slice::from_ref(&b));
+        assert_eq!(a_gone, [Change::Remove(a.nodekey)]);
+
+        // A new key at a's address replaces it.
+        let a2 = record(3, 1, OURS);
+        let replaced = changes(&peers, &[a2.clone(), b.clone()]);
+        assert_eq!(replaced, [Change::Remove(a.nodekey), Change::Upsert(peer(&a2, &["100.64.1.1"]))]);
+
+        // b at a new address is updated in place.
+        let moved = NodeRecord { overlay_ip: [100, 64, 1, 3].into(), ..b };
+        let updated = changes(&peers, &[a, moved.clone()]);
+        assert_eq!(updated, [Change::Upsert(peer(&moved, &["100.64.1.3"]))]);
     }
 }
