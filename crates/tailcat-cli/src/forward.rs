@@ -76,7 +76,7 @@ pub async fn run_forward(g: &Global, bind: &str, addr_arg: &str, mappings: &[For
     for (ln, remote) in listeners {
         tokio::spawn(forward_listener(cl.clone(), ln, remote));
     }
-    shutdown_signal().await;
+    crate::util::shutdown_signal().await;
     Ok(())
 }
 
@@ -95,22 +95,6 @@ async fn forward_listener(cl: Client, ln: TcpListener, remote: Dest) {
             }
         });
     }
-}
-
-/// Waits for Ctrl-C or SIGTERM.
-#[cfg(unix)]
-pub async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
-}
-
-/// Waits for Ctrl-C.
-#[cfg(not(unix))]
-pub async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

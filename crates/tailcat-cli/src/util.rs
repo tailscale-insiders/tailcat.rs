@@ -1,5 +1,5 @@
 //! Small helpers: Go-style duration text, platform directories, loopback
-//! dials, atomic private files, accept loops.
+//! dials, atomic private files, accept loops, shutdown signals.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,22 @@ pub fn split_host_port(s: &str) -> std::io::Result<(String, u16)> {
 /// Joins host and port, bracketing IPv6 hosts.
 pub fn join_host_port(host: &str, port: u16) -> String {
     if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
+}
+
+/// Waits for Ctrl-C or SIGTERM.
+#[cfg(unix)]
+pub async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// Waits for Ctrl-C.
+#[cfg(not(unix))]
+pub async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

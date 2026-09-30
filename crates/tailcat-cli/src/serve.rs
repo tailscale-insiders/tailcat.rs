@@ -505,7 +505,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
         });
     }
     let _keep = dev_derp;
-    crate::forward::shutdown_signal().await;
+    crate::util::shutdown_signal().await;
     Ok(())
 }
 

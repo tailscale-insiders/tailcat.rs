@@ -1338,7 +1338,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
     }
     let res = tokio::select! {
         r = run_client(&cl, p, progress) => r.map_err(|e| anyhow!("perf: {e}"))?,
-        _ = crate::forward::shutdown_signal() => bail!("perf: interrupted"),
+        _ = crate::util::shutdown_signal() => bail!("perf: interrupted"),
     };
     let probe = tokio::time::timeout(Duration::from_secs(3), probe_path(&cl, Duration::from_secs(3)));
     // The test's connections close as it ends, but the TCP stack lives in

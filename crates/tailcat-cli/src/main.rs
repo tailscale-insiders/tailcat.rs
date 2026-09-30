@@ -409,7 +409,7 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             }
             println!("{j}");
             eprintln!("# dev DERP relay running; press Ctrl-C to stop");
-            forward::shutdown_signal().await;
+            util::shutdown_signal().await;
         }
     }
     Ok(ExitCode::SUCCESS)
