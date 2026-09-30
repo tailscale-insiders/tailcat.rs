@@ -330,9 +330,11 @@ impl DevDerp {
 }
 
 #[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
 mod tests {
     use tokio::io::{DuplexStream, duplex};
-    use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
 
     use super::*;
@@ -419,19 +421,13 @@ mod tests {
 
     /// Like [`http`], on an existing server.
     async fn connect(server: &Arc<Server>, request: &str) -> Conn {
-        connect_task(server, request).await.0
-    }
-
-    /// Like [`connect`], also returning the server's task for the
-    /// connection.
-    async fn connect_task(server: &Arc<Server>, request: &str) -> (Conn, JoinHandle<Result<()>>) {
         let (near, far) = duplex(1 << 20);
         let s = server.clone();
         let peer = SocketAddr::from(([127, 0, 0, 1], 1));
-        let task = tokio::spawn(async move { s.handle_http(far, peer).await });
+        tokio::spawn(async move { s.handle_http(far, peer).await });
         let mut near = BufReader::new(near);
         write(&mut near, request.as_bytes()).await;
-        (near, task)
+        near
     }
 
     async fn write(c: &mut Conn, data: &[u8]) {
@@ -538,23 +534,6 @@ mod tests {
         write(&mut new, &frame(FrameType::Ping, &[PING])).await;
         let (t, payload) = next_frame(&mut new).await;
         assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, PING));
-    }
-
-    /// A connection cancelled mid-session, as a task is at shutdown,
-    /// unregisters its client as one that hangs up does.
-    #[tokio::test]
-    async fn a_cancelled_connection_unregisters_its_client() {
-        let server = Server::new();
-        let key = NodePrivate::generate();
-        let (mut c, task) = connect_task(&server, "").await;
-        login(&mut c, "T", &key, &"test".into()).await.unwrap();
-        next_frame(&mut c).await;
-        assert!(server.is_client_connected(&key.public()));
-
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-
-        assert!(!server.is_client_connected(&key.public()), "the cancelled connection's client is still registered");
     }
 
     #[tokio::test]
