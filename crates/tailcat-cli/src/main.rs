@@ -19,7 +19,12 @@ mod socks;
 mod ssh;
 mod util;
 
+use std::error::Error;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+use std::{env, fmt, io};
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 
@@ -129,7 +134,7 @@ enum Cmd {
         until_direct: bool,
         /// Give up after this long.
         #[arg(long, default_value = "10s", value_parser = tailcat_args::parse_duration)]
-        timeout: std::time::Duration,
+        timeout: Duration,
         addr: String,
     },
     /// measure throughput and latency to a server (iperf-like)
@@ -227,16 +232,16 @@ enum Cmd {
     DevDerp {
         /// TCP address for DERP over TLS.
         #[arg(long, default_value = "127.0.0.1:0")]
-        derp: std::net::SocketAddr,
+        derp: SocketAddr,
         /// UDP address for STUN.
         #[arg(long, default_value = "127.0.0.1:0")]
-        stun: std::net::SocketAddr,
+        stun: SocketAddr,
         /// The IP address to advertise in the region.
         #[arg(long)]
-        advertise: Option<std::net::IpAddr>,
+        advertise: Option<IpAddr>,
         /// Write the region's JSON to this file once listening.
         #[arg(long)]
-        region_file: Option<std::path::PathBuf>,
+        region_file: Option<PathBuf>,
     },
 }
 
@@ -250,13 +255,13 @@ impl UsageError {
     }
 }
 
-impl std::fmt::Display for UsageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for UsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for UsageError {}
+impl Error for UsageError {}
 
 /// Returns a usage error.
 #[macro_export]
@@ -274,12 +279,12 @@ fn init_logging(verbose: bool) {
     let default = if verbose { "info,tailcat=debug,tailcat_cli=debug" } else { "off" };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(io::stderr).try_init();
     tailcat::set_verbose(verbose);
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = env::args().collect();
     // The command after "--", like Go's splitExecArgs: None without a
     // separator, empty with one followed by nothing.
     let has_separator = argv.iter().skip(1).any(|a| a == "--");
@@ -390,7 +395,7 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
         Some(Cmd::Resolve { addr }) => {
             let a = addrarg::tailcat_addr_arg(&addr).await?;
             let opts = cache::fetch_options(g, tailcat::FetchMode::Client);
-            let r = tokio::time::timeout(std::time::Duration::from_secs(10), a.resolve(opts))
+            let r = tokio::time::timeout(Duration::from_secs(10), a.resolve(opts))
                 .await
                 .map_err(|_| anyhow::anyhow!("timed out resolving the DERP region"))??;
             println!("{r}");
