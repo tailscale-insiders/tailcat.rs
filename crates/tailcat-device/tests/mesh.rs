@@ -28,7 +28,7 @@ struct Node {
 fn record(i: u32, private: &NodePrivate, dev: &DevDerp) -> NodeRecord {
     NodeRecord {
         derp: Some(dev.region.clone()),
-        routes: vec![format!("10.42.{i}.0/24")],
+        routes: vec![format!("10.42.{i}.0/24").parse().unwrap()],
         ..NodeRecord::new(i, private, format!("100.64.1.{i}").parse().unwrap())
     }
 }
@@ -149,7 +149,7 @@ async fn a_peer_cannot_send_from_our_prefixes() {
     let dm = DerpMap::default();
     let mut me = node(0, &dev).await;
     let mut greedy = key(1, &dev);
-    greedy.record.routes = vec!["100.64.0.0/16".into(), "10.42.0.0/16".into()];
+    greedy.record.routes = vec!["100.64.0.0/16".parse().unwrap(), "10.42.0.0/16".parse().unwrap()];
     let greedy_record = greedy.record.clone();
     let peer = start(greedy).await;
     me.overlay.sync(&[greedy_record], &dm);

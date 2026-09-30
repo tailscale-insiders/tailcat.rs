@@ -77,7 +77,7 @@ fn record(k: u8, ip: u8, run: usize, index: u32, routes: &[&str]) -> NodeRecord 
         overlay_ip: IpAddr::from([100, 64, 1, ip]),
         derp_region: 1,
         derp: None,
-        routes: routes.iter().map(|r| r.to_string()).collect(),
+        routes: routes.iter().map(|r| r.parse().unwrap()).collect(),
         endpoints: Vec::new(),
         os: String::new(),
         arch: String::new(),
@@ -164,7 +164,7 @@ enum Claim {
 
 /// A node's claims, as written: its address, then its routes.
 fn claims_of(r: &NodeRecord) -> Vec<(IpNet, Claim)> {
-    let routes = r.routes.iter().filter_map(|s| s.parse().ok()).map(|n| (n, Claim::Route));
+    let routes = r.routes.iter().map(|&n| (n, Claim::Route));
     iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes).collect()
 }
 

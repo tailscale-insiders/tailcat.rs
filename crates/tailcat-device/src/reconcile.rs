@@ -160,7 +160,7 @@ enum Claim {
 
 /// A record's claims: its address, then its routes, canonical.
 fn claims(r: &NodeRecord) -> impl Iterator<Item = (IpNet, Claim)> + '_ {
-    let routes = r.routes.iter().filter_map(|s| s.parse().ok()).map(|n| (canonical(n), Claim::Route));
+    let routes = r.routes.iter().map(|&n| (canonical(n), Claim::Route));
     std::iter::once((IpNet::host(r.overlay_ip), Claim::Address)).chain(routes)
 }
 
@@ -255,7 +255,7 @@ mod tests {
     }
 
     fn routing(r: NodeRecord, routes: &[&str]) -> NodeRecord {
-        NodeRecord { routes: routes.iter().map(|r| r.to_string()).collect(), ..r }
+        NodeRecord { routes: routes.iter().map(|r| r.parse().unwrap()).collect(), ..r }
     }
 
     /// At 100.64.1.0, routing 10.42.9.0/24 and 100.64.1.9.

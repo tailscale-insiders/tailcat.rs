@@ -32,7 +32,7 @@ pub struct NodeRecord {
     pub derp: Option<DerpRegion>,
     /// Extra prefixes routed to this node (for example a pod CIDR).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routes: Vec<String>,
+    pub routes: Vec<IpNet>,
     /// UDP endpoints known in advance, if any. Endpoints are otherwise
     /// learned at run time over DERP.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,15 +81,12 @@ impl NodeRecord {
     pub fn from_json(b: &[u8]) -> Result<NodeRecord> {
         let r: NodeRecord = serde_json::from_slice(b).context("parsing node record")?;
         ensure!(!r.nodekey.is_zero() && !r.discokey.is_zero(), "node record {} has a zero key", r.index);
-        for route in &r.routes {
-            route.parse::<IpNet>().map_err(|e| anyhow!("node record {}: route {route:?}: {e}", r.index))?;
-        }
         Ok(r)
     }
 
     /// The prefixes routed to this node: its overlay IP plus its routes.
     pub fn allowed_ips(&self) -> Vec<IpNet> {
-        std::iter::once(IpNet::host(self.overlay_ip)).chain(self.routes.iter().filter_map(|r| r.parse().ok())).collect()
+        std::iter::once(IpNet::host(self.overlay_ip)).chain(self.routes.iter().copied()).collect()
     }
 
     /// The node's home region: embedded, or looked up in `dm`.
@@ -256,7 +253,7 @@ mod tests {
         let k = NodePrivate::generate();
         let r = NodeRecord {
             derp_region: 302,
-            routes: vec!["10.42.3.0/24".into()],
+            routes: vec!["10.42.3.0/24".parse().unwrap()],
             os: "Linux".into(),
             arch: "X64".into(),
             run_id: "123".into(),

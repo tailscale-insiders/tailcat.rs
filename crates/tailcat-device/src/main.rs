@@ -67,7 +67,7 @@ struct InitArgs {
     ip: Option<IpAddr>,
     /// Extra prefixes to route to this node (repeatable).
     #[arg(long = "route")]
-    routes: Vec<String>,
+    routes: Vec<IpNet>,
     /// Home DERP region: 'auto' (lowest latency), an ID, a region code or name, or comma-separated
     /// hostnames of your own DERP servers. 'list' lists the regions.
     #[arg(long, default_value = "auto")]
