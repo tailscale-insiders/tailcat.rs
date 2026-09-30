@@ -234,8 +234,8 @@ struct Message {
     id: MessageId,
     #[serde(default, skip_serializing_if = "is_zero")]
     stream: usize,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Failure,
     #[serde(default, skip_serializing_if = "is_zero")]
     t: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,11 +244,11 @@ struct Message {
 
 impl Message {
     fn new(typ: MessageType) -> Self {
-        Message { typ, params: None, id: None, stream: 0, error: String::new(), t: 0, stats: None }
+        Message { typ, params: None, id: None, stream: 0, error: None, t: 0, stats: None }
     }
 
     fn error(e: impl Into<String>) -> Self {
-        Message { error: e.into(), ..Message::new(MessageType::Error) }
+        Message { error: Some(e.into()), ..Message::new(MessageType::Error) }
     }
 
     /// The message as a JSON line.
@@ -258,6 +258,9 @@ impl Message {
         b
     }
 }
+
+/// What went wrong, in an `error` message.
+type Failure = Option<String>;
 
 /// The test a message is about, if it names one.
 type MessageId = Option<[u8; 8]>;
@@ -628,7 +631,7 @@ impl Test {
                 MessageType::Done => self.peer_sent.set(m.stats),
                 MessageType::Result => self.peer_received.set(m.stats),
                 MessageType::Error => {
-                    self.fail(format!("peer: {}", m.error));
+                    self.fail(format!("peer: {}", m.error.unwrap_or_default()));
                     return;
                 }
                 _ => {}
@@ -1107,7 +1110,7 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
         .map_err(|_| anyhow!("reading hello reply: timed out"))?
         .map_err(|e| anyhow!("reading hello reply: {e}"))?;
     match m.typ {
-        MessageType::Error => bail!("server rejected the test: {}", m.error),
+        MessageType::Error => bail!("server rejected the test: {}", m.error.unwrap_or_default()),
         MessageType::Ok => {}
         other => bail!("unexpected reply {other:?} to hello"),
     }
