@@ -252,7 +252,7 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
             };
             reply(&mut c, REP_SUCCESS, zero).await?;
             let _ = c.set_nodelay(true);
-            crate::serve::proxy_and_drain(remote, c).await;
+            crate::util::proxy_and_drain(remote, c).await;
             Ok(())
         }
         3 => {

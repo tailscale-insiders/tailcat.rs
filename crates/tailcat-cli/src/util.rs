@@ -1,10 +1,12 @@
 //! Small helpers: Go-style duration text, platform directories, loopback
-//! dials, atomic private files, accept loops, shutdown signals, and
-//! finding executables.
+//! dials and proxying, atomic private files, accept loops, shutdown
+//! signals, and finding executables.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use tokio::io::AsyncWriteExt;
 
 /// Formats a duration roughly the way Go prints it, rounded sensibly.
 pub fn fmt_duration(d: Duration) -> String {
@@ -237,6 +239,22 @@ fn is_executable(p: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(p: &std::path::Path) -> bool {
     p.is_file()
+}
+
+/// Proxies until both directions finish, then lets our FIN be acked.
+pub async fn proxy_and_drain(c: tailcat::TcpStream, local: tokio::net::TcpStream) {
+    let (mut cr, mut cw) = tokio::io::split(c);
+    let (mut lr, mut lw) = local.into_split();
+    let a = async {
+        let _ = tokio::io::copy(&mut cr, &mut lw).await;
+        let _ = lw.shutdown().await;
+    };
+    let b = async {
+        let _ = tokio::io::copy(&mut lr, &mut cw).await;
+        let _ = cw.shutdown().await;
+    };
+    tokio::join!(a, b);
+    cr.unsplit(cw).drain(Duration::from_secs(5)).await;
 }
 
 #[cfg(test)]

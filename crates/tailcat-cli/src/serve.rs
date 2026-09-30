@@ -209,26 +209,10 @@ async fn proxy_to_local(target: String, c: TcpStream) {
     match crate::util::dial_local(&target).await {
         Ok(local) => {
             let _ = local.set_nodelay(true);
-            proxy_and_drain(c, local).await;
+            crate::util::proxy_and_drain(c, local).await;
         }
         Err(e) => debug!("error proxying to {target}: {e}"),
     }
-}
-
-/// Proxies until both directions finish, then lets our FIN be acked.
-pub async fn proxy_and_drain(c: TcpStream, local: tokio::net::TcpStream) {
-    let (mut cr, mut cw) = tokio::io::split(c);
-    let (mut lr, mut lw) = local.into_split();
-    let a = async {
-        let _ = tokio::io::copy(&mut cr, &mut lw).await;
-        let _ = lw.shutdown().await;
-    };
-    let b = async {
-        let _ = tokio::io::copy(&mut lr, &mut cw).await;
-        let _ = cw.shutdown().await;
-    };
-    tokio::join!(a, b);
-    cr.unsplit(cw).drain(Duration::from_secs(5)).await;
 }
 
 async fn udp_forward_to(dst: SocketAddr, c: UdpConn) {

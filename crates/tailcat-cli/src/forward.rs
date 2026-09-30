@@ -87,7 +87,7 @@ async fn forward_listener(cl: Client, ln: TcpListener, remote: Dest) {
         let cl = cl.clone();
         tokio::spawn(async move {
             match remote.dial(&cl).await {
-                Ok(r) => crate::serve::proxy_and_drain(r, conn).await,
+                Ok(r) => crate::util::proxy_and_drain(r, conn).await,
                 Err(e) => {
                     tracing::debug!("dial remote target {}: {e}", remote_name(remote));
                     let _ = conn.shutdown().await;
