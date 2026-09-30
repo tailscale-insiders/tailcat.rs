@@ -64,6 +64,7 @@ mod server;
 pub mod ssh;
 mod tls;
 
+use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub use addr::{Addr, ConnInfo, PrivateKey};
@@ -94,7 +95,7 @@ pub const TUNNEL_MTU: usize = 1280;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("{0}")]
     Addr(String),
     #[error("DERP: {0}")]
@@ -111,12 +112,12 @@ impl Error {
     }
 }
 
-impl From<Error> for std::io::Error {
+impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
         match e {
             Error::Io(e) => e,
-            Error::Timeout(s) => std::io::Error::new(std::io::ErrorKind::TimedOut, s),
-            e => std::io::Error::other(e.to_string()),
+            Error::Timeout(s) => io::Error::new(ErrorKind::TimedOut, s),
+            e => io::Error::other(e.to_string()),
         }
     }
 }
