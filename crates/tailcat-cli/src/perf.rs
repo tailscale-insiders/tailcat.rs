@@ -1008,12 +1008,14 @@ pub struct Server {
 }
 
 impl Server {
-    /// Registers `t` under `id`, unless another test is running.
-    fn register(&self, id: [u8; 8], t: &Arc<Test>) -> bool {
+    /// Registers `t` until the returned [`Registration`] drops, unless
+    /// another test is running.
+    #[must_use = "dropping the Registration at once ends the test"]
+    fn register(&self, t: &Arc<Test>) -> Option<Registration<'_>> {
         let mut tests = self.tests.lock().unwrap();
-        let registered = tests.is_empty() && tests.insert(id, t.clone()).is_none();
+        let registered = tests.is_empty() && tests.insert(t.id, t.clone()).is_none();
         drop(tests);
-        registered
+        registered.then(|| Registration { server: self, test: t.clone() })
     }
 
     fn lookup(&self, id: [u8; 8], index: usize) -> Result<Arc<Test>, String> {
@@ -1086,22 +1088,35 @@ impl Server {
         let mut id = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
         let t = Test::new(p, id, true, ctrl, None);
-        if !self.register(id, &t) {
+        let Some(_registration) = self.register(&t) else {
             let _ = t.ctrl.send(&Message::error("the server is busy with another test")).await;
             return;
-        }
+        };
         let res = async {
             t.ctrl.send(&Message { id: Some(id), ..Message::new(MessageType::Ok) }).await.map_err(|e| e.to_string())?;
             let limit = DEFAULT_MAX_DURATION + HANDSHAKE_TIMEOUT + REPORT_TIMEOUT;
             tokio::time::timeout(limit, t.clone().run()).await.unwrap_or_else(|_| Err("test timed out".into()))
         }
         .await;
-        t.done.set();
-        self.tests.lock().unwrap().remove(&id);
         match res {
             Ok(r) => eprintln!("# perf test from {remote}: {}", perf_summary(&r)),
             Err(e) => tracing::debug!("perf: test from {remote} failed: {e}"),
         }
+    }
+}
+
+/// A test's place on the server. Dropping it ends the test and frees
+/// the server for the next, however the test ends: finished, failed or
+/// cancelled.
+struct Registration<'a> {
+    server: &'a Server,
+    test: Arc<Test>,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.test.done.set();
+        self.server.tests.lock().unwrap().remove(&self.test.id);
     }
 }
 
@@ -1619,6 +1634,25 @@ mod tests {
     /// Validates `p` with the server's default limits.
     fn server_validate(p: &Params) -> Result<(), String> {
         p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION)
+    }
+
+    /// A test cancelled while it runs frees the server, as one that ends
+    /// does, rather than keep it busy for good.
+    #[tokio::test]
+    async fn a_cancelled_test_frees_the_server() {
+        let server = Server::default();
+        let (client, ours) = duplex(4096);
+        let (rd, wr) = split(ours);
+        let ctrl = Ctrl::new(BufReader::new(Box::new(rd)), Box::new(wr));
+        let hello = Message { params: Some(params()), ..Message::new(MessageType::Hello) };
+        let remote = "[::1]:1".parse().unwrap();
+
+        // No streams connect, so the test waits for them until cancelled.
+        let run = tokio::time::timeout(Duration::from_millis(100), server.run_test(ctrl, hello, remote));
+        assert!(run.await.is_err(), "the test ended without its streams");
+        drop(client);
+
+        assert!(server.tests.lock().unwrap().is_empty(), "the cancelled test kept the server busy");
     }
 
     #[test]
