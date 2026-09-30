@@ -237,7 +237,7 @@ struct Inner {
     engine: Arc<Engine>,
     stack: Stack,
     clients: Mutex<Clients>,
-    pending_allow: Mutex<HashSet<NodePublic>>,
+    pending_allow: PendingAllow,
     listeners: Mutex<Listeners>,
     cfg: Handlers,
     task: tokio::task::JoinHandle<()>,
@@ -293,6 +293,34 @@ struct Clients {
     /// Counts calls to [`Server::disconnect_client`], so a join whose
     /// allow hook answered before a revocation can't complete after it.
     disconnects: u64,
+}
+
+/// The clients the allow hook is being asked about, so a client's
+/// retries don't ask it again meanwhile.
+#[derive(Default)]
+struct PendingAllow(Arc<Mutex<HashSet<NodePublic>>>);
+
+impl PendingAllow {
+    /// Marks `k` as being asked about until the returned [`Asking`]
+    /// drops, unless it is already.
+    #[must_use = "dropping the Asking at once unmarks the client"]
+    fn ask(&self, k: NodePublic) -> Option<Asking> {
+        let fresh = self.0.lock().unwrap().insert(k);
+        fresh.then(|| Asking { pending: self.0.clone(), key: k })
+    }
+}
+
+/// A client the allow hook is being asked about. Dropping it unmarks
+/// the client, however the asking ends: answered, failed or cancelled.
+struct Asking {
+    pending: Arc<Mutex<HashSet<NodePublic>>>,
+    key: NodePublic,
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// The per-flow hooks and filters, set through [`ServerBuilder`].
@@ -466,7 +494,7 @@ impl Server {
             engine,
             stack,
             clients: Mutex::new(Clients { ids: HashMap::new(), next_id: 2, disconnects: 0 }),
-            pending_allow: Mutex::default(),
+            pending_allow: PendingAllow::default(),
             listeners: Mutex::default(),
             cfg: b.cfg,
             task,
@@ -635,15 +663,14 @@ impl Server {
     /// meanwhile, it closes, and this returns `None`.
     async fn vet(self, src: NodePublic, known: bool) -> Option<Server> {
         let Some(allow) = self.inner.cfg.allow_client.clone().filter(|_| !known) else { return Some(self) };
-        if !self.inner.pending_allow.lock().unwrap().insert(src) {
+        let Some(_asking) = self.inner.pending_allow.ask(src) else {
             // An earlier meow is still waiting on the hook; the client retries.
             return None;
-        }
+        };
         let server = Arc::downgrade(&self.inner);
         drop(self);
         let allowed = tokio::task::spawn_blocking(move || allow(src)).await.unwrap_or(false);
         let inner = server.upgrade()?;
-        inner.pending_allow.lock().unwrap().remove(&src);
         if !allowed {
             debug!("tailcat: ignoring meow from {src}: rejected by the allow hook");
             return None;
@@ -935,6 +962,35 @@ mod tests {
 
         assert!(closed, "the dropped server stayed up for the hook");
         assert!(!meow.await.unwrap(), "the dropped server acked a client");
+    }
+
+    /// A meow cancelled while the allow hook decides leaves the client
+    /// free to be asked about again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_meow_lets_the_client_retry() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (hook_asked, hook_resume) = (asked.clone(), resume.clone());
+        let first = AtomicBool::new(true);
+        let slow_once = move |_| {
+            if first.swap(false, Ordering::Relaxed) {
+                hook_asked.wait();
+                hook_resume.wait();
+            }
+            true
+        };
+        let server = Server::builder().region(dev.region.clone()).allow_client(slow_once).start().await.unwrap();
+        let k = NodePrivate::generate().public();
+        let meow = tokio::spawn(server.meow(k));
+        wait_at(&asked).await;
+
+        meow.abort();
+        assert!(meow.await.unwrap_err().is_cancelled());
+        let retried = server.meow(k).await;
+        wait_at(&resume).await;
+
+        assert!(retried, "the cancelled meow kept the client marked as being asked about");
+        server.close();
     }
 
     /// Asserts that `c` is aborted soon rather than left open.
