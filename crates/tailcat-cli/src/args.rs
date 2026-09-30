@@ -276,6 +276,21 @@ pub struct FilesArg {
     pub mode: FilesMode,
 }
 
+impl FilesArg {
+    /// `dir`, the current one if empty, served as `mode` says.
+    pub fn new(dir: impl Into<PathBuf>, mode: FilesMode) -> Self {
+        let dir = dir.into();
+        FilesArg { dir: if dir.as_os_str().is_empty() { ".".into() } else { dir }, mode }
+    }
+}
+
+/// The current directory, read-only, as an empty `--files` means.
+impl Default for FilesArg {
+    fn default() -> Self {
+        FilesArg::new("", FilesMode::ReadOnly)
+    }
+}
+
 /// How `--files` serves its directory, by its suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesMode {
@@ -328,7 +343,7 @@ impl FromStr for FilesArg {
             .into_iter()
             .find_map(|(suffix, mode)| Some((v.strip_suffix(suffix)?, mode)))
             .unwrap_or((v, FilesMode::ReadOnly));
-        Ok(FilesArg { dir: if dir.is_empty() { ".".into() } else { dir.into() }, mode })
+        Ok(FilesArg::new(dir, mode))
     }
 }
 
@@ -476,13 +491,12 @@ mod tests {
     #[test]
     fn files_args() {
         let arg = |s: &str| s.parse::<FilesArg>().unwrap();
-        let files = |dir: &str, mode| FilesArg { dir: dir.into(), mode };
-        assert_eq!(arg("/srv"), files("/srv", FilesMode::ReadOnly));
-        assert_eq!(arg("/srv:ro"), files("/srv", FilesMode::ReadOnly));
-        assert_eq!(arg("/srv:rw"), files("/srv", FilesMode::ReadWrite));
-        assert_eq!(arg("/srv:wo"), files("/srv", FilesMode::WriteOnly));
-        assert_eq!(arg("/srv:wo+"), files("/srv", FilesMode::WriteOnlyTree));
-        assert_eq!(arg(":rw"), files(".", FilesMode::ReadWrite));
+        assert_eq!(arg("/srv"), FilesArg::new("/srv", FilesMode::ReadOnly));
+        assert_eq!(arg("/srv:ro"), FilesArg::new("/srv", FilesMode::ReadOnly));
+        assert_eq!(arg("/srv:rw"), FilesArg::new("/srv", FilesMode::ReadWrite));
+        assert_eq!(arg("/srv:wo"), FilesArg::new("/srv", FilesMode::WriteOnly));
+        assert_eq!(arg("/srv:wo+"), FilesArg::new("/srv", FilesMode::WriteOnlyTree));
+        assert_eq!(arg(":rw"), FilesArg::new(".", FilesMode::ReadWrite));
     }
 
     #[test]

@@ -14,9 +14,9 @@ use tailcat::{
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-use crate::args::KeyArg;
 #[cfg(feature = "ssh")]
-use crate::args::{FilesArg, FilesMode};
+use crate::args::FilesArg;
+use crate::args::KeyArg;
 use crate::perf::PORT as PERF_PORT;
 use crate::{Global, ServeFlags};
 
@@ -389,7 +389,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
             eprintln!("# SSH sessions run only {}", a.join(" "));
         }
         if has(Service::Files) {
-            let files = flags.files.clone().unwrap_or_else(|| FilesArg { dir: ".".into(), mode: FilesMode::ReadOnly });
+            let files = flags.files.clone().unwrap_or_default();
             let fs = file_service(&files)?;
             eprintln!("# Serving files from {} ({})", fs.dir.display(), files.mode.name());
             opts.files = Some(fs);

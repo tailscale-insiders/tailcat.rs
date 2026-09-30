@@ -351,7 +351,7 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
                 return Err(usagef!("recv takes the directory as an argument, not --files"));
             }
             let mode = if accept_dirs { args::FilesMode::WriteOnlyTree } else { args::FilesMode::WriteOnly };
-            flags.files = Some(args::FilesArg { dir: dir.as_deref().unwrap_or(".").into(), mode });
+            flags.files = Some(args::FilesArg::new(dir.unwrap_or_default(), mode));
             serve::server(g, &flags, serve::PortSet::default(), None).await?;
         }
         #[cfg(feature = "ssh")]
