@@ -349,7 +349,7 @@ impl Client {
         };
         // Region IDs are never 0 once expanded, so direct pongs get no code.
         let region = r.ci.region.iter().find(|x| x.region_id == derp_region_id);
-        let derp_region_code = region.map(|x| x.region_code.clone()).unwrap_or_default();
+        let derp_region_code = region.map(|x| x.region_code.to_string()).unwrap_or_default();
         Ok(DiscoPingResult { latency: res.latency, endpoint, derp_region_id, derp_region_code })
     }
 

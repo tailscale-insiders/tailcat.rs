@@ -23,7 +23,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::derpmap::{DerpMap, DerpNode, DerpRegion, FetchOptions, is_default};
+use crate::derpmap::{DerpMap, DerpNode, DerpRegion, FetchOptions, RegionCode, RegionName, is_default};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::{Error, Result};
 
@@ -60,7 +60,7 @@ impl Addr {
                 r.region_id = ri as i32 + 1;
             }
             if r.region_code.is_empty() {
-                r.region_code = r.region_id.to_string();
+                r.region_code = r.region_id.to_string().into();
             }
             for n in &mut r.nodes {
                 if n.name.is_empty() {
@@ -324,9 +324,42 @@ struct Wire {
 /// table drives decoding, encoding and display. Zero values are omitted
 /// when encoding and displaying.
 enum Field<'a> {
-    Str(&'a mut String),
+    Str(&'a mut dyn Text),
     Int(&'a mut i32),
     Bool(&'a mut bool),
+}
+
+/// A text field: a plain string, or a region's code or name.
+trait Text {
+    fn text(&self) -> &str;
+    fn set_text(&mut self, s: String);
+}
+
+impl Text for String {
+    fn text(&self) -> &str {
+        self
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s;
+    }
+}
+
+impl Text for RegionCode {
+    fn text(&self) -> &str {
+        self.as_str()
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s.into();
+    }
+}
+
+impl Text for RegionName {
+    fn text(&self) -> &str {
+        self.as_str()
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s.into();
+    }
 }
 
 /// Fields by CBOR key and JSON name, in wire order.
@@ -360,7 +393,7 @@ fn region_fields(r: &mut DerpRegion) -> Fields<'_, 3> {
 impl Field<'_> {
     fn is_zero(&self) -> bool {
         match self {
-            Field::Str(s) => s.is_empty(),
+            Field::Str(s) => s.text().is_empty(),
             Field::Int(i) => **i == 0,
             Field::Bool(b) => !**b,
         }
@@ -368,7 +401,7 @@ impl Field<'_> {
 
     fn to_cbor(&self) -> Value {
         match self {
-            Field::Str(s) => Value::Text(s.to_string()),
+            Field::Str(s) => Value::Text(s.text().to_string()),
             Field::Int(i) => Value::Integer((**i).into()),
             Field::Bool(b) => Value::Bool(**b),
         }
@@ -376,7 +409,7 @@ impl Field<'_> {
 
     fn to_json(&self) -> serde_json::Value {
         match self {
-            Field::Str(s) => s.as_str().into(),
+            Field::Str(s) => s.text().into(),
             Field::Int(i) => (**i).into(),
             Field::Bool(b) => (**b).into(),
         }
@@ -384,7 +417,7 @@ impl Field<'_> {
 
     fn set(&mut self, v: Value, what: &str) -> Result<()> {
         match self {
-            Field::Str(s) => **s = v.into_text().map_err(|_| bad(format!("{what} is not a string")))?,
+            Field::Str(s) => s.set_text(v.into_text().map_err(|_| bad(format!("{what} is not a string")))?),
             Field::Int(i) => **i = as_int(v, what)?,
             Field::Bool(b) => **b = matches!(v, Value::Bool(true)),
         }

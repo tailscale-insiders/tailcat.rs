@@ -563,7 +563,7 @@ impl Server {
                     key: k,
                     tailcat_ip: k.tailcat_ip(),
                     cur_addr: direct,
-                    relay: if direct.is_none() { self.inner.region.region_code.clone() } else { String::new() },
+                    relay: if direct.is_none() { self.inner.region.region_code.to_string() } else { String::new() },
                     last_handshake: hs,
                     tx_bytes: tx,
                     rx_bytes: rx,

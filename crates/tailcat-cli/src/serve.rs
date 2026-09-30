@@ -125,7 +125,7 @@ pub fn parse_port_target(port: &str, target: &str) -> Result<(u16, String)> {
 fn clear_unnecessary_region_fields(r: &mut DerpRegion) {
     r.latitude = 0.0;
     r.longitude = 0.0;
-    r.region_code.clear();
+    r.region_code = tailcat::RegionCode::Unset;
     r.nodes.truncate(1);
     for n in &mut r.nodes {
         n.can_port_80 = false;

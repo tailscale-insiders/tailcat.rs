@@ -151,7 +151,7 @@ async fn tcp_and_udp_over_local_derp() {
     let dp = client.disco_ping(Duration::from_secs(5)).await.unwrap();
     if dp.endpoint.is_none() {
         assert_eq!(dp.derp_region_id, dev.region.region_id);
-        assert_eq!(dp.derp_region_code, dev.region.region_code);
+        assert_eq!(dp.derp_region_code, dev.region.region_code.as_str());
     }
 
     let st = server.status();

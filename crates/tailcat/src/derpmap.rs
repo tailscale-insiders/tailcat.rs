@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Result};
 
@@ -37,6 +37,110 @@ pub struct DerpMap {
     pub omit_default_regions: bool,
 }
 
+/// Defines a string type whose well-known values are unit variants, so
+/// that copying one allocates nothing, while any other value is kept as
+/// it is in `Other`, and the empty string is `Unset`. Values compare,
+/// print and serialize as the string.
+macro_rules! known_strings {
+    ($(#[$m:meta])* $t:ident { $($v:ident => $s:literal),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Default)]
+        pub enum $t {
+            /// None given: the empty string, as Go leaves it.
+            #[default]
+            Unset,
+            $($v,)*
+            Other(String),
+        }
+
+        impl $t {
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $t::Unset => "",
+                    $($t::$v => $s,)*
+                    $t::Other(s) => s,
+                }
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.as_str().is_empty()
+            }
+        }
+
+        impl From<&str> for $t {
+            fn from(s: &str) -> Self {
+                match s {
+                    "" => $t::Unset,
+                    $($s => $t::$v,)*
+                    s => $t::Other(s.into()),
+                }
+            }
+        }
+
+        impl From<String> for $t {
+            fn from(s: String) -> Self {
+                match s.as_str() {
+                    "" => $t::Unset,
+                    $($s => $t::$v,)*
+                    _ => $t::Other(s),
+                }
+            }
+        }
+
+        impl PartialEq for $t {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_str() == other.as_str()
+            }
+        }
+
+        impl PartialEq<&str> for $t {
+            fn eq(&self, other: &&str) -> bool {
+                self.as_str() == *other
+            }
+        }
+
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $t {
+            fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $t {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                String::deserialize(d).map($t::from)
+            }
+        }
+    };
+}
+
+known_strings! {
+    /// A region's code, like `sfo`: those of the default map's regions
+    /// are variants.
+    RegionCode {
+        Nyc => "nyc",
+        Sfo => "sfo",
+        Fra => "fra",
+        Tok => "tok",
+    }
+}
+
+known_strings! {
+    /// A region's name, like `San Francisco`: those of the default map's
+    /// regions are variants.
+    RegionName {
+        NewYorkCity => "New York City",
+        SanFrancisco => "San Francisco",
+        Frankfurt => "Frankfurt",
+        Tokyo => "Tokyo",
+    }
+}
+
 /// A geographic region of DERP relays that are meshed together, so a
 /// client may connect to any of its nodes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -44,9 +148,9 @@ pub struct DerpRegion {
     #[serde(rename = "RegionID", default)]
     pub region_id: i32,
     #[serde(rename = "RegionCode", default)]
-    pub region_code: String,
+    pub region_code: RegionCode,
     #[serde(rename = "RegionName", default)]
-    pub region_name: String,
+    pub region_name: RegionName,
     #[serde(rename = "Latitude", default, skip_serializing_if = "is_default")]
     pub latitude: f64,
     #[serde(rename = "Longitude", default, skip_serializing_if = "is_default")]
@@ -252,11 +356,11 @@ pub fn find_region(dm: &DerpMap, s: &str) -> Option<i32> {
     if s == "list" {
         return None;
     }
-    if let Some(r) = dm.regions.values().find(|r| r.region_code.eq_ignore_ascii_case(s)) {
+    if let Some(r) = dm.regions.values().find(|r| r.region_code.as_str().eq_ignore_ascii_case(s)) {
         return Some(r.region_id);
     }
     let needle = s.to_lowercase();
-    dm.regions.values().find(|r| r.region_name.to_lowercase().contains(&needle)).map(|r| r.region_id)
+    dm.regions.values().find(|r| r.region_name.as_str().to_lowercase().contains(&needle)).map(|r| r.region_id)
 }
 
 /// What a `--region` argument names.
@@ -330,6 +434,27 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn known_region_strings() {
+        // The default map's codes and names parse to variants, which cost
+        // nothing to copy; any other value is kept exactly.
+        let (code, name): (RegionCode, RegionName) = ("sfo".into(), "San Francisco".to_string().into());
+        assert!(matches!((&code, &name), (RegionCode::Sfo, RegionName::SanFrancisco)));
+        assert!(matches!(RegionCode::from("SFO"), RegionCode::Other(s) if s == "SFO"));
+        assert_eq!(RegionCode::Other("sfo".into()), RegionCode::Sfo, "equal as strings");
+        assert!(matches!(RegionCode::default(), RegionCode::Unset));
+        assert!(matches!(RegionCode::from(""), RegionCode::Unset));
+        assert_eq!(RegionCode::Unset.as_str(), "");
+        assert_eq!(format!("{code} {name}"), "sfo San Francisco");
+
+        let json = r#"{"RegionCode":"tok","RegionName":"Somewhere Else"}"#;
+        let r: DerpRegion = serde_json::from_str(json).unwrap();
+        assert!(matches!(r.region_code, RegionCode::Tok));
+        assert!(matches!(&r.region_name, RegionName::Other(s) if s == "Somewhere Else"));
+        let back = serde_json::to_string(&r).unwrap();
+        assert!(back.contains(r#""RegionCode":"tok","RegionName":"Somewhere Else""#), "{back}");
     }
 
     #[test]
