@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::addr::{Addr, ConnInfo};
+use crate::client::Via;
 use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::magicsock::{self, MagicSock, PeerPath};
@@ -318,10 +319,8 @@ pub struct Server {
 pub struct PeerStatus {
     pub key: NodePublic,
     pub tailcat_ip: Ipv6Addr,
-    /// The direct UDP path in use, if any.
-    pub cur_addr: Option<SocketAddr>,
-    /// The DERP region code, when relayed.
-    pub relay: String,
+    /// The path in use: direct, or relayed through our home region.
+    pub via: Via,
     pub last_handshake: Option<Duration>,
     pub tx_bytes: usize,
     pub rx_bytes: usize,
@@ -558,16 +557,12 @@ impl Server {
             .map(|k| {
                 let path = self.inner.ms.peer_path(&k);
                 let (hs, tx, rx) = self.inner.engine.peer_stats(&k).unwrap_or((None, 0, 0));
-                let direct = path.as_ref().and_then(PeerPath::direct);
-                PeerStatus {
-                    key: k,
-                    tailcat_ip: k.tailcat_ip(),
-                    cur_addr: direct,
-                    relay: if direct.is_none() { self.inner.region.region_code.to_string() } else { String::new() },
-                    last_handshake: hs,
-                    tx_bytes: tx,
-                    rx_bytes: rx,
-                }
+                let region = &self.inner.region;
+                let via = match path.as_ref().and_then(PeerPath::direct) {
+                    Some(a) => Via::Direct(a),
+                    None => Via::Derp { region_id: region.region_id, region_code: region.region_code.clone() },
+                };
+                PeerStatus { key: k, tailcat_ip: k.tailcat_ip(), via, last_handshake: hs, tx_bytes: tx, rx_bytes: rx }
             })
             .collect();
         ServerStatus {
