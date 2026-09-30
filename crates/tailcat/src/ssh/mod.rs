@@ -10,10 +10,13 @@ mod session;
 mod sftp;
 
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write as _};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{env, fmt};
 
 use base64::Engine as _;
 use russh::keys::PrivateKey;
@@ -88,7 +91,7 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let bad = |msg: &dyn std::fmt::Display| {
+            let bad = |msg: &dyn fmt::Display| {
                 Error::other(format!("authorized keys entry {}, line {}: {msg}", ti + 1, li + 1))
             };
             let entry: Entry = line.parse().map_err(|e| bad(&e))?;
@@ -106,27 +109,27 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
 
 fn ssh_key_dir() -> Result<PathBuf> {
     let dir = config_dir().ok_or_else(|| Error::other("no user config directory"))?.join("tailcat").join("ssh");
-    std::fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir)?;
     make_private_dir(&dir);
     Ok(dir)
 }
 
 /// Makes `dir` accessible only to its owner, if it can.
 #[cfg(unix)]
-fn make_private_dir(dir: &std::path::Path) {
+fn make_private_dir(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
 }
 
 /// Does nothing: directories have no Unix mode here.
 #[cfg(not(unix))]
-fn make_private_dir(_: &std::path::Path) {}
+fn make_private_dir(_: &Path) {}
 
 /// Go's `os.UserConfigDir`, where the Go implementation keeps its host
 /// key too, so both share one: `%AppData%`.
 #[cfg(windows)]
 fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("AppData").map(PathBuf::from)
+    env::var_os("AppData").map(PathBuf::from)
 }
 
 /// Go's `os.UserConfigDir`, where the Go implementation keeps its host
@@ -146,7 +149,7 @@ fn config_dir() -> Option<PathBuf> {
 /// The path in the environment variable `k`, unless it's unset or empty.
 #[cfg(not(windows))]
 fn env_path(k: &str) -> Option<PathBuf> {
-    std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from)
+    env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// Returns the SSH host key, generating an ed25519 key on first use in
@@ -160,14 +163,14 @@ pub fn host_key() -> Result<PrivateKey> {
 /// A new key is written in full to a temporary file and then linked into
 /// place, so processes starting together all end up with the one that
 /// got there first, and none reads a partial key.
-fn load_or_create_key(path: &std::path::Path) -> Result<PrivateKey> {
+fn load_or_create_key(path: &Path) -> Result<PrivateKey> {
     // Replacing an empty file can't be made safe by linking alone, so
     // tailcat processes also take turns, by locking the directory.
-    with_dir_locked(path.parent().unwrap_or(std::path::Path::new(".")), || {
-        let pem = match std::fs::read_to_string(path) {
+    with_dir_locked(path.parent().unwrap_or(Path::new(".")), || {
+        let pem = match fs::read_to_string(path) {
             Ok(pem) if !pem.trim().is_empty() => pem,
             Ok(_) => install_new_key(path, true)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => install_new_key(path, false)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => install_new_key(path, false)?,
             Err(e) => return Err(e.into()),
         };
         russh::keys::decode_secret_key(&pem, None)
@@ -178,41 +181,42 @@ fn load_or_create_key(path: &std::path::Path) -> Result<PrivateKey> {
 /// Runs `f` holding an exclusive lock on the directory `dir`, waiting
 /// for other processes' turns first.
 #[cfg(unix)]
-fn with_dir_locked<T>(dir: &std::path::Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_dir_locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::io;
     use std::os::fd::AsRawFd;
-    let dir = std::fs::File::open(dir)?;
+    let dir = fs::File::open(dir)?;
     if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     f() // Unlocked when `dir` closes.
 }
 
 /// Runs `f`: directories can't be locked here.
 #[cfg(not(unix))]
-fn with_dir_locked<T>(_: &std::path::Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_dir_locked<T>(_: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     f()
 }
 
 /// Generates a key and puts it at `path`, replacing what's there only
 /// if `replace`, and returns the file's contents afterwards.
-fn install_new_key(path: &std::path::Path, replace: bool) -> Result<String> {
+fn install_new_key(path: &Path, replace: bool) -> Result<String> {
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", hex::encode(rand::random::<[u8; 8]>())));
     let r = write_private_file(&tmp, pkcs8_ed25519_pem(&seed).as_bytes()).and_then(|()| {
         if replace {
-            return Ok(std::fs::rename(&tmp, path)?);
+            return Ok(fs::rename(&tmp, path)?);
         }
-        match std::fs::hard_link(&tmp, path) {
+        match fs::hard_link(&tmp, path) {
             // Someone else's key got there first.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
             r => Ok(r?),
         }
     });
-    let _ = std::fs::remove_file(&tmp);
+    let _ = fs::remove_file(&tmp);
     r?;
-    Ok(std::fs::read_to_string(path)?)
+    Ok(fs::read_to_string(path)?)
 }
 
 /// Encodes an ed25519 seed as a PKCS#8 v1 PEM ("PRIVATE KEY").
@@ -225,9 +229,8 @@ fn pkcs8_ed25519_pem(seed: &[u8; 32]) -> String {
 
 /// Creates `path`, which must not exist, readable only by its owner, and
 /// syncs its contents to disk.
-fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut o = std::fs::OpenOptions::new();
+fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
+    let mut o = OpenOptions::new();
     o.write(true).create_new(true);
     owner_only(&mut o);
     let mut f = o.open(path)?;
@@ -238,13 +241,14 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
 
 /// Makes `o` create files readable and writable only by their owner.
 #[cfg(unix)]
-fn owner_only(o: &mut std::fs::OpenOptions) {
-    std::os::unix::fs::OpenOptionsExt::mode(o, 0o600);
+fn owner_only(o: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    o.mode(0o600);
 }
 
 /// Does nothing: files have no Unix mode here.
 #[cfg(not(unix))]
-fn owner_only(_: &mut std::fs::OpenOptions) {}
+fn owner_only(_: &mut OpenOptions) {}
 
 impl Shared {
     fn new(peer_lookup: PeerLookup, mut opts: SshOptions, key: PrivateKey) -> Result<Self> {
@@ -301,7 +305,7 @@ pub fn conn_handler_with_lookup(peer_lookup: PeerLookup, opts: SshOptions) -> Re
 
 /// Like [`conn_handler_with_lookup`], looking peers up on a server that
 /// may not have started yet (as when handlers are built before it).
-pub fn conn_handler(server: Arc<std::sync::OnceLock<Server>>, opts: SshOptions) -> Result<TcpHandler> {
+pub fn conn_handler(server: Arc<OnceLock<Server>>, opts: SshOptions) -> Result<TcpHandler> {
     conn_handler_with_lookup(Arc::new(move |a| server.get().and_then(|s| s.peer_key(a))), opts)
 }
 
@@ -343,8 +347,6 @@ pub fn utc_civil(secs: i64) -> [i64; 6] {
 #[cfg(test)]
 mod tests {
     use std::env::temp_dir;
-    use std::fs;
-    use std::path::Path;
     use std::sync::Barrier;
     use std::thread;
 
