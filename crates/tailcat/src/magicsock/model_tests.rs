@@ -166,14 +166,10 @@ impl Table {
         let ping = Message::Ping { tx_id: rand::random(), node_key, padding: 0 };
         self.deliver(&from, &ping, src, derp_src);
 
-        if let Some(k) = derp_src
-            && self.holds(&k, &from.public())
-        {
+        if let Some(k) = derp_src.filter(|k| self.holds(k, &from.public())) {
             assert_eq!(self.derp_seen(&k), Some(REGION), "a DERP ping from its holder was not attributed to it");
         }
-        if let (PathAddr::Udp(a), Some(k)) = (src, node_key)
-            && self.holds(&k, &from.public())
-        {
+        if let (PathAddr::Udp(a), Some(k)) = (src, node_key.filter(|k| self.holds(k, &from.public()))) {
             assert_eq!(self.mapped(&a), Some(k), "a UDP ping naming its holder was not attributed to it");
         }
     }
@@ -208,9 +204,7 @@ impl Table {
         let (src, derp_src) = self.draw_path(&tc);
         let endpoints = Self::draw_addrs(&tc);
         self.deliver(&from, &Message::CallMeMaybe { endpoints: endpoints.clone() }, src, derp_src);
-        if let Some(k) = derp_src
-            && self.holds(&k, &from.public())
-        {
+        if let Some(k) = derp_src.filter(|k| self.holds(k, &from.public())) {
             self.advertised.insert(k, endpoints);
         }
     }
