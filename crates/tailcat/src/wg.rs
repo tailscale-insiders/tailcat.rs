@@ -338,13 +338,12 @@ impl Engine {
     /// The peer with key `k`, else a new one if the `peer_config` hook
     /// has a configuration for it.
     fn peer_or_add(&self, k: NodePublic) -> Option<Arc<WgPeer>> {
-        let removals = {
-            let peers = self.peers.lock().unwrap();
-            if let Some(p) = peers.by_key.get(&k) {
-                return Some(p.clone());
-            }
-            peers.removals
-        };
+        let peers = self.peers.lock().unwrap();
+        if let Some(p) = peers.by_key.get(&k) {
+            return Some(p.clone());
+        }
+        let removals = peers.removals;
+        drop(peers);
         // The hook runs unlocked, since it may take a while. If the owner
         // adds the peer meanwhile, its configuration wins; if it removes
         // one, which may be this peer, the handshake is dropped (and
@@ -426,7 +425,8 @@ impl Engine {
 
     /// Stops the engine's background tasks.
     pub fn close(&self) {
-        for t in self.tasks.lock().unwrap().drain(..) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for t in tasks {
             t.abort();
         }
     }
