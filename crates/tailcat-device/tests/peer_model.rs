@@ -79,7 +79,7 @@ impl Mesh {
             arch: String::new(),
             run_id: tc.draw(gs::sampled_from(vec!["", "7", "8"])).into(),
             run_attempt: String::new(),
-            jwt: String::new(),
+            jwt: None,
         }
     }
 

@@ -69,7 +69,7 @@ impl GithubSource {
                 };
                 let rec = NodeRecord::from_json(&body);
                 if let Ok(r) = &rec
-                    && !r.jwt.is_empty()
+                    && r.jwt.is_some()
                     && self.verifier.is_none()
                 {
                     self.verifier = Some(Verifier::fetch().await?);

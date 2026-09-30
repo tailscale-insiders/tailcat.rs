@@ -83,7 +83,7 @@ fn record(k: u8, ip: u8, run: usize, index: u32, routes: &[&str]) -> NodeRecord 
         arch: String::new(),
         run_id: RUNS[run].0.into(),
         run_attempt: RUNS[run].1.into(),
-        jwt: String::new(),
+        jwt: None,
     }
 }
 

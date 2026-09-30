@@ -8,10 +8,29 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use tailcat::wg::IpNet;
 use tailcat::{DerpRegion, DiscoPublic, NodePrivate, NodePublic};
+
+/// A GitHub OIDC token, as its compact JWT text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Jwt(pub String);
+
+impl Jwt {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A record's OIDC token, if it carries one.
+pub type Token = Option<Jwt>;
+
+/// Reads a [`Token`], taking an empty one for none.
+fn token<'de, D: Deserializer<'de>>(d: D) -> Result<Token, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()).map(Jwt))
+}
 
 /// A mesh node's public record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,8 +68,8 @@ pub struct NodeRecord {
     pub run_attempt: String,
     /// A GitHub OIDC token binding `nodekey` to the repository, ref and
     /// run: its audience is [`audience_for`] of the node key.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub jwt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "token")]
+    pub jwt: Token,
 }
 
 fn is_zero(v: &i32) -> bool {
@@ -73,7 +92,7 @@ impl NodeRecord {
             arch: String::new(),
             run_id: String::new(),
             run_attempt: String::new(),
-            jwt: String::new(),
+            jwt: None,
         }
     }
 
@@ -291,6 +310,9 @@ mod tests {
         assert!(with("routes", json!(["10.0.0.0/8", "bogus"])).is_err(), "bad route");
         assert!(with("overlay_ip", "not-an-ip".into()).is_err());
         assert!(NodeRecord::from_json(b"{\"index\": 1").is_err(), "half-written");
+        // An empty token is no token.
+        assert_eq!(with("jwt", "".into()).unwrap().jwt, None);
+        assert_eq!(with("jwt", "a.b.c".into()).unwrap().jwt, Some(Jwt("a.b.c".into())));
     }
 
     #[test]

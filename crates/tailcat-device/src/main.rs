@@ -222,7 +222,7 @@ async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
         ..NodeRecord::new(a.index, &private, overlay_ip)
     };
     if a.oidc {
-        record.jwt = github::mint_oidc(&record::audience_for(&a.oidc_audience_prefix, &record.nodekey)).await?;
+        record.jwt = Some(github::mint_oidc(&record::audience_for(&a.oidc_audience_prefix, &record.nodekey)).await?);
     }
     let out = a.out.unwrap_or_else(|| format!("node-{}-{}.json", a.attempt, a.index).into());
     let k = DeviceKey { private, record };

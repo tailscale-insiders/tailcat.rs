@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::{IntoUrl, RequestBuilder, Response, Url};
 use serde::Deserialize;
 
-use crate::record::{NodeRecord, audience_for};
+use crate::record::{Jwt, NodeRecord, audience_for};
 
 /// GitHub's OIDC issuer.
 pub const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -195,7 +195,7 @@ pub async fn download(e: &GithubEnv, a: &Artifact) -> Result<Vec<u8>> {
 
 /// Mints a GitHub OIDC token for `audience`. The job needs
 /// `permissions: id-token: write`.
-pub async fn mint_oidc(audience: &str) -> Result<String> {
+pub async fn mint_oidc(audience: &str) -> Result<Jwt> {
     #[derive(Deserialize)]
     struct Resp {
         value: String,
@@ -207,7 +207,7 @@ pub async fn mint_oidc(audience: &str) -> Result<String> {
     let mut url = Url::parse(&url).context("parsing ACTIONS_ID_TOKEN_REQUEST_URL")?;
     url.query_pairs_mut().append_pair("audience", audience);
     let req = tailcat::shared_client().get(url).bearer_auth(tok).timeout(Duration::from_secs(15));
-    Ok(send(req, || "minting an OIDC token".into()).await?.json::<Resp>().await?.value)
+    Ok(Jwt(send(req, || "minting an OIDC token".into()).await?.json::<Resp>().await?.value))
 }
 
 /// The claims of a GitHub Actions OIDC token that admission checks.
@@ -294,12 +294,12 @@ pub fn admit(
             e.run_attempt
         );
     }
-    if r.jwt.is_empty() {
+    let Some(jwt) = &r.jwt else {
         ensure!(scope == Scope::Run, "record carries no OIDC token, required outside run scope");
         return Ok(());
-    }
+    };
     let v = verifier.ok_or_else(|| anyhow!("no OIDC verifier"))?;
-    let c = v.verify(&r.jwt, &audience_for(audience_prefix, &r.nodekey), published)?;
+    let c = v.verify(jwt.as_str(), &audience_for(audience_prefix, &r.nodekey), published)?;
     ensure!(
         e.repository_id.is_empty() || c.repository_id == e.repository_id,
         "token is for repository {}, not ours",
@@ -345,6 +345,7 @@ pub(crate) mod tests {
     use tailcat::NodePrivate;
 
     use super::*;
+    use crate::record::Token;
 
     pub const P: &str = "tailcat-device:";
 
@@ -380,11 +381,11 @@ pub(crate) mod tests {
     }
 
     /// `jwt`, with a byte of its signature changed.
-    fn tampered(jwt: &str) -> String {
-        let mut b = jwt.as_bytes().to_vec();
+    fn tampered(jwt: &Token) -> Token {
+        let mut b = jwt.as_ref().unwrap().as_str().as_bytes().to_vec();
         let i = b.len() - 10; // inside the signature
         b[i] = if b[i] == b'A' { b'B' } else { b'A' };
-        String::from_utf8(b).unwrap()
+        Some(Jwt(String::from_utf8(b).unwrap()))
     }
 
     #[test]
@@ -399,7 +400,7 @@ pub(crate) mod tests {
         assert!(admit(&claims_another, "100", Scope::Run).is_err(), "says it's from another run");
         assert!(admit(&rec("1"), "100", Scope::Branch).is_err(), "no token outside run scope");
         assert!(admit(&rec("1"), "100", Scope::Pr).is_err(), "no token outside run scope");
-        let tokened = NodeRecord { jwt: "x.y.z".into(), ..rec("1") };
+        let tokened = NodeRecord { jwt: Some(Jwt("x.y.z".into())), ..rec("1") };
         assert!(admit(&tokened, "100", Scope::Run).is_err(), "a token but no verifier");
     }
 
@@ -430,14 +431,14 @@ pub(crate) mod tests {
         }
 
         /// Signs `claims` over a valid default set for run 100 of repo 42.
-        pub fn sign(&self, kid: Option<&str>, claims: Value) -> String {
+        pub fn sign(&self, kid: Option<&str>, claims: Value) -> Token {
             let mut header = Header::new(Algorithm::RS256);
             header.kid = kid.map(Into::into);
             let defaults = json!({
                 "iss": OIDC_ISSUER, "exp": self.now + 600, "iat": self.now,
                 "repository_id": "42", "ref": "refs/heads/main", "run_id": "100", "run_attempt": "1",
             });
-            jsonwebtoken::encode(&header, &merged(defaults, claims), &self.enc).unwrap()
+            Some(Jwt(jsonwebtoken::encode(&header, &merged(defaults, claims), &self.enc).unwrap()))
         }
 
         /// A record for a fresh key with a token for it, plus `claims`.

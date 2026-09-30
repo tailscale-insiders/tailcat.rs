@@ -250,7 +250,7 @@ mod tests {
             arch: String::new(),
             run_id: format!("{}", 100 + run),
             run_attempt: "1".into(),
-            jwt: String::new(),
+            jwt: None,
         }
     }
 
