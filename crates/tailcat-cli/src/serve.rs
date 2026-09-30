@@ -17,15 +17,55 @@ use tracing::debug;
 use crate::perf::PORT as PERF_PORT;
 use crate::{Global, ServeFlags};
 
-/// The services `serve` knows by name.
-const SERVICES: &[&str] = &["all", "ssh", "no-auth-ssh", "files", "exec", "exit-node", "perf"];
+/// A service `serve` knows by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Service {
+    Ssh,
+    NoAuthSsh,
+    Files,
+    Exec,
+    ExitNode,
+    Perf,
+}
+
+impl Service {
+    const ALL: [Service; 6] =
+        [Service::Ssh, Service::NoAuthSsh, Service::Files, Service::Exec, Service::ExitNode, Service::Perf];
+
+    /// Its name in a serve spec.
+    pub fn name(self) -> &'static str {
+        match self {
+            Service::Ssh => "ssh",
+            Service::NoAuthSsh => "no-auth-ssh",
+            Service::Files => "files",
+            Service::Exec => "exec",
+            Service::ExitNode => "exit-node",
+            Service::Perf => "perf",
+        }
+    }
+
+    /// The service called `name`, if any.
+    pub fn named(name: &str) -> Option<Service> {
+        Service::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// Whether it's served over SSH.
+    fn needs_ssh(self) -> bool {
+        matches!(self, Service::Ssh | Service::NoAuthSsh | Service::Files)
+    }
+}
+
+/// The names a serve spec knows: "all", then the services'.
+fn known_names() -> String {
+    std::iter::once("all").chain(Service::ALL.map(Service::name)).collect::<Vec<_>>().join(", ")
+}
 
 /// A parsed serve spec.
 #[derive(Debug, Default, PartialEq)]
 pub struct PortSet {
     pub all: bool,
     pub ports: BTreeSet<u16>,
-    pub services: BTreeSet<String>,
+    pub services: BTreeSet<Service>,
     /// Mapped ports' targets, as dialable host:port.
     pub targets: BTreeMap<u16, String>,
 }
@@ -64,14 +104,15 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
         return Ok(ps);
     }
     for r in s.split(',').map(str::trim) {
-        match r {
-            "all" => ps.all = true,
-            "ssh" | "no-auth-ssh" | "files" if !cfg!(feature = "ssh") => {
+        if let Some(service) = Service::named(r) {
+            if service.needs_ssh() && !cfg!(feature = "ssh") {
                 bail!("SSH support not included in this build");
             }
-            _ if SERVICES.contains(&r) => {
-                ps.services.insert(r.to_string());
-            }
+            ps.services.insert(service);
+            continue;
+        }
+        match r {
+            "all" => ps.all = true,
             _ => {
                 if let Some((port, target)) = r.split_once(':') {
                     let (port, target) = parse_port_target(port, target)?;
@@ -87,7 +128,7 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
                 let (a, b) = match r.split_once('-') {
                     Some((a, b)) if is_num(a) && is_num(b) => (a, b),
                     _ if is_num(r) => (r, r),
-                    _ => bail!("{r:?} is not a known named service (want one of: {})", SERVICES.join(", ")),
+                    _ => bail!("{r:?} is not a known named service (want one of: {})", known_names()),
                 };
                 let lo: u16 = a.parse().map_err(|_| anyhow!("{a:?} is not a valid port"))?;
                 let hi: u16 = b.parse().map_err(|_| anyhow!("{b:?} is not a valid port number"))?;
@@ -184,25 +225,25 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         Some(a) if a.is_empty() => bail!("no command given after --"),
         Some(mut a) => {
             a[0] = which(&a[0]).with_context(|| format!("exec command: {:?} not found", a[0]))?;
-            if !services.contains("ssh") && !services.contains("no-auth-ssh") {
-                services.insert("exec".into());
+            if !services.contains(&Service::Ssh) && !services.contains(&Service::NoAuthSsh) {
+                services.insert(Service::Exec);
             }
             Some(a)
         }
-        None if services.contains("exec") => bail!("the 'exec' service requires a command after --"),
+        None if services.contains(&Service::Exec) => bail!("the 'exec' service requires a command after --"),
         None => None,
     };
     if flags.files.is_some() {
         if !cfg!(feature = "ssh") {
             bail!("--files requires SSH support, not included in this build");
         }
-        services.insert("files".into());
+        services.insert(Service::Files);
     }
-    let has = |s: &str| services.contains(s);
+    let has = |s: Service| services.contains(&s);
     let (ssh_auth, ssh_noauth, serve_perf, exit_node, serve_exec) =
-        (has("ssh"), has("no-auth-ssh"), has("perf"), has("exit-node"), has("exec"));
+        (has(Service::Ssh), has(Service::NoAuthSsh), has(Service::Perf), has(Service::ExitNode), has(Service::Exec));
     let ssh_shell = ssh_auth || ssh_noauth;
-    let ssh_services = ssh_shell || has("files");
+    let ssh_services = ssh_shell || has(Service::Files);
     if serve_perf && ps.contains(PERF_PORT) {
         bail!("port {PERF_PORT} is used by the 'perf' service and cannot also be proxied");
     }
@@ -218,7 +259,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     if flags.ssh_authorized_keys.is_some() && !ssh_auth {
         bail!("--ssh-authorized-keys requires the 'ssh' service");
     }
-    if ssh_shell && exec_args.is_some() && has("files") {
+    if ssh_shell && exec_args.is_some() && has(Service::Files) {
         bail!("the 'files' service cannot be served with an SSH -- command, which allows nothing but that command");
     }
     #[cfg(feature = "ssh")]
@@ -316,7 +357,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
             opts.exec = a.clone();
             eprintln!("# SSH sessions run only {}", a.join(" "));
         }
-        if has("files") {
+        if has(Service::Files) {
             let (fs, mode_name) = parse_files_flag(flags.files.as_deref().unwrap_or(""))?;
             eprintln!("# Serving files from {} ({mode_name})", fs.dir.display());
             opts.files = Some(fs);
@@ -601,7 +642,7 @@ mod tests {
     fn port_sets() {
         let ps = parse_port_set("22, 80,8000-8002,exec").unwrap();
         assert_eq!(ps.ports, BTreeSet::from([22, 80, 8000, 8001, 8002]));
-        assert!(ps.services.contains("exec"));
+        assert!(ps.services.contains(&Service::Exec));
 
         let ps = parse_port_set("5555:10.2.200.213:5555,8080:80,9:[fd7a::1]:22").unwrap();
         assert_eq!(ps.targets[&5555], "10.2.200.213:5555");
@@ -623,7 +664,7 @@ mod tests {
         assert!(ps.all);
         assert!(!ps.contains(0));
         assert!(ps.contains(65535));
-        assert_eq!(ps.services, BTreeSet::from(["perf".into()]));
+        assert_eq!(ps.services, BTreeSet::from([Service::Perf]));
         assert_eq!(ps.tcp_ranges([22]), [PortRange { first: 1, last: 65535 }]);
         let ps = parse_port_set("80,81").unwrap();
         assert_eq!(ps.tcp_ranges([22, 82, 22]), [PortRange::single(22), PortRange { first: 80, last: 82 }]);
