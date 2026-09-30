@@ -35,7 +35,7 @@ pub async fn dial_tls(n: &DerpNode) -> Result<TlsStream<TcpStream>> {
                 return connector
                     .connect(crate::tls::server_name(&host)?, tcp)
                     .await
-                    .map_err(|e| Error::Derp(format!("TLS handshake with {host}: {e}")));
+                    .map_err(|error| Error::Handshake { host: host.to_string(), error });
             }
             Ok(Err(e)) => err = format!("dial {a}: {e}"),
             Err(_) => err = format!("dial {a}: timeout"),
