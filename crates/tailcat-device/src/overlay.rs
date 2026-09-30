@@ -9,10 +9,10 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{io, iter};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
@@ -240,7 +240,7 @@ impl Overlay {
         // As if polled with every other peer, less any at its address.
         let others =
             st.peers.values().map(|p| &p.record).filter(|p| p.nodekey != r.nodekey && p.overlay_ip != r.overlay_ip);
-        let changes = reconcile(&self.me, &st.peers, std::iter::once(r).chain(others));
+        let changes = reconcile(&self.me, &st.peers, iter::once(r).chain(others));
         for c in changes {
             self.apply_locked(&mut st, c, dm);
         }
