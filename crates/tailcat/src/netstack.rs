@@ -313,9 +313,7 @@ impl State {
                 state if peer_closed(state) => {
                     self.ends.entry(h).or_insert(End::Fin);
                     // This segment's FIN closed the peer's side.
-                    if !peer_closed(before)
-                        && let Some(end) = fin_end
-                    {
+                    if let Some(end) = fin_end.filter(|_| !peer_closed(before)) {
                         self.fins.insert(h, end);
                     }
                 }
