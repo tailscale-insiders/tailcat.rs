@@ -510,7 +510,7 @@ async fn fetch_fresh(url: &str, mode: FetchMode, cache: &dyn DerpMapCache, stale
     if let Some((_, _, etag)) = stale.filter(|(_, _, etag)| !etag.is_empty()) {
         req = req.header("If-None-Match", etag.as_str());
     }
-    let res = req.send().await.map_err(|e| Error::other(format!("fetching {url}: {e}")))?;
+    let res = req.send().await?;
     if let Some((dm, data, etag)) = stale.filter(|_| res.status() == reqwest::StatusCode::NOT_MODIFIED) {
         cache.put(url, data, etag);
         return Ok(dm.clone());
@@ -519,7 +519,7 @@ async fn fetch_fresh(url: &str, mode: FetchMode, cache: &dyn DerpMapCache, stale
         return Err(Error::other(format!("fetching {url}: {}", res.status())));
     }
     let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let body = res.bytes().await.map_err(|e| Error::other(format!("reading {url}: {e}")))?;
+    let body = res.bytes().await?;
     if body.len() > 8 << 20 {
         return Err(Error::other(format!("DERP map from {url} is too large")));
     }

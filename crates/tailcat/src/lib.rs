@@ -112,6 +112,8 @@ pub enum Error {
     Certificate(#[from] rcgen::Error),
     #[error("task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    #[error("HTTP: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("base64 decode: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("CBOR unmarshal: {0}")]
