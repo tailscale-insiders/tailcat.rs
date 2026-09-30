@@ -233,7 +233,13 @@ enum Cmd {
 
 /// A usage error: printed with the command's help.
 #[derive(Debug)]
-pub struct UsageError(pub String);
+pub struct UsageError(String);
+
+impl UsageError {
+    pub fn new(msg: String) -> Self {
+        UsageError(msg)
+    }
+}
 
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -246,7 +252,7 @@ impl std::error::Error for UsageError {}
 /// Returns a usage error.
 #[macro_export]
 macro_rules! usagef {
-    ($($t:tt)*) => { anyhow::Error::new($crate::UsageError(format!($($t)*))) };
+    ($($t:tt)*) => { anyhow::Error::new($crate::UsageError::new(format!($($t)*))) };
 }
 
 /// The version: $TAILCAT_VERSION at build time, else the crate's.
