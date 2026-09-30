@@ -242,6 +242,30 @@ impl<'de> Deserialize<'de> for NodeIp {
     }
 }
 
+/// The address a node's STUN is tested at instead of its own, if any
+/// (for Tailscale's tests).
+pub type StunTestIp = Option<std::net::IpAddr>;
+
+/// Reads and writes a [`StunTestIp`] as the map does: the address, or
+/// the empty string for none. Text that isn't an address reads as none,
+/// rather than failing the whole map over a field only tests use.
+mod stun_test_ip {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::StunTestIp;
+
+    pub fn serialize<S: Serializer>(ip: &StunTestIp, s: S) -> Result<S::Ok, S::Error> {
+        match ip {
+            Some(ip) => s.collect_str(ip),
+            None => s.serialize_str(""),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<StunTestIp, D::Error> {
+        Ok(String::deserialize(d)?.parse().ok())
+    }
+}
+
 /// One DERP relay server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DerpNode {
@@ -265,8 +289,8 @@ pub struct DerpNode {
     pub derp_port: i32,
     #[serde(rename = "InsecureForTests", default, skip_serializing_if = "is_default")]
     pub insecure_for_tests: bool,
-    #[serde(rename = "STUNTestIP", default, skip_serializing_if = "is_default")]
-    pub stun_test_ip: String,
+    #[serde(rename = "STUNTestIP", default, skip_serializing_if = "Option::is_none", with = "stun_test_ip")]
+    pub stun_test_ip: StunTestIp,
     #[serde(rename = "CanPort80", default, skip_serializing_if = "is_default")]
     pub can_port_80: bool,
 }
@@ -513,6 +537,17 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn stun_test_ips() {
+        let parse = |json: &str| serde_json::from_str::<DerpNode>(json).unwrap().stun_test_ip;
+        assert_eq!(parse(r#"{"STUNTestIP":"192.0.2.9"}"#), Some("192.0.2.9".parse().unwrap()));
+        assert_eq!(parse(r#"{"STUNTestIP":""}"#), None);
+        assert_eq!(parse("{}"), None);
+        let n = DerpNode { stun_test_ip: parse(r#"{"STUNTestIP":"192.0.2.9"}"#), ..Default::default() };
+        assert!(serde_json::to_string(&n).unwrap().contains(r#""STUNTestIP":"192.0.2.9""#));
+        assert!(!serde_json::to_string(&DerpNode::default()).unwrap().contains("STUNTestIP"));
     }
 
     #[test]
