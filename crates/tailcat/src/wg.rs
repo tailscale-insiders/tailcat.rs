@@ -410,7 +410,10 @@ impl Engine {
         let peers: Vec<Arc<WgPeer>> = self.peers.lock().unwrap().by_key.values().cloned().collect();
         let mut buf = vec![0u8; 256];
         for p in peers {
-            if let TunnResult::WriteToNetwork(b) = p.tunn.lock().unwrap().update_timers(&mut buf) {
+            let mut tunn = p.tunn.lock().unwrap();
+            let res = tunn.update_timers(&mut buf);
+            drop(tunn);
+            if let TunnResult::WriteToNetwork(b) = res {
                 self.send(&p.key, b);
             }
         }
