@@ -159,6 +159,22 @@ pub struct ConnInfo {
 }
 
 impl ConnInfo {
+    /// The connection info for a node key with the given regions.
+    pub fn for_key(
+        private: &NodePrivate,
+        psk: PresharedKey,
+        region: impl IntoIterator<Item = DerpRegion>,
+        region_id: i32,
+    ) -> Self {
+        ConnInfo {
+            server_public: private.public(),
+            server_disco_public: private.disco_private().public(),
+            preshared_key: psk,
+            region: region.into_iter().collect(),
+            region_id,
+        }
+    }
+
     /// Serializes to a compact [`Addr`]. Region IDs, codes and names, and
     /// node names redundant with their hostname, are dropped to save
     /// space; [`Addr::parse`] restores them.
@@ -276,7 +292,7 @@ impl PrivateKey {
     /// but no DERP region (the caller populates it).
     pub fn generate() -> Self {
         let private = NodePrivate::generate();
-        let public = conn_info_for(&private, PresharedKey::generate(), Vec::new(), 0);
+        let public = ConnInfo::for_key(&private, PresharedKey::generate(), [], 0);
         PrivateKey { private, public }
     }
 
@@ -297,17 +313,6 @@ fn indented_json(v: &impl Serialize, indent: &[u8]) -> String {
     let fmt = serde_json::ser::PrettyFormatter::with_indent(indent);
     v.serialize(&mut serde_json::Serializer::with_formatter(&mut buf, fmt)).expect("JSON serializes");
     String::from_utf8(buf).expect("JSON is UTF-8")
-}
-
-/// Builds the connection info for a node key with the given regions.
-pub fn conn_info_for(private: &NodePrivate, psk: PresharedKey, region: Vec<DerpRegion>, region_id: i32) -> ConnInfo {
-    ConnInfo {
-        server_public: private.public(),
-        server_disco_public: private.disco_private().public(),
-        preshared_key: psk,
-        region,
-        region_id,
-    }
 }
 
 // ---------------------------------------------------------------------

@@ -512,7 +512,7 @@ impl Server {
 
     /// The connection info for this server, embedding the full region.
     pub fn conn_info(&self) -> ConnInfo {
-        crate::addr::conn_info_for(&self.inner.key, self.inner.psk, vec![self.inner.region.clone()], 0)
+        ConnInfo::for_key(&self.inner.key, self.inner.psk, [self.inner.region.clone()], 0)
     }
 
     /// The tailcat address clients use to connect. It embeds the full
