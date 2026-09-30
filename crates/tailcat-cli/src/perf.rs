@@ -697,7 +697,9 @@ impl Test {
         if let Some(e) = err {
             return Err(e);
         }
-        let mine = (self.tx.stats.lock().unwrap().clone(), self.rx.stats.lock().unwrap().clone());
+        let sent = self.tx.stats.lock().unwrap().clone();
+        let received = self.rx.stats.lock().unwrap().clone();
+        let mine = (sent, received);
         let peer = (self.peer_sent.get(), self.peer_received.get());
         let ((client_sent, client_received), (server_sent, server_received), rtt) =
             if self.is_server { (peer, mine, None) } else { (mine, peer, self.rtt.lock().unwrap().stats.clone()) };
