@@ -1160,7 +1160,7 @@ pub struct PerfArgs {
     /// Send this many bytes per stream instead of sending for --time, with an optional K, M, or G suffix
     /// (powers of 1000).
     #[arg(long)]
-    bytes: Option<String>,
+    bytes: Option<crate::args::ByteCount>,
     /// Number of parallel streams.
     #[arg(long, default_value_t = 1)]
     parallel: usize,
@@ -1170,7 +1170,7 @@ pub struct PerfArgs {
     /// Target bits per second per stream, with an optional K, M, or G suffix, or 0 for as fast as possible.
     /// If empty, as fast as possible for TCP and 1M for UDP.
     #[arg(long)]
-    bitrate: Option<String>,
+    bitrate: Option<crate::args::Bitrate>,
     /// How often to print progress; 0 disables progress lines.
     #[arg(long, default_value = "1s", value_parser = crate::util::parse_duration)]
     interval: Duration,
@@ -1182,21 +1182,6 @@ pub struct PerfArgs {
     #[arg(long)]
     via_derp: bool,
     addr: String,
-}
-
-/// Parses a number with an optional K, M, or G (powers of 1000) suffix.
-fn parse_si(s: &str) -> Result<i64> {
-    let (num, mult) = match s.char_indices().last() {
-        Some((i, 'k' | 'K')) => (&s[..i], 1e3),
-        Some((i, 'm' | 'M')) => (&s[..i], 1e6),
-        Some((i, 'g' | 'G')) => (&s[..i], 1e9),
-        _ => (s, 1.0),
-    };
-    let v: f64 = num.parse::<f64>()? * mult;
-    if !v.is_finite() || v > i64::MAX as f64 || v < i64::MIN as f64 {
-        bail!("out of range");
-    }
-    Ok(v as i64)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1295,13 +1280,12 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
         bitrate: if a.udp { 1_000_000 } else { 0 },
         interval: a.interval,
     };
-    if let Some(b) = &a.bytes {
-        p.bytes = parse_si(b).ok().filter(|n| *n > 0).ok_or_else(|| crate::usagef!("invalid --bytes value {b:?}"))?;
+    if let Some(b) = a.bytes {
+        p.bytes = b.0;
         p.duration = Duration::ZERO;
     }
-    if let Some(b) = &a.bitrate {
-        p.bitrate =
-            parse_si(b).ok().filter(|n| *n >= 0).ok_or_else(|| crate::usagef!("invalid --bitrate value {b:?}"))?;
+    if let Some(b) = a.bitrate {
+        p.bitrate = b.0;
     }
     if p.length == 0 {
         p.length = if a.udp { tailcat::MAX_UDP_PAYLOAD } else { DEFAULT_TCP_LENGTH };
@@ -1612,14 +1596,6 @@ mod tests {
         assert_eq!(fmt_si(2e15, "B"), "2000 TB");
         assert_eq!(fmt_rate(1_000_000, Duration::from_secs(8)), "1.00 Mbit/s");
         assert_eq!(fmt_rate(1, Duration::ZERO), "-");
-        assert_eq!(parse_si("10M").unwrap(), 10_000_000);
-        assert_eq!(parse_si("1.5G").unwrap(), 1_500_000_000);
-        assert_eq!(parse_si("2k").unwrap(), 2_000);
-        assert_eq!(parse_si("7").unwrap(), 7);
-        assert!(parse_si("x").is_err());
-        assert!(parse_si("").is_err());
-        assert!(parse_si("M").is_err());
-        assert!(parse_si("1e30G").is_err());
     }
 
     fn params() -> Params {

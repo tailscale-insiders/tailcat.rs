@@ -107,6 +107,44 @@ impl fmt::Display for SshTarget {
     }
 }
 
+/// A perf `--bytes` count: more than zero, with an optional K, M, or G
+/// suffix (powers of 1000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteCount(pub i64);
+
+impl FromStr for ByteCount {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        parse_si(s).filter(|n| *n > 0).map(ByteCount).ok_or_else(|| format!("invalid byte count {s:?}"))
+    }
+}
+
+/// A perf `--bitrate` in bits per second: zero for as fast as possible,
+/// or more, with an optional K, M, or G suffix (powers of 1000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bitrate(pub i64);
+
+impl FromStr for Bitrate {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        parse_si(s).filter(|n| *n >= 0).map(Bitrate).ok_or_else(|| format!("invalid bitrate {s:?}"))
+    }
+}
+
+/// Parses a number with an optional K, M, or G (powers of 1000) suffix.
+fn parse_si(s: &str) -> Option<i64> {
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 'k' | 'K')) => (&s[..i], 1e3),
+        Some((i, 'm' | 'M')) => (&s[..i], 1e6),
+        Some((i, 'g' | 'G')) => (&s[..i], 1e9),
+        _ => (s, 1.0),
+    };
+    let v = num.parse::<f64>().ok()? * mult;
+    (v.is_finite() && v <= i64::MAX as f64 && v >= i64::MIN as f64).then_some(v as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use tailcat::NodePrivate;
@@ -136,6 +174,21 @@ mod tests {
         for bad in ["0", "10.0.0.1:0", "host:22"] {
             assert!(target(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn si_numbers() {
+        assert_eq!(parse_si("10M"), Some(10_000_000));
+        assert_eq!(parse_si("1.5G"), Some(1_500_000_000));
+        assert_eq!(parse_si("2k"), Some(2_000));
+        assert_eq!(parse_si("7"), Some(7));
+        for bad in ["x", "", "M", "1e30G"] {
+            assert_eq!(parse_si(bad), None, "{bad:?}");
+        }
+        assert_eq!("1K".parse(), Ok(ByteCount(1000)));
+        assert!("0".parse::<ByteCount>().is_err(), "no bytes to send");
+        assert_eq!("0".parse(), Ok(Bitrate(0)));
+        assert!("-1".parse::<Bitrate>().is_err());
     }
 
     #[test]
