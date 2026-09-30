@@ -8,6 +8,9 @@
 //! the test ID, stream, flags, sequence number and send time.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, ErrorKind};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -338,29 +341,29 @@ impl Ctrl {
         Ctrl { rd: tokio::sync::Mutex::new(rd), wr: tokio::sync::Mutex::new(wr) }
     }
 
-    async fn send(&self, m: &Message) -> std::io::Result<()> {
+    async fn send(&self, m: &Message) -> io::Result<()> {
         let b = m.line();
         let mut w = self.wr.lock().await;
         w.write_all(&b).await?;
         w.flush().await
     }
 
-    async fn recv(&self) -> std::io::Result<Message> {
+    async fn recv(&self) -> io::Result<Message> {
         read_message(&mut *self.rd.lock().await).await
     }
 }
 
-async fn read_message<R: AsyncRead + Unpin>(br: &mut BufReader<R>) -> std::io::Result<Message> {
+async fn read_message<R: AsyncRead + Unpin>(br: &mut BufReader<R>) -> io::Result<Message> {
     let mut line = Vec::new();
     let n = br.take(CTRL_BUF_SIZE as u64).read_until(b'\n', &mut line).await?;
     if n == 0 {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
+        return Err(ErrorKind::UnexpectedEof.into());
     }
     if !line.ends_with(b"\n") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control line too long"));
+        return Err(io::Error::new(ErrorKind::InvalidData, "control line too long"));
     }
     serde_json::from_slice(&line)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad control message: {e}")))
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("bad control message: {e}")))
 }
 
 /// The sending half of a stream's connection.
@@ -639,7 +642,7 @@ impl Test {
         }
     }
 
-    async fn send_openers(&self) -> std::io::Result<()> {
+    async fn send_openers(&self) -> io::Result<()> {
         for (i, s) in self.streams.iter().enumerate() {
             let conn = match &*s.lock().unwrap() {
                 Some((SendSide::Udp(conn), _)) => conn.clone(),
@@ -920,7 +923,7 @@ impl Test {
 
     async fn recv_stream(&self, i: usize, side: RecvSide) -> RecvState {
         let mut st = RecvState::default();
-        let res: std::io::Result<()> = async {
+        let res: io::Result<()> = async {
             match side {
                 RecvSide::Tcp(mut rd) => {
                     let mut buf = vec![0u8; self.p.length.max(64 << 10)];
@@ -1068,7 +1071,7 @@ impl Server {
         }
     }
 
-    async fn run_test(&self, ctrl: Ctrl, hello: Message, remote: std::net::SocketAddr) {
+    async fn run_test(&self, ctrl: Ctrl, hello: Message, remote: SocketAddr) {
         let p = hello
             .params
             .ok_or_else(|| "hello without params".to_string())
@@ -1208,7 +1211,7 @@ impl PathInfo {
 struct PathJson {
     direct: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    endpoint: Option<std::net::SocketAddr>,
+    endpoint: Option<SocketAddr>,
     #[serde(rename = "derpRegion", skip_serializing_if = "Option::is_none")]
     derp_region: Option<String>,
     #[serde(with = "nanos")]
@@ -1225,8 +1228,8 @@ impl From<PathInfo> for PathJson {
     }
 }
 
-impl std::fmt::Display for PathInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PathInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let how = if self.direct() { "direct" } else { "relayed" };
         write!(f, "{how} via {}, rtt {}", self.via, fmt_rtt(self.rtt))
     }
