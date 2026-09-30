@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use std::{fmt, mem};
 
 use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::{Packet, Tunn, TunnResult};
@@ -52,16 +54,16 @@ impl IpNet {
     }
 }
 
-impl std::fmt::Display for IpNet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for IpNet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.prefix_len)
     }
 }
 
-impl std::str::FromStr for IpNet {
+impl FromStr for IpNet {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        let err = |e: &dyn std::fmt::Display| format!("{s}: {e}");
+        let err = |e: &dyn fmt::Display| format!("{s}: {e}");
         let (a, len) = s.split_once('/').map_or((s, None), |(a, l)| (a, Some(l)));
         let addr: IpAddr = a.parse().map_err(|e| err(&e))?;
         let prefix_len = len.map_or(Ok(bits(addr)), |l| l.parse().map_err(|e| err(&e)))?;
@@ -446,7 +448,7 @@ impl Engine {
 
     /// Stops the engine's background tasks.
     pub fn close(&self) {
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        let tasks = mem::take(&mut *self.tasks.lock().unwrap());
         for t in tasks {
             t.abort();
         }
