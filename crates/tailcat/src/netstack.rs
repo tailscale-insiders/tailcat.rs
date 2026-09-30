@@ -996,45 +996,73 @@ mod udp_model_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::pin::pin;
+    use std::sync::mpsc as std_mpsc;
+    use std::task::Waker;
+    use std::thread;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::runtime::Builder;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// How long to wait for anything that should happen.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn config(ip: IpAddr) -> StackConfig {
+        StackConfig { addrs: vec![ip], any_ip: false, mtu: 1280 }
+    }
+
+    /// Injects every packet `rx` gets into `stack`.
+    fn forward(mut rx: UnboundedReceiver<Vec<u8>>, stack: Stack) {
+        tokio::spawn(async move {
+            while let Some(p) = rx.recv().await {
+                stack.inject(p);
+            }
+        });
+    }
+
+    /// Two stacks wired to each other, `b` answering with the policies.
     fn back_to_back(
         a_ip: IpAddr,
         b_ip: IpAddr,
         tcp_policy: Option<TcpPolicy>,
         udp_policy: Option<UdpPolicy>,
     ) -> (Stack, Stack) {
-        let (to_b_tx, mut to_b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (to_a_tx, mut to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let b = Stack::new(
-            StackConfig { addrs: vec![b_ip], any_ip: false, mtu: 1280 },
-            Arc::new(move |p| {
-                let _ = to_a_tx.send(p);
-            }),
-            tcp_policy,
-            udp_policy,
-        );
-        let a = Stack::new(
-            StackConfig { addrs: vec![a_ip], any_ip: false, mtu: 1280 },
-            Arc::new(move |p| {
-                let _ = to_b_tx.send(p);
-            }),
-            None,
-            None,
-        );
-        let (a2, b2) = (a.clone(), b.clone());
-        tokio::spawn(async move {
-            while let Some(p) = to_b_rx.recv().await {
-                b2.inject(p);
-            }
+        let (to_b_tx, to_b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (to_a_tx, to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let to_a = Arc::new(move |p: Vec<u8>| {
+            let _ = to_a_tx.send(p);
         });
-        tokio::spawn(async move {
-            while let Some(p) = to_a_rx.recv().await {
-                a2.inject(p);
-            }
+        let to_b = Arc::new(move |p: Vec<u8>| {
+            let _ = to_b_tx.send(p);
         });
+        let b = Stack::new(config(b_ip), to_a, tcp_policy, udp_policy);
+        let a = Stack::new(config(a_ip), to_b, None, None);
+        forward(to_b_rx, b.clone());
+        forward(to_a_rx, a.clone());
         (a, b)
+    }
+
+    /// Port 80 answers with "got: " and everything the client sent; SYNs
+    /// to port 82 are dropped, and to other ports reset.
+    fn tcp_policy() -> TcpPolicy {
+        Arc::new(|_src, dst| match dst.port() {
+            80 => TcpDecision::Accept(Box::new(|mut s: TcpStream| {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).await.unwrap();
+                    s.write_all(b"got: ").await.unwrap();
+                    s.write_all(&buf).await.unwrap();
+                    s.shutdown().await.unwrap();
+                    s.drain(WAIT).await;
+                });
+            })),
+            82 => TcpDecision::Drop,
+            _ => TcpDecision::Reset,
+        })
     }
 
     fn udp_echo() -> UdpPolicy {
@@ -1050,29 +1078,30 @@ mod tests {
         })
     }
 
+    /// Receives on `u`, failing the test if nothing comes within `WAIT`.
+    async fn recv(u: &UdpConn, buf: &mut [u8]) -> io::Result<usize> {
+        timeout(WAIT, u.recv(buf)).await.expect("recv timed out")
+    }
+
+    /// Polls `f` once, without a waker to wake.
+    fn poll_once<F: Future>(f: F) -> Poll<F::Output> {
+        pin!(f).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    fn error_kind<T>(r: io::Result<T>) -> Result<(), io::ErrorKind> {
+        r.map(drop).map_err(|e| e.kind())
+    }
+
     /// Two stacks wired back to back: a client dials a server.
     #[tokio::test]
     async fn tcp_and_udp_between_two_stacks() {
         let a_ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
         let b_ip: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
-        let tcp_policy: TcpPolicy = Arc::new(|_src, dst| match dst.port() {
-            80 => TcpDecision::Accept(Box::new(|mut s: TcpStream| {
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    s.read_to_end(&mut buf).await.unwrap();
-                    s.write_all(b"got: ").await.unwrap();
-                    s.write_all(&buf).await.unwrap();
-                    s.shutdown().await.unwrap();
-                    s.drain(Duration::from_secs(5)).await;
-                });
-            })),
-            82 => TcpDecision::Drop,
-            _ => TcpDecision::Reset,
-        });
-        let (a, _b) = back_to_back(a_ip, b_ip, Some(tcp_policy), Some(udp_echo()));
+        let b_port = |port| SocketAddr::new(b_ip, port);
+        let (a, _b) = back_to_back(a_ip, b_ip, Some(tcp_policy()), Some(udp_echo()));
 
-        let mut c = a.dial_tcp(a_ip, SocketAddr::new(b_ip, 80)).await.unwrap();
-        assert_eq!(c.peer_addr(), SocketAddr::new(b_ip, 80));
+        let mut c = a.dial_tcp(a_ip, b_port(80)).await.unwrap();
+        assert_eq!(c.peer_addr(), b_port(80));
         assert_eq!(c.local_addr().ip(), a_ip);
         let big = vec![b'x'; 300_000];
         c.write_all(&big).await.unwrap();
@@ -1082,20 +1111,21 @@ mod tests {
         assert_eq!(got.len(), 5 + big.len());
         assert!(got.starts_with(b"got: x"));
 
-        let refused = a.dial_tcp(a_ip, SocketAddr::new(b_ip, 81)).await;
+        let refused = a.dial_tcp(a_ip, b_port(81)).await;
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
 
         // A dropped SYN gets no answer at all.
-        let dropped = tokio::time::timeout(Duration::from_millis(500), a.dial_tcp(a_ip, SocketAddr::new(b_ip, 82)));
-        assert!(dropped.await.is_err(), "dropped SYN was answered");
+        let dropped = timeout(Duration::from_millis(500), a.dial_tcp(a_ip, b_port(82))).await;
+        assert!(dropped.is_err(), "dropped SYN was answered");
 
-        let u = a.dial_udp(a_ip, SocketAddr::new(b_ip, 53)).unwrap();
+        let u = a.dial_udp(a_ip, b_port(53)).unwrap();
         u.send(b"ping").await.unwrap();
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(5), u.recv(&mut buf)).await.unwrap().unwrap();
+        let n = recv(&u, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping");
+
         drop(c);
-        assert!(a.drain_tcp(Duration::from_secs(5)).await);
+        assert!(a.drain_tcp(WAIT).await);
     }
 
     #[tokio::test]
@@ -1104,19 +1134,22 @@ mod tests {
         let b_ip: IpAddr = "100.64.0.2".parse().unwrap();
         let (a, _b) = back_to_back(a_ip, b_ip, None, Some(udp_echo()));
         let u = a.dial_udp(a_ip, SocketAddr::new(b_ip, 7)).unwrap();
+
         u.send(b"v4").await.unwrap();
         let mut buf = [0u8; 1];
+        let n = recv(&u, &mut buf).await.unwrap();
         // Datagrams too big for the buffer are truncated.
-        let n = tokio::time::timeout(Duration::from_secs(5), u.recv(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[..n], b"v");
 
         u.set_idle_timeout(Some(Duration::from_millis(100)));
-        let err = tokio::time::timeout(Duration::from_secs(5), u.recv(&mut buf)).await.unwrap().unwrap_err();
+        let err = recv(&u, &mut buf).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(u.send(b"late").await.unwrap_err().kind(), io::ErrorKind::NotConnected);
+        let late = u.send(b"late").await;
+        assert_eq!(late.unwrap_err().kind(), io::ErrorKind::NotConnected);
 
         let mixed = a.dial_udp(a_ip, "[::1]:7".parse().unwrap()).unwrap();
-        assert_eq!(mixed.send(b"x").await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let sent = mixed.send(b"x").await;
+        assert_eq!(sent.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     /// With every ephemeral port on the address taken, dials fail instead
@@ -1124,24 +1157,27 @@ mod tests {
     /// that's freed is used again.
     #[test]
     fn dials_fail_when_ports_run_out() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
         let ip: IpAddr = "100.64.0.1".parse().unwrap();
         let remote: SocketAddr = "100.64.0.2:7".parse().unwrap();
-        let stack = Stack::new(StackConfig { addrs: vec![ip], any_ip: false, mtu: 1280 }, Arc::new(|_| {}), None, None);
+        let stack = Stack::new(config(ip), Arc::new(|_| {}), None, None);
         let (tx, _rx) = mpsc::channel(1);
-        let mut st = stack.shared.lock();
-        for p in EPHEMERAL {
-            st.udp.insert((SocketAddr::new(ip, p), remote), tx.clone());
+        let flow = |port| (SocketAddr::new(ip, port), remote);
+        {
+            let mut st = stack.shared.lock();
+            for port in EPHEMERAL {
+                st.udp.insert(flow(port), tx.clone());
+            }
         }
-        drop(st);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        // On another thread, so a dial that never returns fails the test.
+        let (done_tx, done_rx) = std_mpsc::channel();
         let s = stack.clone();
-        std::thread::spawn(move || {
-            let udp = s.dial_udp(ip, remote).map(drop).map_err(|e| e.kind());
-            let mut dial = std::pin::pin!(s.dial_tcp(ip, remote));
-            let tcp = match dial.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())) {
-                Poll::Ready(r) => r.map(drop).map_err(|e| e.kind()),
+        thread::spawn(move || {
+            let udp = error_kind(s.dial_udp(ip, remote));
+            let tcp = match poll_once(s.dial_tcp(ip, remote)) {
+                Poll::Ready(r) => error_kind(r),
                 Poll::Pending => Ok(()),
             };
             let _ = done_tx.send((udp, tcp));
@@ -1150,30 +1186,39 @@ mod tests {
         let unavailable = Err(io::ErrorKind::AddrNotAvailable);
         assert_eq!(got, (unavailable, unavailable));
 
-        stack.shared.lock().udp.remove(&(SocketAddr::new(ip, 40000), remote));
-        assert_eq!(stack.dial_udp(ip, remote).unwrap().local_addr().port(), 40000);
+        stack.shared.lock().udp.remove(&flow(40000));
+        let redialed = stack.dial_udp(ip, remote).unwrap();
+        assert_eq!(redialed.local_addr().port(), 40000);
+    }
+
+    /// Checks `pkt`'s IP header, and returns its length and addresses.
+    fn parse_ip(pkt: &[u8], v4: bool) -> (usize, IpAddress, IpAddress) {
+        if v4 {
+            let ip = Ipv4Packet::new_checked(pkt).unwrap();
+            assert!(ip.verify_checksum());
+            (ip.header_len() as usize, ip.src_addr().into(), ip.dst_addr().into())
+        } else {
+            let ip = Ipv6Packet::new_checked(pkt).unwrap();
+            (40, ip.src_addr().into(), ip.dst_addr().into())
+        }
     }
 
     #[test]
     fn build_udp_checksums() {
+        let caps = ChecksumCapabilities::default();
         for (src, dst) in [("10.0.0.1:1000", "10.0.0.2:2000"), ("[fd00::1]:1000", "[fd00::2]:2000")] {
             let (src, dst): (SocketAddr, SocketAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+
             let pkt = build_udp(src, dst, b"payload").unwrap();
-            let caps = ChecksumCapabilities::default();
-            let (ip_len, s, d) = if src.is_ipv4() {
-                let ip = Ipv4Packet::new_checked(&pkt[..]).unwrap();
-                assert!(ip.verify_checksum());
-                (ip.header_len() as usize, ip.src_addr().into(), ip.dst_addr().into())
-            } else {
-                let ip = Ipv6Packet::new_checked(&pkt[..]).unwrap();
-                (40, ip.src_addr().into(), ip.dst_addr().into())
-            };
+
+            let (ip_len, s, d) = parse_ip(&pkt, src.is_ipv4());
             assert_eq!((IpAddr::from(s), IpAddr::from(d)), (src.ip(), dst.ip()));
             let udp = UdpPacket::new_checked(&pkt[ip_len..]).unwrap();
             let repr = UdpRepr::parse(&udp, &s, &d, &caps).unwrap();
             assert_eq!((repr.src_port, repr.dst_port), (1000, 2000));
             assert_eq!(udp.payload(), b"payload");
         }
-        assert!(build_udp("10.0.0.1:1".parse().unwrap(), "[::1]:1".parse().unwrap(), b"").is_none());
+        let mixed = build_udp("10.0.0.1:1".parse().unwrap(), "[::1]:1".parse().unwrap(), b"");
+        assert!(mixed.is_none());
     }
 }

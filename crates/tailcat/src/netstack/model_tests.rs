@@ -5,11 +5,14 @@
 //! it, and what that peer sent.
 
 use std::collections::HashSet;
+use std::mem;
 use std::task::Waker;
 
 use hegel::TestCase;
 use hegel::generators as gs;
 use smoltcp::wire::{TcpControl, TcpRepr, TcpSeqNumber};
+use tokio::runtime::{Builder, Runtime};
+use tokio::task::yield_now;
 
 use super::*;
 
@@ -28,6 +31,16 @@ fn denied_ip() -> IpAddr {
 fn remotes() -> [SocketAddr; 3] {
     let allowed: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
     [SocketAddr::new(allowed, 1000), SocketAddr::new(allowed, 1001), SocketAddr::new(denied_ip(), 1000)]
+}
+
+/// One of `items`, drawn by `tc`.
+fn pick<T: Copy>(tc: &TestCase, items: &[T]) -> T {
+    items[tc.draw(gs::integers::<usize>().max_value(items.len() - 1))]
+}
+
+/// Takes everything out of `v`.
+fn take<T>(v: &Mutex<Vec<T>>) -> Vec<T> {
+    mem::take(&mut *v.lock().unwrap())
 }
 
 /// A raw TCP segment.
@@ -87,6 +100,23 @@ struct Conn {
 }
 
 impl Conn {
+    fn new(remote: SocketAddr, port: u16, isn: TcpSeqNumber) -> Conn {
+        Conn {
+            remote,
+            port,
+            isn,
+            server_isn: None,
+            server_fin: false,
+            established: false,
+            sent: Vec::new(),
+            fin: false,
+            reset: false,
+            stream: None,
+            received: Vec::new(),
+            end: None,
+        }
+    }
+
     /// The sequence number of the remote's next segment.
     fn seq(&self) -> TcpSeqNumber {
         self.isn + 1 + self.sent.len() + usize::from(self.fin)
@@ -119,7 +149,7 @@ impl Conn {
 }
 
 struct Net {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     stack: Stack,
     out: Arc<Mutex<Vec<Vec<u8>>>>,
     /// Handed-off connections, with the remote the policy decided on.
@@ -133,7 +163,7 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
         let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let accepted: Arc<Mutex<Vec<(SocketAddr, TcpStream)>>> = Arc::default();
@@ -166,44 +196,51 @@ impl Net {
     fn settle(&mut self) {
         self.rt.block_on(async {
             for _ in 0..16 {
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         });
-        for p in std::mem::take(&mut *self.out.lock().unwrap()) {
-            let ip = Ipv6Packet::new_checked(&p[..]).unwrap();
-            let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else { continue };
-            let key = (SocketAddr::new(IpAddr::from(ip.dst_addr()), tcp.dst_port()), tcp.src_port());
-            if tcp.rst() {
-                self.live.remove(&key);
-                continue;
-            }
-            let Some(c) = self.live.get(&key).map(|&i| &mut self.conns[i]) else { continue };
-            if tcp.syn() && tcp.ack() {
-                c.server_isn = Some(tcp.seq_number());
-            }
-            if tcp.fin() {
-                c.server_fin = true;
-            }
+        for p in take(&self.out) {
+            self.apply_reply(&p);
         }
-        for (decided_for, s) in std::mem::take(&mut *self.accepted.lock().unwrap()) {
-            // The latest attempt on the flow the policy decided on.
-            let port = s.local_addr().port();
-            let c = self
-                .conns
-                .iter_mut()
-                .rev()
-                .find(|c| (c.remote, c.port) == (decided_for, port))
-                .unwrap_or_else(|| panic!("{s:?} was accepted for {decided_for}, which never connected"));
-            assert!(c.stream.is_none() && c.end.is_none(), "{decided_for} -> {port} was accepted twice");
-            c.stream = Some(s);
+        for (decided_for, s) in take(&self.accepted) {
+            self.hand_off(decided_for, s);
         }
         self.conns.iter_mut().for_each(Conn::read);
     }
 
+    /// Applies a segment the stack sent to the remote's state.
+    fn apply_reply(&mut self, p: &[u8]) {
+        let ip = Ipv6Packet::new_checked(p).unwrap();
+        let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else { return };
+        let key = (SocketAddr::new(IpAddr::from(ip.dst_addr()), tcp.dst_port()), tcp.src_port());
+        if tcp.rst() {
+            self.live.remove(&key);
+            return;
+        }
+        let Some(&i) = self.live.get(&key) else { return };
+        let c = &mut self.conns[i];
+        if tcp.syn() && tcp.ack() {
+            c.server_isn = Some(tcp.seq_number());
+        }
+        c.server_fin |= tcp.fin();
+    }
+
+    /// Gives a connection the handler got to the latest attempt on the
+    /// flow the policy decided on.
+    fn hand_off(&mut self, decided_for: SocketAddr, s: TcpStream) {
+        let port = s.local_addr().port();
+        let c = self
+            .conns
+            .iter_mut()
+            .rev()
+            .find(|c| (c.remote, c.port) == (decided_for, port))
+            .unwrap_or_else(|| panic!("{s:?} was accepted for {decided_for}, which never connected"));
+        assert!(c.stream.is_none() && c.end.is_none(), "{decided_for} -> {port} was accepted twice");
+        c.stream = Some(s);
+    }
+
     fn draw_flow(&self, tc: &TestCase) -> (SocketAddr, u16) {
-        let r = remotes()[tc.draw(gs::integers::<usize>().max_value(remotes().len() - 1))];
-        let port = PORTS[tc.draw(gs::integers::<usize>().max_value(PORTS.len() - 1))];
-        (r, port)
+        (pick(tc, &remotes()), pick(tc, &PORTS))
     }
 
     fn live(&self, flow: (SocketAddr, u16)) -> Option<&Conn> {
@@ -212,30 +249,20 @@ impl Net {
 
     /// Sends a SYN from `r` to `port`: a new attempt, or a retransmit.
     fn syn(&mut self, r: SocketAddr, port: u16) {
-        let i = match self.live.get(&(r, port)) {
-            Some(&i) => i,
-            None => {
-                self.next_isn += 1000;
-                self.conns.push(Conn {
-                    remote: r,
-                    port,
-                    isn: TcpSeqNumber(self.next_isn),
-                    server_isn: None,
-                    server_fin: false,
-                    established: false,
-                    sent: Vec::new(),
-                    fin: false,
-                    reset: false,
-                    stream: None,
-                    received: Vec::new(),
-                    end: None,
-                });
-                self.live.insert((r, port), self.conns.len() - 1);
-                self.conns.len() - 1
-            }
-        };
-        let c = &self.conns[i];
+        if !self.live.contains_key(&(r, port)) {
+            self.next_isn += 1000;
+            self.conns.push(Conn::new(r, port, TcpSeqNumber(self.next_isn)));
+            self.live.insert((r, port), self.conns.len() - 1);
+        }
+        let c = &self.conns[self.live[&(r, port)]];
         self.send(segment(r, c.local(), TcpControl::Syn, c.isn, None, &[]));
+    }
+
+    /// Sends a SYN from `r` to `port`, then the ACK completing the
+    /// handshake.
+    fn connect(&mut self, r: SocketAddr, port: u16) {
+        self.syn(r, port);
+        self.ack((r, port), TcpControl::None, &[]);
     }
 
     /// Sends an ACK (completing the handshake, the first time), with a
@@ -316,8 +343,7 @@ impl Net {
         if held.is_empty() {
             return;
         }
-        let i = held[tc.draw(gs::integers::<usize>().max_value(held.len() - 1))];
-        self.conns[i].stream = None;
+        self.conns[pick(&tc, &held)].stream = None;
         self.settle();
     }
 
@@ -377,7 +403,8 @@ impl Net {
     #[invariant(always_run)]
     fn sockets_are_reaped(&self, _: TestCase) {
         let st = self.stack.shared.lock();
-        let held: HashSet<SocketHandle> = self.conns.iter().filter_map(|c| Some(c.stream.as_ref()?.handle)).collect();
+        let held: HashSet<SocketHandle> =
+            self.conns.iter().filter_map(|c| c.stream.as_ref()).map(|s| s.handle).collect();
         let live: HashSet<SocketHandle> = st.sockets.iter().map(|(h, _)| h).collect();
         for (h, s) in st.sockets.iter() {
             let flows: Vec<_> = st.tuples.iter().filter(|&(_, &v)| v == h).map(|(k, _)| k).collect();
@@ -413,11 +440,11 @@ fn refused_peer_cannot_take_over_a_listening_socket() {
     let [a, _, bad] = remotes();
     net.syn(a, 80);
     net.rst((a, 80));
-    net.syn(bad, 80);
-    net.ack((bad, 80), TcpControl::None, &[]);
-    let accepted: Vec<_> =
-        net.conns.iter().filter_map(|c| Some((c.remote, actual_remote(c.stream.as_ref()?)))).collect();
-    assert!(accepted.iter().all(|(_, actual)| *actual != Some(bad)), "refused peer {bad} was accepted: {accepted:?}");
+
+    net.connect(bad, 80);
+
+    let accepted: Vec<SocketAddr> = net.conns.iter().filter_map(|c| actual_remote(c.stream.as_ref()?)).collect();
+    assert!(!accepted.contains(&bad), "refused peer {bad} was accepted: {accepted:?}");
 }
 
 /// A connection the peer resets must not read as a clean end of stream:
@@ -428,15 +455,15 @@ fn reset_is_not_eof() {
     let mut net = Net::new();
     let [a, b, _] = remotes();
     for r in [a, b] {
-        net.syn(r, 80);
-        net.ack((r, 80), TcpControl::None, &[]);
+        net.connect(r, 80);
         net.ack((r, 80), TcpControl::Psh, b"partial");
     }
+
     net.rst((a, 80));
     net.ack((b, 80), TcpControl::Fin, &[]);
+
     let ends: Vec<_> = net.conns.iter().map(|c| (c.remote, c.received.clone(), c.end)).collect();
-    assert_eq!(
-        ends,
-        [(a, b"partial".to_vec(), Some(Err(io::ErrorKind::ConnectionReset))), (b, b"partial".to_vec(), Some(Ok(()))),]
-    );
+    let partial = b"partial".to_vec();
+    let reset = Some(Err(io::ErrorKind::ConnectionReset));
+    assert_eq!(ends, [(a, partial.clone(), reset), (b, partial, Some(Ok(())))]);
 }

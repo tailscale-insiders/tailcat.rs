@@ -8,9 +8,12 @@
 //! open.
 
 use std::collections::HashSet;
+use std::mem;
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use tokio::runtime::{Builder, Runtime};
+use tokio::time::timeout;
 
 use super::*;
 
@@ -31,6 +34,16 @@ fn denied_ip() -> IpAddr {
 fn remotes() -> [SocketAddr; 3] {
     let allowed: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
     [SocketAddr::new(allowed, 1000), SocketAddr::new(allowed, 1001), SocketAddr::new(denied_ip(), 1000)]
+}
+
+/// One of `items`, drawn by `tc`.
+fn pick<T: Copy>(tc: &TestCase, items: &[T]) -> T {
+    items[tc.draw(gs::integers::<usize>().max_value(items.len() - 1))]
+}
+
+/// Takes everything out of `v`.
+fn take<T>(v: &Mutex<Vec<T>>) -> Vec<T> {
+    mem::take(&mut *v.lock().unwrap())
 }
 
 /// Something that happens while the policy decides on a new flow.
@@ -62,7 +75,7 @@ type Accepted = Arc<Mutex<Vec<(FlowKey, UdpConn)>>>;
 type Hook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 struct Net {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     stack: Stack,
     out: Arc<Mutex<Vec<Vec<u8>>>>,
     /// Conns the policy's handlers were given, with the flow the policy
@@ -81,7 +94,7 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
         let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let accepted: Accepted = Arc::default();
@@ -127,16 +140,16 @@ impl Net {
     /// ports, or one we've had before, dialed or not.
     fn draw_key(&self, tc: &TestCase) -> FlowKey {
         if !self.flows.is_empty() && tc.draw(gs::booleans()) {
-            let f = &self.flows[tc.draw(gs::integers::<usize>().max_value(self.flows.len() - 1))];
-            return (f.local, f.remote);
+            let keys: Vec<FlowKey> = self.flows.iter().map(|f| (f.local, f.remote)).collect();
+            return pick(tc, &keys);
         }
-        let r = remotes()[tc.draw(gs::integers::<usize>().max_value(remotes().len() - 1))];
-        let port = PORTS[tc.draw(gs::integers::<usize>().max_value(PORTS.len() - 1))];
+        let r = pick(tc, &remotes());
+        let port = pick(tc, &PORTS);
         (SocketAddr::new(local_ip(), port), r)
     }
 
     fn draw_remote(tc: &TestCase) -> SocketAddr {
-        remotes()[tc.draw(gs::integers::<usize>().max_value(remotes().len() - 1))]
+        pick(tc, &remotes())
     }
 
     /// One of the flows whose conn a handler still holds.
@@ -145,7 +158,7 @@ impl Net {
         if held.is_empty() {
             return None;
         }
-        Some(held[tc.draw(gs::integers::<usize>().max_value(held.len() - 1))])
+        Some(pick(tc, &held))
     }
 
     /// Takes flow `i` out of the flow table, if it's the one there.
@@ -218,7 +231,7 @@ impl Net {
         }
         self.expect_inbound(key, data, &mut new);
 
-        let accepted = std::mem::take(&mut *self.accepted.lock().unwrap());
+        let accepted = take(&self.accepted);
         let got: Vec<FlowKey> = accepted.iter().map(|(k, _)| *k).collect();
         let want: Vec<FlowKey> = new.iter().map(|&i| (self.flows[i].local, self.flows[i].remote)).collect();
         assert_eq!(got, want, "handlers were given the wrong flows (race {race:?})");
@@ -248,7 +261,7 @@ impl Net {
         let c = self.flows[i].conn.as_ref().unwrap();
         let got = self.rt.block_on(async {
             let mut buf = [0u8; 64];
-            let r = tokio::time::timeout(Duration::from_millis(1), c.recv(&mut buf)).await.ok()?;
+            let r = timeout(Duration::from_millis(1), c.recv(&mut buf)).await.ok()?;
             Some(r.map(|n| buf[..n].to_vec()).map_err(|e| e.kind()))
         });
         let f = &mut self.flows[i];
@@ -291,7 +304,7 @@ impl Net {
         let r = self.rt.block_on(c.send(&data)).map_err(|e| e.kind());
         let f = &mut self.flows[i];
         let flow = format!("{} -> {}", f.local, f.remote);
-        let sent = std::mem::take(&mut *self.out.lock().unwrap());
+        let sent = take(&self.out);
         if f.closed || self.closed {
             assert_eq!(r, Err(io::ErrorKind::NotConnected), "{flow}: sent on a closed flow");
             assert!(sent.is_empty(), "{flow}: a closed flow sent {sent:?}");
@@ -376,9 +389,8 @@ impl Net {
     fn table_routes_open_flows(&self, _: TestCase) {
         // Not holding the lock: a panic would poison it for the conns'
         // drops.
-        let table: HashSet<FlowKey> = self.stack.shared.lock().udp.keys().copied().collect();
         let open: HashSet<FlowKey> = self.open.keys().copied().collect();
-        assert_eq!(table, open, "the flow table is wrong");
+        assert_eq!(table(self), open, "the flow table is wrong");
         for &i in self.open.values() {
             let f = &self.flows[i];
             let c = f.conn.as_ref().expect("an open flow's conn was dropped");
@@ -409,14 +421,17 @@ fn port_53(remote: SocketAddr) -> FlowKey {
 #[test]
 fn closing_again_leaves_a_new_flow_alone() {
     let mut net = Net::new();
-    let key = port_53(remotes()[0]);
+    let [a, _, _] = remotes();
+    let key = port_53(a);
     net.inbound(key, None);
     net.recv(0);
     net.idle(0);
     net.recv(0);
     assert!(net.flows[0].closed, "the flow didn't time out");
     net.inbound(key, None);
+
     net.flows[0].conn = None;
+
     assert_eq!(table(&net), HashSet::from([key]), "dropping the idle flow closed the new one");
     net.inbound(key, None);
     net.recv(1);
@@ -429,10 +444,14 @@ fn closing_again_leaves_a_new_flow_alone() {
 #[test]
 fn nothing_opens_after_the_stack_closes() {
     let mut net = Net::new();
-    net.inbound(port_53(remotes()[0]), Some(Race::Close));
-    net.inbound(port_53(remotes()[1]), None);
-    net.dial(remotes()[0]);
-    assert!(net.flows.is_empty() && table(&net).is_empty(), "flows opened on a closed stack");
+    let [a, b, _] = remotes();
+
+    net.inbound(port_53(a), Some(Race::Close));
+    net.inbound(port_53(b), None);
+    net.dial(a);
+
+    assert!(net.flows.is_empty(), "flows opened on a closed stack");
+    assert!(table(&net).is_empty(), "flows opened on a closed stack");
 }
 
 /// Two datagrams on a new flow, one arriving while the policy decides on
@@ -442,8 +461,11 @@ fn nothing_opens_after_the_stack_closes() {
 #[test]
 fn racing_datagrams_open_one_flow() {
     let mut net = Net::new();
-    let key = port_53(remotes()[0]);
+    let [a, _, _] = remotes();
+    let key = port_53(a);
+
     net.inbound(key, Some(Race::Inbound(key)));
+
     assert_eq!(net.flows.len(), 1);
     net.recv(0);
     net.recv(0);
@@ -454,9 +476,12 @@ fn racing_datagrams_open_one_flow() {
 #[test]
 fn flows_fail_once_the_stack_closes() {
     let mut net = Net::new();
-    net.inbound(port_53(remotes()[0]), None);
-    net.dial(remotes()[1]);
+    let [a, b, _] = remotes();
+    net.inbound(port_53(a), None);
+    net.dial(b);
+
     net.close_stack();
+
     for i in 0..2 {
         net.send(i);
         net.recv(i);
