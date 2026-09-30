@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+use std::{fmt, io};
 
 use tokio::sync::{OnceCell, watch};
 use tracing::debug;
@@ -68,8 +69,8 @@ impl Via {
     }
 }
 
-impl std::fmt::Display for Via {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self, self.derp_region()) {
             (Via::Direct(a), _) => write!(f, "{a}"),
             (_, r) => write!(f, "DERP({})", r.unwrap_or_default()),
@@ -381,14 +382,14 @@ impl Client {
     }
 
     /// Opens a TCP connection to a port on the server.
-    pub async fn dial_tcp_port(&self, port: u16) -> std::io::Result<TcpStream> {
+    pub async fn dial_tcp_port(&self, port: u16) -> io::Result<TcpStream> {
         self.dial_tcp(SocketAddr::new(self.up().await?.server_ip.into(), port)).await
     }
 
     /// Opens a TCP connection to any address through the server, which
     /// must be an exit node. IPv4 destinations ride the NAT64 prefix
     /// over the IPv6-only tunnel.
-    pub async fn dial_tcp(&self, dst: SocketAddr) -> std::io::Result<TcpStream> {
+    pub async fn dial_tcp(&self, dst: SocketAddr) -> io::Result<TcpStream> {
         let r = self.up().await?;
         let dst = map_nat64(dst);
         if let Ok(res) = tokio::time::timeout(DIAL_REJOIN_TIMEOUT, r.stack.dial_tcp(r.my_ip, dst)).await {
@@ -399,13 +400,13 @@ impl Client {
     }
 
     /// Opens a UDP flow to a port on the server.
-    pub async fn dial_udp_port(&self, port: u16) -> std::io::Result<UdpConn> {
+    pub async fn dial_udp_port(&self, port: u16) -> io::Result<UdpConn> {
         self.dial_udp(SocketAddr::new(self.up().await?.server_ip.into(), port)).await
     }
 
     /// Opens a UDP flow to any address through the server (which must
     /// forward UDP).
-    pub async fn dial_udp(&self, dst: SocketAddr) -> std::io::Result<UdpConn> {
+    pub async fn dial_udp(&self, dst: SocketAddr) -> io::Result<UdpConn> {
         let r = self.up().await?;
         r.stack.dial_udp(r.my_ip, map_nat64(dst))
     }
