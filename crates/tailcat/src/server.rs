@@ -694,7 +694,8 @@ impl Server {
         let cfg = &self.inner.cfg;
         let h = if dst.ip() == IpAddr::V6(self.inner.addr) {
             let port = dst.port();
-            if let Some(tx) = self.inner.listeners.lock().unwrap().tcp.get(&port).cloned() {
+            let listener = self.inner.listeners.lock().unwrap().tcp.get(&port).cloned();
+            if let Some(tx) = listener {
                 return TcpDecision::Accept(self.for_client(src, move |s| {
                     tokio::spawn(async move { tx.send(s).await });
                 }));
@@ -722,7 +723,8 @@ impl Server {
         let idle = Some(cfg.udp_idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT));
         let h: UdpHandler = if dst.ip() == IpAddr::V6(self.inner.addr) {
             let port = dst.port();
-            if let Some(tx) = self.inner.listeners.lock().unwrap().udp.get(&port).cloned() {
+            let listener = self.inner.listeners.lock().unwrap().udp.get(&port).cloned();
+            if let Some(tx) = listener {
                 return Some(self.for_client(src, move |c: UdpConn| {
                     c.set_idle_timeout(idle);
                     tokio::spawn(async move { tx.send(c).await });
