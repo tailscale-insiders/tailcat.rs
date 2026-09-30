@@ -39,6 +39,9 @@
 //! This crate has no API stability promises, and neither does the wire
 //! format it shares with the Go implementation.
 
+#[macro_use]
+mod known;
+
 pub mod addr;
 pub mod derp;
 pub mod derpmap;
