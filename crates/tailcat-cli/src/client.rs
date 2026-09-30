@@ -1,7 +1,8 @@
 //! Client modes: the stdin/stdout pipe and `tailcat ping`.
 
-use std::io::Read;
+use std::io::{self, ErrorKind, Read};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -50,7 +51,7 @@ pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Resu
     let mut out = tokio::io::stdout();
     let res: Result<()> = tokio::select! {
         r = tokio::io::copy(&mut rd, &mut out) => r.map(drop).map_err(Into::into),
-        Err(e) = upload(read_chunks(std::io::stdin()), wr) => Err(anyhow!("stdin: {e}")),
+        Err(e) = upload(read_chunks(io::stdin()), wr) => Err(anyhow!("stdin: {e}")),
     };
     // Whatever arrived goes out, even on failure.
     let flushed = out.flush().await;
@@ -65,15 +66,15 @@ pub async fn client_mode(g: &Global, addr_arg: &str, dest: Option<&str>) -> Resu
 /// that ends it, until EOF. Unlike tokio's stdin, whose reads run on
 /// the runtime's blocking pool and hold up its shutdown until they
 /// return, a read blocked here doesn't keep the process from exiting.
-fn read_chunks(mut r: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+fn read_chunks(mut r: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
     let (tx, rx) = mpsc::channel(1);
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let mut buf = vec![0u8; 32 << 10];
         loop {
             let chunk = match r.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => Ok(buf[..n].to_vec()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => Err(e),
             };
             let last = chunk.is_err();
@@ -89,10 +90,7 @@ fn read_chunks(mut r: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Res
 /// server we're done sending, netcat style. It fails only if reading
 /// does: a write error means the connection is going away, which the
 /// other direction reports.
-async fn upload(
-    mut rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    mut wr: impl AsyncWrite + Unpin,
-) -> std::io::Result<()> {
+async fn upload(mut rx: mpsc::Receiver<io::Result<Vec<u8>>>, mut wr: impl AsyncWrite + Unpin) -> io::Result<()> {
     while let Some(chunk) = rx.recv().await {
         if wr.write_all(&chunk?).await.is_err() {
             return Ok(());
@@ -130,9 +128,8 @@ pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_a
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write, pipe};
+    use std::io::{Write, pipe};
     use std::sync::mpsc as std_mpsc;
-    use std::thread;
 
     use tokio::io::{AsyncReadExt, duplex, sink};
     use tokio::runtime::Runtime;
