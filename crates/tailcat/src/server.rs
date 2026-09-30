@@ -621,10 +621,7 @@ impl Server {
         if self.inner.closed.load(Ordering::Relaxed) {
             return false;
         }
-        let (known, disconnects) = {
-            let clients = self.inner.clients.lock().unwrap();
-            (clients.ids.contains_key(&src), clients.disconnects)
-        };
+        let (known, disconnects) = self.client_state(&src);
         if !known && let Some(allow) = self.inner.cfg.allow_client.clone() {
             if !self.inner.pending_allow.lock().unwrap().insert(src) {
                 // An earlier meow is still waiting on the hook; the client retries.
@@ -637,6 +634,28 @@ impl Server {
                 return false;
             }
         }
+        if !self.admit(src, disco, disconnects) {
+            return false;
+        }
+        // Tell the client our UDP endpoints so both sides can try a
+        // direct path.
+        self.inner.ms.send_call_me_maybe(&src);
+        true
+    }
+
+    /// Whether `src` is a client, and how many clients were disconnected
+    /// so far, for [`Server::admit`].
+    fn client_state(&self, src: &NodePublic) -> (bool, u64) {
+        let clients = self.inner.clients.lock().unwrap();
+        let known = clients.ids.contains_key(src);
+        let disconnects = clients.disconnects;
+        drop(clients);
+        (known, disconnects)
+    }
+
+    /// Adds `src` as a client, or refreshes it, unless a client was
+    /// disconnected since there were `disconnects`.
+    fn admit(&self, src: NodePublic, disco: DiscoPublic, disconnects: u64) -> bool {
         let mut clients = self.inner.clients.lock().unwrap();
         if clients.disconnects != disconnects {
             // The hook's answer may predate a revocation; the client retries.
@@ -666,9 +685,6 @@ impl Server {
             },
         );
         drop(clients);
-        // Tell the client our UDP endpoints so both sides can try a
-        // direct path.
-        self.inner.ms.send_call_me_maybe(&src);
         true
     }
 
