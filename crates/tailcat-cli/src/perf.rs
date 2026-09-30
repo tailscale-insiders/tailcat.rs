@@ -651,10 +651,8 @@ impl Test {
             .streams
             .iter()
             .map(|s| s.lock().unwrap().take())
-            .collect::<Option<Vec<_>>>()
-            .ok_or("stream not attached")?
-            .into_iter()
-            .unzip();
+            .collect::<Option<_>>()
+            .ok_or("stream not attached")?;
         let senders = async {
             if self.sends() {
                 self.run_senders(start, send_sides).await
