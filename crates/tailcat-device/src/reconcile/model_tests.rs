@@ -3,7 +3,8 @@
 //!
 //! The model says, as plainly as it can, what a poll should become:
 //!
-//! - Records rank by run (our own first), then node key, then content.
+//! - Records rank by run attempt (our own first), then node key, then
+//!   content.
 //! - Each key's record is its best one. The peers are those records that
 //!   aren't us (by key, or at an address we claim) and that no other
 //!   such record outranks at their address.
@@ -25,9 +26,10 @@ use tailcat::DiscoPublic;
 
 use super::*;
 
-/// Runs a record can come from: ours, another one, and none at all (a
-/// record made outside GitHub Actions).
-const RUNS: [(&str, &str); 3] = [("100", "1"), ("101", "1"), ("", "")];
+/// Run attempts a record can come from: ours, an earlier attempt of our
+/// run, another run, and none at all (a record made outside GitHub
+/// Actions).
+const RUNS: [(&str, &str); 4] = [("100", "2"), ("100", "1"), ("101", "1"), ("", "")];
 
 /// Routes, chosen to collide: the same /24 written two ways, a /16
 /// around it, our own route, two peers' addresses (one written bare),
@@ -81,8 +83,8 @@ fn record(k: u8, ip: u8, run: usize, index: u32, routes: &[&str]) -> NodeRecord 
     }
 }
 
-/// Us: key 0 at 100.64.1.0 in run 100, routing 10.42.1.0/24, and
-/// sometimes also a peer's address.
+/// Us: key 0 at 100.64.1.0 in run 100 attempt 2, routing 10.42.1.0/24
+/// and sometimes also a peer's address.
 fn draw_me(tc: &TestCase) -> NodeRecord {
     let routes: &[&str] = if tc.draw(gs::booleans()) { &["10.42.1.0/24", "100.64.1.3"] } else { &["10.42.1.0/24"] };
     record(0, 0, 0, 0, routes)
@@ -164,8 +166,10 @@ struct Model<'a> {
 }
 
 impl Model<'_> {
+    /// Whether `r` is from our own run attempt: an earlier attempt's
+    /// nodes are gone.
     fn ours(&self, r: &NodeRecord) -> bool {
-        !self.me.run_id.is_empty() && r.run_id == self.me.run_id
+        !self.me.run_id.is_empty() && (&r.run_id, &r.run_attempt) == (&self.me.run_id, &self.me.run_attempt)
     }
 
     /// Orders records best first.

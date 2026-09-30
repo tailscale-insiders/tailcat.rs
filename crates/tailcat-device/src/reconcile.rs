@@ -141,12 +141,13 @@ fn offer<'a, K: Eq + Hash>(me: &NodeRecord, m: &mut HashMap<K, &'a NodeRecord>, 
 }
 
 /// Orders records claiming the same address or route, best first:
-/// records from our own GitHub Actions run, so that concurrent runs,
-/// whose default addresses and routes collide, form separate meshes that
-/// agree on who is who; then by node key. The record's content breaks
-/// ties between records with the same key.
+/// records from our own GitHub Actions run attempt, so that concurrent
+/// runs, whose default addresses and routes collide, form separate
+/// meshes that agree on who is who, and so that an earlier attempt's
+/// nodes, which are gone, don't displace this one's; then by node key.
+/// The record's content breaks ties between records with the same key.
 pub fn rank(me: &NodeRecord, a: &NodeRecord, b: &NodeRecord) -> Ordering {
-    let foreign = |r: &NodeRecord| me.run_id.is_empty() || r.run_id != me.run_id;
+    let foreign = |r: &NodeRecord| me.run_id.is_empty() || (&r.run_id, &r.run_attempt) != (&me.run_id, &me.run_attempt);
     let json = |r: &NodeRecord| serde_json::to_vec(r).unwrap_or_default();
     foreign(a).cmp(&foreign(b)).then(a.nodekey.cmp(&b.nodekey)).then_with(|| json(a).cmp(&json(b)))
 }
@@ -240,6 +241,14 @@ mod tests {
         let ours = record(5, 1, 0, 1);
         let theirs = record(1, 1, 1, 1);
         assert_eq!(from_scratch(&[theirs, ours.clone()]), [peer(&ours, &["100.64.1.1"])]);
+    }
+
+    /// An earlier attempt of our run is another run: its nodes are gone.
+    #[test]
+    fn our_own_attempt_wins_an_address() {
+        let ours = record(5, 1, 0, 1);
+        let earlier = NodeRecord { run_attempt: "0".into(), ..record(1, 1, 0, 1) };
+        assert_eq!(from_scratch(&[earlier, ours.clone()]), [peer(&ours, &["100.64.1.1"])]);
     }
 
     /// Node 1 of our run and node 2 of another both route 10.42.1.0/24:
