@@ -38,7 +38,8 @@ impl Server {
     /// the command's stdin reaches EOF when the client shuts down its
     /// sending side, and the client sees a FIN when the command closes
     /// its stdout.
-    pub fn exec_conn_handler(&self, argv: Vec<String>) -> TcpHandler {
+    pub fn exec_conn_handler(&self, argv: impl IntoIterator<Item = impl Into<String>>) -> TcpHandler {
+        let argv: Vec<String> = argv.into_iter().map(Into::into).collect();
         let ctx = Arc::new((self.clone(), argv));
         handler(move |c: TcpStream| {
             let ctx = ctx.clone();

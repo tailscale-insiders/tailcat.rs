@@ -405,7 +405,7 @@ async fn exec_handler_runs_a_command_per_connection() {
     let server = bare_server(&dev).await;
     let mut ln = server.listen_tcp(7).unwrap();
     let script = r#"printf '%s %s\n' "$TAILCAT_PEER_KEY" "$TAILCAT_LOCAL_ADDR"; tr a-z A-Z"#;
-    let h = server.exec_conn_handler(["sh", "-c", script].map(String::from).to_vec());
+    let h = server.exec_conn_handler(["sh", "-c", script]);
     tokio::spawn(async move {
         while let Some(c) = ln.accept().await {
             tokio::spawn(h(c));
