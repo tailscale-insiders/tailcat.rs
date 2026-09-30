@@ -4,12 +4,14 @@
 //!     tailcat-device up --records ./records --nodes 5
 //!     tailcat-device up --github --nodes 5           # records from run artifacts
 
-use std::future::Future;
+use std::future::{self, Future};
+use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -152,7 +154,7 @@ fn main() -> ExitCode {
         if cli.verbose { "info,tailcat=debug,tailcat_device=debug" } else { "info,tailcat=warn,tailcat_device=info" };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
-        .with_writer(std::io::stderr)
+        .with_writer(io::stderr)
         .try_init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let res = rt.block_on(async {
@@ -193,20 +195,20 @@ async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
     };
     let (derp_region, derp) = match &a.region_file {
         Some(f) => {
-            let b = std::fs::read(f).with_context(|| format!("reading {}", f.display()))?;
+            let b = fs::read(f).with_context(|| format!("reading {}", f.display()))?;
             (0, Some(serde_json::from_slice(&b).with_context(|| format!("parsing {}", f.display()))?))
         }
         None => pick_region(derpmap_url, &a.region).await?,
     };
-    let env = |k, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
+    let var = |k, default: &str| env::var(k).unwrap_or_else(|_| default.into());
     let mut record = NodeRecord {
         derp_region,
         derp,
         routes: a.routes,
-        os: env("RUNNER_OS", std::env::consts::OS),
-        arch: env("RUNNER_ARCH", std::env::consts::ARCH),
-        run_id: github::RunId::given(&env("GITHUB_RUN_ID", "")),
-        run_attempt: github::Attempt::given(&env("GITHUB_RUN_ATTEMPT", "")),
+        os: var("RUNNER_OS", env::consts::OS),
+        arch: var("RUNNER_ARCH", env::consts::ARCH),
+        run_id: github::RunId::given(&var("GITHUB_RUN_ID", "")),
+        run_attempt: github::Attempt::given(&var("GITHUB_RUN_ATTEMPT", "")),
         ..NodeRecord::new(a.index, &private, overlay_ip)
     };
     if a.oidc {
@@ -218,7 +220,7 @@ async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
     if let Err(e) = k.record.write(&out) {
         // Without its record the key is no use; don't make the next try
         // need --force.
-        let _ = std::fs::remove_file(&a.key);
+        let _ = fs::remove_file(&a.key);
         return Err(e);
     }
     eprintln!("# wrote key to {} and record to {}", a.key.display(), out.display());
@@ -233,8 +235,8 @@ async fn up(derpmap_url: &str, a: UpArgs) -> Result<()> {
     // A ready file left by an earlier run would say we're ready too soon.
     let ready_file = a.ready_file.clone();
     let remove_ready = || match &ready_file {
-        Some(f) => match std::fs::remove_file(f) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context(format!("removing {}", f.display())),
+        Some(f) => match fs::remove_file(f) {
+            Err(e) if e.kind() != ErrorKind::NotFound => Err(e).context(format!("removing {}", f.display())),
             _ => Ok(()),
         },
         None => Ok(()),
@@ -356,11 +358,11 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
         }
     };
     let deadline = async {
-        let Some(n) = expected else { return std::future::pending().await };
+        let Some(n) = expected else { return future::pending().await };
         tokio::time::sleep(a.wait).await;
         let have = overlay.peer_count();
         if have >= n {
-            return std::future::pending().await;
+            return future::pending().await;
         }
         anyhow!("only {have} of {n} peers appeared within {}s", a.wait.as_secs())
     };
@@ -440,6 +442,7 @@ fn open_tun(name: Option<&str>, me: &NodeRecord, prefix: &IpNet, mtu: u16) -> Re
 #[cfg(unix)]
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
+
     let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     Ok(async move {
