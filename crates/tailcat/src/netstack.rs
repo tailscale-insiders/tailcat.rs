@@ -979,11 +979,19 @@ impl UdpConn {
 
     /// Closes the flow; later receives and sends fail.
     pub fn close(&self) {
-        // Only once: by the next close (or the drop), a new flow may
-        // have taken the 4-tuple.
-        if !self.closed.swap(true, Ordering::Relaxed) {
-            self.shared.lock().udp.remove(&(self.local, self.remote));
+        self.closed.store(true, Ordering::Relaxed);
+        // The flow may be out of the table already, its peer aborted, and
+        // a new flow on the 4-tuple in its place.
+        let key = (self.local, self.remote);
+        let mut st = self.shared.lock();
+        if st.udp.get(&key).is_some_and(|tx| self.is_sender(tx)) {
+            st.udp.remove(&key);
         }
+    }
+
+    /// Whether `tx` is this flow's sender.
+    fn is_sender(&self, tx: &mpsc::Sender<Vec<u8>>) -> bool {
+        self.tx.upgrade().is_some_and(|mine| mine.same_channel(tx))
     }
 }
 
@@ -1259,5 +1267,38 @@ mod tests {
         }
         let mixed = build_udp("10.0.0.1:1".parse().unwrap(), "[::1]:1".parse().unwrap(), b"");
         assert!(mixed.is_none());
+    }
+
+    /// A flow its peer's abort took out of the table leaves the 4-tuple
+    /// to a new flow; closing the old conn afterwards leaves the new
+    /// one be.
+    #[tokio::test]
+    async fn closing_an_aborted_flow_keeps_its_successor() {
+        let ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let (local, remote): (SocketAddr, SocketAddr) =
+            ("[fd7a:115c:a1e0::1]:53".parse().unwrap(), "[fd7a:115c:a1e0::2]:1000".parse().unwrap());
+        let accepted: Arc<Mutex<Vec<UdpConn>>> = Arc::default();
+        let a = accepted.clone();
+        let policy: UdpPolicy = Arc::new(move |_, _| {
+            let a = a.clone();
+            Some(Box::new(move |c| a.lock().unwrap().push(c)))
+        });
+        let stack = Stack::new(config(ip), Arc::new(|_| {}), None, Some(policy));
+        let datagram = |d: &[u8]| build_udp(remote, local, d).unwrap();
+
+        stack.inject(datagram(b"one"));
+        let old = accepted.lock().unwrap().pop().unwrap();
+        stack.abort_peer(remote.ip());
+        stack.inject(datagram(b"two"));
+        let new = accepted.lock().unwrap().pop().unwrap();
+        drop(old);
+
+        stack.inject(datagram(b"three"));
+        assert!(accepted.lock().unwrap().is_empty(), "the datagram opened a third flow");
+        let mut buf = [0u8; 16];
+        let n = recv(&new, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two");
+        let n = recv(&new, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"three");
     }
 }
