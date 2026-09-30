@@ -50,7 +50,11 @@ pub enum Change {
 /// peers missing from the poll are removed. Records with our node key,
 /// or at an address we claim, never become peers. The prefixes the
 /// peers claim are then shared out, as `owners` says.
-pub fn reconcile(me: &NodeRecord, current: &HashMap<NodePublic, Peer>, polled: &[NodeRecord]) -> Vec<Change> {
+pub fn reconcile<'a>(
+    me: &NodeRecord,
+    current: &HashMap<NodePublic, Peer>,
+    polled: impl IntoIterator<Item = &'a NodeRecord>,
+) -> Vec<Change> {
     let want = select(me, polled);
     let mut removed: Vec<NodePublic> = current.keys().filter(|k| !want.contains_key(k)).copied().collect();
     removed.sort();
@@ -85,7 +89,7 @@ pub fn contested<'a>(me: &'a NodeRecord, polled: &'a [NodeRecord]) -> Vec<(IpNet
 }
 
 /// The peers `polled` calls for.
-fn select(me: &NodeRecord, polled: &[NodeRecord]) -> HashMap<NodePublic, Peer> {
+fn select<'a>(me: &NodeRecord, polled: impl IntoIterator<Item = &'a NodeRecord>) -> HashMap<NodePublic, Peer> {
     let ours: HashSet<IpNet> = claims(me).map(|(n, _)| n).collect();
     let mine = |r: &NodeRecord| r.nodekey == me.nodekey || ours.contains(&IpNet::host(r.overlay_ip));
     assign(me, &ours, &chosen(me, polled, mine))

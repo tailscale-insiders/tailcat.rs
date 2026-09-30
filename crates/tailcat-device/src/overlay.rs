@@ -209,7 +209,9 @@ impl Overlay {
             }
         }
         st.contested = contested.into_iter().map(|(n, r)| (n, r.nodekey)).collect();
-        let usable: Vec<NodeRecord> = polled
+        // Checking regions takes `st` mutably, so this can't be done lazily
+        // while `reconcile` reads `st.peers`.
+        let usable: Vec<&NodeRecord> = polled
             .iter()
             .filter(|r| {
                 let ok = r.nodekey == self.me.nodekey || st.region(r, dm).is_some();
@@ -218,9 +220,8 @@ impl Overlay {
                 }
                 ok
             })
-            .cloned()
             .collect();
-        let changes = reconcile(&self.me, &st.peers, &usable);
+        let changes = reconcile(&self.me, &st.peers, usable);
         for c in changes {
             self.apply_locked(&mut st, c, dm);
         }
@@ -241,8 +242,7 @@ impl Overlay {
         // As if polled with every other peer, less any at its address.
         let others =
             st.peers.values().map(|p| &p.record).filter(|p| p.nodekey != r.nodekey && p.overlay_ip != r.overlay_ip);
-        let polled: Vec<NodeRecord> = std::iter::once(r).chain(others).cloned().collect();
-        let changes = reconcile(&self.me, &st.peers, &polled);
+        let changes = reconcile(&self.me, &st.peers, std::iter::once(r).chain(others));
         for c in changes {
             self.apply_locked(&mut st, c, dm);
         }
