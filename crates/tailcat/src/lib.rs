@@ -105,23 +105,52 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
     #[error("TLS: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(rustls::Error),
     #[error("TLS verifier: {0}")]
-    Verifier(#[from] rustls::client::VerifierBuilderError),
+    Verifier(rustls::client::VerifierBuilderError),
     #[error("certificate: {0}")]
-    Certificate(#[from] rcgen::Error),
+    Certificate(rcgen::Error),
     #[error("task failed: {0}")]
-    Task(#[from] tokio::task::JoinError),
+    Task(tokio::task::JoinError),
     #[error("HTTP: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error("base64 decode: {0}")]
-    Base64(#[from] base64::DecodeError),
+    Base64(base64::DecodeError),
     #[error("CBOR unmarshal: {0}")]
-    Cbor(#[from] ciborium::de::Error<io::Error>),
+    Cbor(ciborium::de::Error<io::Error>),
     /// An SFTP request refused with a status.
     #[cfg(feature = "ssh")]
     #[error("SFTP: {0}")]
-    Sftp(#[from] russh_sftp::protocol::StatusCode),
+    Sftp(russh_sftp::protocol::StatusCode),
+}
+
+/// Implements `From` for each arm that wraps another error, so `?` puts
+/// the error in its arm. These are written out rather than `#[from]`,
+/// which would also make the wrapped error the arm's `source()`, and a
+/// cause chain (like anyhow's `{:#}`) would then print it twice.
+macro_rules! wraps {
+    ($($arm:ident($error:ty)),* $(,)?) => {$(
+        impl From<$error> for Error {
+            fn from(e: $error) -> Self {
+                Error::$arm(e)
+            }
+        }
+    )*};
+}
+
+wraps! {
+    Tls(rustls::Error),
+    Verifier(rustls::client::VerifierBuilderError),
+    Certificate(rcgen::Error),
+    Task(tokio::task::JoinError),
+    Http(reqwest::Error),
+    Base64(base64::DecodeError),
+    Cbor(ciborium::de::Error<io::Error>),
+}
+
+#[cfg(feature = "ssh")]
+wraps! {
+    Sftp(russh_sftp::protocol::StatusCode),
 }
 
 impl Error {
@@ -155,3 +184,17 @@ pub(crate) fn verbose() -> bool {
 }
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn wrapped_errors_say_themselves_once() {
+        let e = Error::from(base64::DecodeError::InvalidLength(3));
+        assert_eq!(e.to_string(), "base64 decode: Invalid input length: 3");
+        assert!(e.source().is_none(), "a cause chain would print it again");
+    }
+}
