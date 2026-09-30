@@ -493,23 +493,27 @@ impl Stack {
 
     /// Opens a TCP connection from `local_ip` to `remote`.
     pub async fn dial_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
-        let (h, local) = {
-            let mut st = self.shared.lock();
-            if st.closed {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed"));
-            }
-            let local = SocketAddr::new(local_ip, st.alloc_port(local_ip)?);
-            let mut sock = new_tcp_socket();
-            sock.connect(st.iface.context(), remote, local)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
-            let h = st.sockets.add(sock);
-            st.tuples.insert((local, remote), h);
-            (h, local)
-        };
-        self.shared.wake.notify_one();
-        let stream = TcpStream { shared: self.shared.clone(), handle: h, local, remote };
+        let stream = self.open_tcp(local_ip, remote)?;
         std::future::poll_fn(|cx| stream.poll_connected(cx)).await?;
         Ok(stream)
+    }
+
+    /// Adds a socket connecting from `local_ip` to `remote`, for
+    /// [`Stack::dial_tcp`] to wait on.
+    fn open_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
+        let mut st = self.shared.lock();
+        if st.closed {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed"));
+        }
+        let local = SocketAddr::new(local_ip, st.alloc_port(local_ip)?);
+        let mut sock = new_tcp_socket();
+        sock.connect(st.iface.context(), remote, local)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
+        let h = st.sockets.add(sock);
+        st.tuples.insert((local, remote), h);
+        drop(st);
+        self.shared.wake.notify_one();
+        Ok(TcpStream { shared: self.shared.clone(), handle: h, local, remote })
     }
 
     /// Opens a connected UDP flow from `local_ip` to `remote`.
