@@ -121,8 +121,8 @@ impl Source {
     }
 
     /// Specific files.
-    pub fn files(fs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Source {
-        Source { kind: Kind::Files(fs.into_iter().map(Into::into).collect()), last: HashMap::new() }
+    pub fn files(files: impl IntoIterator<Item = impl Into<PathBuf>>) -> Source {
+        Source { kind: Kind::Files(files.into_iter().map(Into::into).collect()), last: HashMap::new() }
     }
 
     /// GitHub Actions run artifacts.
