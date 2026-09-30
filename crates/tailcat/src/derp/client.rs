@@ -45,7 +45,7 @@ pub async fn dial_tls(n: &DerpNode) -> Result<TlsStream<TcpStream>> {
 
 /// The name a node is dialed by, which it can't be without.
 fn node_host(n: &DerpNode) -> Result<std::borrow::Cow<'_, str>> {
-    n.host_name.dialable().ok_or_else(|| Error::Derp(format!("DERP node {:?} has no hostname", n.name)))
+    n.host_name.dialable().ok_or_else(|| Error::Derp(format!("DERP node {} has no hostname", n.name)))
 }
 
 /// Performs the HTTP upgrade and DERP login on an established stream,

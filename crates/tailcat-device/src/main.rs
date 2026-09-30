@@ -475,8 +475,11 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 /// Picks the home region for `init`.
 async fn pick_region(url: &str, region: &RegionArg) -> Result<(i32, Option<DerpRegion>)> {
     if let RegionArg::Hosts(hosts) = region {
-        let nodes =
-            hosts.iter().map(|h| DerpNode { name: h.clone(), host_name: h.as_str().into(), ..Default::default() });
+        let nodes = hosts.iter().map(|h| DerpNode {
+            name: h.as_str().into(),
+            host_name: h.as_str().into(),
+            ..Default::default()
+        });
         let custom =
             DerpRegion { region_id: 900, region_code: "custom".into(), nodes: nodes.collect(), ..Default::default() };
         return Ok((0, Some(custom)));

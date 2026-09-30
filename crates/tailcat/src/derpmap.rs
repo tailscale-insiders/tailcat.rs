@@ -141,6 +141,17 @@ known_strings! {
     }
 }
 
+known_strings! {
+    /// A DERP node's name, like `302a`: those of the default map's nodes
+    /// are variants, named for their regions.
+    NodeName {
+        NycA => "301a",
+        SfoA => "302a",
+        FraA => "303a",
+        TokA => "304a",
+    }
+}
+
 /// A geographic region of DERP relays that are meshed together, so a
 /// client may connect to any of its nodes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -418,7 +429,7 @@ mod stun_test_ip {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DerpNode {
     #[serde(rename = "Name", default)]
-    pub name: String,
+    pub name: NodeName,
     #[serde(rename = "RegionID", default)]
     pub region_id: i32,
     #[serde(rename = "HostName", default)]
@@ -783,6 +794,7 @@ mod tests {
 
         let r = &dm.regions[&302];
         assert_eq!(r.region_code, "sfo");
+        assert!(matches!(r.nodes[0].name, NodeName::SfoA));
         assert_eq!(r.nodes[0].host_name, "tc302a.ipn.dev");
         assert_eq!(r.nodes[0].derp_port(), 443);
         assert_eq!(r.nodes[0].stun_port(), Some(3478));
