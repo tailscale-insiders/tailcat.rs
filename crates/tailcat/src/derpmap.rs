@@ -163,13 +163,13 @@ impl fmt::Display for NodeIp {
 }
 
 impl Serialize for NodeIp {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for NodeIp {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         String::deserialize(d).map(NodeIp::from)
     }
 }
@@ -234,13 +234,13 @@ impl fmt::Display for Host {
 }
 
 impl Serialize for Host {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for Host {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         String::deserialize(d).map(Host::from)
     }
 }
@@ -311,13 +311,13 @@ impl fmt::Display for CertName {
 }
 
 impl Serialize for CertName {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for CertName {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         String::deserialize(d).map(CertName::from)
     }
 }
