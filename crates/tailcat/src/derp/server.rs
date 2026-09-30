@@ -240,7 +240,9 @@ pub struct DevDerp {
 
 impl Drop for DevDerp {
     fn drop(&mut self) {
-        self.tasks.iter().for_each(|t| t.abort());
+        for t in &self.tasks {
+            t.abort();
+        }
     }
 }
 

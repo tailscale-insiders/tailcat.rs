@@ -136,7 +136,9 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         close_tunnel(&self.stack, &self.engine, &self.ms);
-        self.tasks.iter().for_each(|t| t.abort());
+        for t in &self.tasks {
+            t.abort();
+        }
     }
 }
 

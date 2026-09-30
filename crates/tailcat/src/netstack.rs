@@ -656,7 +656,9 @@ async fn poll_loop(shared: Weak<Shared>) {
             let delay = st.iface.poll_delay(st.now(), &st.sockets);
             (std::mem::take(&mut st.device.tx), delay, accepted, st.closed)
         };
-        out.into_iter().for_each(|p| (sh.out)(p));
+        for p in out {
+            (sh.out)(p);
+        }
         for (h, pa) in accepted {
             let (local, remote) = pa.flow;
             (pa.handler)(TcpStream { shared: sh.clone(), handle: h, local, remote });
