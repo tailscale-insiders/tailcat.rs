@@ -1,10 +1,12 @@
 //! `tailcat ssh`, `tailcat cp`, `tailcat ls`, and loading the `ssh`
 //! service's authorized keys.
 
+use std::fmt::Display;
 use std::io::{self, Write as _};
-use std::process::ExitCode;
+use std::process::{self, Command, ExitCode};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, fs, slice};
 
 use anyhow::{Result, anyhow, bail};
 use russh_sftp::client::SftpSession;
@@ -33,25 +35,25 @@ pub async fn load_authorized_keys(list: &AuthorizedKeysArg) -> Result<Vec<String
             KeySource::Github(user) => {
                 fetch_github_keys(user).await.map_err(|e| anyhow!("source {n} ({source}): {e}"))?
             }
-            KeySource::Local(s) => match std::fs::read(s).and_then(|b| limited_text(&b, "file")) {
+            KeySource::Local(s) => match fs::read(s).and_then(|b| limited_text(&b, "file")) {
                 Ok(t) => t,
-                Err(file_err) => match parse_authorized_keys(std::slice::from_ref(s)) {
+                Err(file_err) => match parse_authorized_keys(slice::from_ref(s)) {
                     Ok(_) => s.clone(),
                     Err(e) if looks_like_ssh_public_key(s) => bail!("source {n}: invalid SSH public key: {e}"),
                     Err(_) => bail!("source {n}: reading {s:?}: {file_err}"),
                 },
             },
         };
-        parse_authorized_keys(std::slice::from_ref(&text)).map_err(|e| anyhow!("source {n} ({source}): {e}"))?;
+        parse_authorized_keys(slice::from_ref(&text)).map_err(|e| anyhow!("source {n} ({source}): {e}"))?;
         texts.push(text);
     }
     Ok(texts)
 }
 
 /// Decodes authorized keys text, refusing implausibly large inputs.
-fn limited_text(b: &[u8], what: &str) -> std::io::Result<String> {
+fn limited_text(b: &[u8], what: &str) -> io::Result<String> {
     if b.len() > MAX_AUTHORIZED_KEYS_SIZE {
-        return Err(std::io::Error::other(format!("{what} is larger than {MAX_AUTHORIZED_KEYS_SIZE} bytes")));
+        return Err(io::Error::other(format!("{what} is larger than {MAX_AUTHORIZED_KEYS_SIZE} bytes")));
     }
     Ok(String::from_utf8_lossy(b).into_owned())
 }
@@ -129,7 +131,7 @@ fn proxy_command_join_windows(args: &[String]) -> Result<String> {
 /// The `-o` options for ssh and scp: skip host key checks (the tunnel
 /// authenticates the server) and connect through `tailcat <addr> <port>`.
 fn ssh_opts(g: &Global, addr: &str, port: SshTarget) -> Result<Vec<String>> {
-    let mut proxy = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
+    let mut proxy = vec![env::current_exe()?.to_string_lossy().into_owned()];
     if g.key != KeyArg::Default {
         proxy.push(format!("--key={}", g.key));
     }
@@ -153,9 +155,11 @@ fn ssh_opts(g: &Global, addr: &str, port: SshTarget) -> Result<Vec<String>> {
 /// Replaces this process with `argv`, returning only if that fails.
 #[cfg(unix)]
 fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
-    let mut cmd = std::process::Command::new(&argv[0]);
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    let err = std::os::unix::process::CommandExt::exec(&mut cmd);
+    let err = cmd.exec();
     bail!("failed to run {}: {err}", argv[0]);
 }
 
@@ -163,7 +167,7 @@ fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
 /// replaced here.
 #[cfg(not(unix))]
 fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
-    let mut cmd = std::process::Command::new(&argv[0]);
+    let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     Ok(ExitCode::from(cmd.status()?.code().unwrap_or(1) as u8))
 }
@@ -193,7 +197,7 @@ fn split_remote_arg(arg: &str) -> Option<(&str, &str)> {
 }
 
 fn scp_supports_sftp_flag(scp: &str) -> bool {
-    let Ok(o) = std::process::Command::new(scp).args(["-s", "--"]).output() else { return false };
+    let Ok(o) = Command::new(scp).args(["-s", "--"]).output() else { return false };
     let msg = String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).to_lowercase();
     !["unknown", "illegal", "invalid"].iter().any(|w| msg.contains(&format!("{w} option -- s")))
 }
@@ -245,7 +249,7 @@ impl russh::client::Handler for AcceptAny {
 }
 
 fn local_username() -> String {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "tailcat".into())
+    env::var("USER").or_else(|_| env::var("USERNAME")).unwrap_or_else(|_| "tailcat".into())
 }
 
 /// Starts an SSH session over `conn` and tries logging in as `user`
@@ -299,7 +303,7 @@ it requires client authentication:
 
 Or, to connect anyway, re-run with --skip-dns-safety-check."#
     );
-    std::process::exit(1);
+    process::exit(1);
 }
 
 /// How long `tailcat ls` waits for the SSH handshake and the SFTP
@@ -319,7 +323,7 @@ async fn open_sftp(
         if !ok {
             bail!("SSH handshake: the server requires authentication");
         }
-        let sftp_err = |e: &dyn std::fmt::Display| anyhow!("opening SFTP session: {e}");
+        let sftp_err = |e: &dyn Display| anyhow!("opening SFTP session: {e}");
         let ch = h.channel_open_session().await.map_err(|e| sftp_err(&e))?;
         ch.request_subsystem(true, "sftp").await.map_err(|e| sftp_err(&e))?;
         let sf = SftpSession::new(ch.into_stream()).await.map_err(|e| sftp_err(&e))?;
@@ -387,7 +391,7 @@ fn entry_line(long: bool, md: &FileAttributes, name: &str) -> String {
         '-'
     };
     let perms = tailcat::ssh::permission_string(mode);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let mtime = fmt_mtime(md.mtime.unwrap_or(0).into(), now);
     format!("{kind}{perms} {:>12} {mtime} {name}{slash}", md.size.unwrap_or(0))
 }
@@ -403,9 +407,6 @@ fn fmt_mtime(t: i64, now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Display;
-    use std::fs;
-
     use tokio::io::duplex;
     use tokio::time::timeout;
 
