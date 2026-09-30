@@ -9,7 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-use crate::derpmap::DerpNode;
+use crate::derpmap::{CertName, DerpNode};
 use crate::{Error, Result};
 
 fn provider() -> Arc<CryptoProvider> {
@@ -34,16 +34,20 @@ pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>> {
 /// against the node's `CertName` (a DNS name, or `sha256-raw:<hex>` of
 /// the leaf certificate) when it differs from the hostname.
 pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfig> {
-    let check = if n.insecure_for_tests {
-        Check::Any
-    } else if let Some(hash) = n.cert_name.strip_prefix("sha256-raw:") {
-        Check::Hash(hash.to_ascii_lowercase())
-    } else {
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let webpki =
-            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build().map_err(derp_err)?;
-        let name = if n.cert_name.is_empty() { None } else { Some(server_name(&n.cert_name)?) };
-        Check::WebPki(webpki, name)
+    let check = match &n.cert_name {
+        _ if n.insecure_for_tests => Check::Any,
+        CertName::Sha256(hash) => Check::Hash(*hash),
+        CertName::BadSha256(s) => return Err(derp_err(format!("CertName sha256-raw:{s} isn't a SHA-256 in hex"))),
+        other => {
+            let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+            let webpki =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build().map_err(derp_err)?;
+            let name = match other {
+                CertName::Name(n) => Some(server_name(n)?),
+                _ => None,
+            };
+            Check::WebPki(webpki, name)
+        }
     };
     Ok(rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
@@ -72,8 +76,8 @@ pub(crate) fn self_signed_server_config(names: &[&str]) -> Result<rustls::Server
 enum Check {
     /// Not at all (`InsecureForTests`).
     Any,
-    /// By the SHA-256 of the leaf certificate, in lowercase hex.
-    Hash(String),
+    /// By the SHA-256 of the leaf certificate.
+    Hash([u8; 32]),
     /// By web PKI, for the given name instead of the dialed one if set.
     WebPki(Arc<WebPkiServerVerifier>, Option<ServerName<'static>>),
 }
@@ -96,10 +100,11 @@ impl ServerCertVerifier for Verifier {
         match &self.check {
             Check::Any => Ok(ServerCertVerified::assertion()),
             Check::Hash(want) => {
-                let got = hex::encode(Sha256::digest(end_entity.as_ref()));
+                let got: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
                 if got == *want {
                     Ok(ServerCertVerified::assertion())
                 } else {
+                    let (got, want) = (hex::encode(got), hex::encode(want));
                     Err(rustls::Error::General(format!("DERP certificate hash {got} != expected {want}")))
                 }
             }
@@ -175,9 +180,11 @@ mod tests {
         let hash = hex::encode_upper(Sha256::digest(cert.as_ref()));
         let pinned = node(false, &format!("sha256-raw:{hash}"));
         assert!(handshake(&pinned).await.is_err());
-        let v = Verifier { check: Check::Hash(hash.to_ascii_lowercase()), provider: provider() };
+        let v = Verifier { check: Check::Hash(Sha256::digest(cert.as_ref()).into()), provider: provider() };
         let name = server_name("localhost").unwrap();
         assert!(v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());
+        // A pin that isn't a SHA-256 is refused before dialing.
+        assert!(client_config_for_node(&node(false, "sha256-raw:beef")).is_err());
         assert!(server_name("not a hostname").is_err());
     }
 }

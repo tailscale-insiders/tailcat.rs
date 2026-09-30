@@ -24,7 +24,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::derpmap::{DerpMap, DerpNode, DerpRegion, FetchOptions, NodeIp, RegionCode, RegionName, is_default};
+use crate::derpmap::{
+    CertName, DerpMap, DerpNode, DerpRegion, FetchOptions, NodeIp, RegionCode, RegionName, is_default,
+};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::{Error, Result};
 
@@ -372,6 +374,15 @@ impl Text for NodeIp {
     }
 }
 
+impl Text for CertName {
+    fn text(&self) -> Cow<'_, str> {
+        CertName::text(self)
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s.into();
+    }
+}
+
 /// Fields by CBOR key and JSON name, in wire order.
 type Fields<'a, const N: usize> = [(&'static str, &'static str, Field<'a>); N];
 
@@ -686,7 +697,7 @@ mod tests {
         let n = &r.nodes[0];
         assert_eq!(n.name, "127.0.0.1", "a name redundant with the hostname becomes the hostname");
         assert_eq!((n.region_id, n.derp_port, n.stun_port), (1, 4443, -1));
-        assert_eq!((n.cert_name.as_str(), &n.ipv6), ("c", &NodeIp::Disabled));
+        assert_eq!((&n.cert_name, &n.ipv6), (&CertName::Name("c".into()), &NodeIp::Disabled));
         assert!(n.insecure_for_tests);
         assert_eq!(r.nodes[1].name, "bare", "a name with no hostname is kept");
     }

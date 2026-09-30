@@ -242,6 +242,83 @@ impl<'de> Deserialize<'de> for NodeIp {
     }
 }
 
+/// What a DERP node's TLS certificate is checked against, as the map
+/// gives it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CertName {
+    /// None given (the empty string): the node's hostname.
+    #[default]
+    HostName,
+    /// `sha256-raw:<hex>`: the SHA-256 of the leaf certificate, whatever
+    /// it names.
+    Sha256([u8; 32]),
+    /// `sha256-raw:` and then something that isn't a SHA-256 in hex, kept
+    /// as given. No certificate matches it.
+    BadSha256(String),
+    /// Another name the certificate is for.
+    Name(String),
+}
+
+impl CertName {
+    const SHA256_PREFIX: &str = "sha256-raw:";
+
+    /// The text form, as the map has it.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            CertName::HostName => "".into(),
+            CertName::Sha256(hash) => format!("{}{}", CertName::SHA256_PREFIX, hex::encode(hash)).into(),
+            CertName::BadSha256(s) => format!("{}{s}", CertName::SHA256_PREFIX).into(),
+            CertName::Name(n) => n.as_str().into(),
+        }
+    }
+}
+
+impl From<&str> for CertName {
+    fn from(s: &str) -> Self {
+        match s.strip_prefix(CertName::SHA256_PREFIX) {
+            _ if s.is_empty() => CertName::HostName,
+            Some(h) => match hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                Some(hash) => CertName::Sha256(hash),
+                None => CertName::BadSha256(h.into()),
+            },
+            None => CertName::Name(s.into()),
+        }
+    }
+}
+
+impl From<String> for CertName {
+    fn from(s: String) -> Self {
+        match CertName::from(s.as_str()) {
+            CertName::Name(_) => CertName::Name(s),
+            c => c,
+        }
+    }
+}
+
+impl PartialEq<&str> for CertName {
+    fn eq(&self, other: &&str) -> bool {
+        self.text() == *other
+    }
+}
+
+impl std::fmt::Display for CertName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+impl Serialize for CertName {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for CertName {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(d).map(CertName::from)
+    }
+}
+
 /// The address a node's STUN is tested at instead of its own, if any
 /// (for Tailscale's tests).
 pub type StunTestIp = Option<std::net::IpAddr>;
@@ -276,7 +353,7 @@ pub struct DerpNode {
     #[serde(rename = "HostName", default)]
     pub host_name: String,
     #[serde(rename = "CertName", default, skip_serializing_if = "is_default")]
-    pub cert_name: String,
+    pub cert_name: CertName,
     #[serde(rename = "IPv4", default, skip_serializing_if = "is_default")]
     pub ipv4: NodeIp,
     #[serde(rename = "IPv6", default, skip_serializing_if = "is_default")]
@@ -548,6 +625,18 @@ mod tests {
         let n = DerpNode { stun_test_ip: parse(r#"{"STUNTestIP":"192.0.2.9"}"#), ..Default::default() };
         assert!(serde_json::to_string(&n).unwrap().contains(r#""STUNTestIP":"192.0.2.9""#));
         assert!(!serde_json::to_string(&DerpNode::default()).unwrap().contains("STUNTestIP"));
+    }
+
+    #[test]
+    fn cert_names() {
+        let hash = [0xab; 32];
+        assert_eq!(CertName::from(""), CertName::HostName);
+        assert_eq!(CertName::from("derp.example.com"), CertName::Name("derp.example.com".into()));
+        assert_eq!(CertName::from(format!("sha256-raw:{}", hex::encode_upper(hash)).as_str()), CertName::Sha256(hash));
+        assert_eq!(CertName::from("sha256-raw:beef"), CertName::BadSha256("beef".into()));
+        // A bad pin is kept as given; a good one is written in lowercase.
+        assert_eq!(CertName::BadSha256("beef".into()).text(), "sha256-raw:beef");
+        assert_eq!(CertName::Sha256(hash).text(), format!("sha256-raw:{}", hex::encode(hash)));
     }
 
     #[test]
