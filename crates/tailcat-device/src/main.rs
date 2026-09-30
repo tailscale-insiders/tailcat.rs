@@ -341,14 +341,9 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
             }
             // Pings go by node key, so they're answered even when our run's
             // nodes send what's for our address to another node.
-            if let Some(n) = expected
-                && !ready
-                && overlay.peer_count() >= n
-                && !overlay.contested().iter().any(|(net, _)| *net == IpNet::host(me.overlay_ip))
-                && all_reachable(&overlay).await
-            {
+            if !ready && mesh_up(&overlay, me.overlay_ip, expected).await {
                 ready = true;
-                info!("overlay: all {n} peers reachable");
+                info!("overlay: all {} peers reachable", overlay.peer_count());
                 if let Some(Err(e)) = a.ready_file.as_ref().map(|f| record::write_atomic(f, b"ready\n")) {
                     warn!("{e:#}");
                 }
@@ -392,6 +387,13 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
         _ = membership => unreachable!(),
         _ = status => unreachable!(),
     }
+}
+
+/// Whether the mesh is up: the `expected` number of peers, if any, are
+/// here and answer a ping, and no other node has our address, `ours`.
+async fn mesh_up(o: &Arc<Overlay>, ours: IpAddr, expected: Option<usize>) -> bool {
+    let Some(n) = expected else { return false };
+    o.peer_count() >= n && !o.contested().iter().any(|(net, _)| *net == IpNet::host(ours)) && all_reachable(o).await
 }
 
 /// Pings every peer at once, driving path discovery; true if all answer.
