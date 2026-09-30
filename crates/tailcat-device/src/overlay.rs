@@ -22,7 +22,7 @@ use tailcat::{DerpMap, DerpRegion, NodePublic, PresharedKey};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::reconcile::{Change, reconcile};
+use crate::reconcile::{Change, Peer, reconcile};
 use crate::record::{DeviceKey, NodeRecord};
 
 /// Something that carries raw IP packets: a TUN device, or a channel in
@@ -93,7 +93,7 @@ pub struct Overlay {
 
 #[derive(Default)]
 struct State {
-    peers: HashMap<NodePublic, NodeRecord>,
+    peers: HashMap<NodePublic, Peer>,
     /// Distinct embedded regions (with their IDs zeroed), each known by
     /// `EMBEDDED_REGION_BASE` plus its position.
     embedded: Vec<DerpRegion>,
@@ -176,9 +176,10 @@ impl Overlay {
     }
 
     /// Brings the peers in line with a poll of every record, as
-    /// [`reconcile`] decides: one peer per overlay address, chosen the
-    /// same way however often and in whatever order records are polled.
-    /// Records whose home region isn't known are skipped.
+    /// [`reconcile`] decides: one peer per overlay address, and each
+    /// route to one peer, chosen the same way however often and in
+    /// whatever order records are polled. Records whose home region isn't
+    /// known are skipped.
     pub fn sync(&self, polled: &[NodeRecord], dm: &DerpMap) {
         let mut st = self.state.lock().unwrap();
         let usable: Vec<NodeRecord> = polled
@@ -219,9 +220,10 @@ impl Overlay {
 
     fn apply_locked(&self, st: &mut State, c: Change, dm: &DerpMap) {
         match c {
-            Change::Upsert(r) => {
+            Change::Upsert(p) => {
+                let r = &p.record;
                 // Upserted records passed the region check.
-                let Some(region) = st.region(&r, dm) else { return };
+                let Some(region) = st.region(r, dm) else { return };
                 let home_region = region.region_id;
                 self.ms.add_region(region);
                 self.ms.upsert_peer(magicsock::PeerConfig {
@@ -233,19 +235,19 @@ impl Overlay {
                 self.engine.upsert_peer(
                     r.nodekey,
                     wg::PeerConfig {
-                        allowed_ips: r.allowed_ips(),
+                        allowed_ips: p.allowed_ips.clone(),
                         preshared_key: PresharedKey::default(),
                         persistent_keepalive: None,
                     },
                 );
                 let (k, index, ip) = (r.nodekey, r.index, r.overlay_ip);
-                if st.peers.insert(k, r).is_none() {
+                if st.peers.insert(k, p).is_none() {
                     info!(peer = index, overlay_ip = %ip, "overlay: added peer {}", k.short_string());
                     self.ms.send_call_me_maybe(&k);
                 }
             }
             Change::Remove(k) => {
-                if let Some(r) = st.peers.remove(&k) {
+                if let Some(Peer { record: r, .. }) = st.peers.remove(&k) {
                     info!(peer = r.index, overlay_ip = %r.overlay_ip, "overlay: removed peer {}", k.short_string());
                 }
                 self.engine.remove_peer(&k);
@@ -306,7 +308,7 @@ impl Overlay {
             .unwrap()
             .peers
             .values()
-            .map(|r| {
+            .map(|Peer { record: r, .. }| {
                 let path = self.ms.peer_path(&r.nodekey);
                 let (hs, tx_bytes, rx_bytes) = self.engine.peer_stats(&r.nodekey).unwrap_or((None, 0, 0));
                 PeerStatus {
