@@ -1,5 +1,6 @@
 //! Small helpers: Go-style duration text, platform directories, loopback
-//! dials, atomic private files, accept loops, shutdown signals.
+//! dials, atomic private files, accept loops, shutdown signals, and
+//! finding executables.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -194,6 +195,50 @@ pub async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Finds an executable in $PATH, like Go's exec.LookPath.
+pub fn which(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return std::path::Path::new(name).exists().then(|| name.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(name);
+        if is_executable(&p) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+        if let Some(p) = exe_in(&dir, name) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// `name` with the `.exe` extension in `dir`, if it exists.
+#[cfg(windows)]
+fn exe_in(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let p = dir.join(format!("{name}.exe"));
+    p.exists().then_some(p)
+}
+
+/// None: executables don't need an extension here.
+#[cfg(not(windows))]
+fn exe_in(_: &std::path::Path, _: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Reports whether `p` is a file with any execute bit set.
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Reports whether `p` is a file: there are no execute bits here.
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -340,5 +385,18 @@ mod tests {
         assert_eq!(accepted, 7);
         // It backed off (5ms, then 10ms) between tries.
         assert!(t0.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[test]
+    fn finds_no_missing_executables() {
+        assert!(which("definitely-not-a-tailcat-command").is_none());
+        assert!(which("/definitely/not/a/path").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_executables() {
+        assert!(which("sh").is_some_and(|p| p.ends_with("/sh")));
+        assert_eq!(which("/bin/sh").as_deref(), Some("/bin/sh"));
     }
 }

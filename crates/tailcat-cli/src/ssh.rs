@@ -173,7 +173,7 @@ pub async fn ssh_mode(g: &Global, port: SshTarget, skip_dns_check: bool, args: V
     if via_dns && !skip_dns_check {
         refuse_wide_open_dns(g, addr_str, &addr, port, user).await;
     }
-    let ssh = crate::serve::which("ssh").ok_or_else(|| anyhow!("no ssh client found in $PATH"))?;
+    let ssh = crate::util::which("ssh").ok_or_else(|| anyhow!("no ssh client found in $PATH"))?;
     let host = ssh_dest_host(addr.as_str());
     let mut argv = vec![ssh];
     argv.extend(ssh_opts(g, addr.as_str(), port)?);
@@ -215,7 +215,7 @@ pub async fn cp_mode(
     }
     let (addr, _) = crate::addrarg::validated_addr(addr).await?;
     let label = ssh_dest_host(addr.as_str());
-    let scp = crate::serve::which("scp").ok_or_else(|| anyhow!("no scp found in $PATH"))?;
+    let scp = crate::util::which("scp").ok_or_else(|| anyhow!("no scp found in $PATH"))?;
     let mut argv = vec![scp.clone()];
     if scp_supports_sftp_flag(&scp) {
         argv.push("-s".into());

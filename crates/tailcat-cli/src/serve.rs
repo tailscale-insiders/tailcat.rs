@@ -250,7 +250,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     let exec_args = match exec_args {
         Some(a) if a.is_empty() => bail!("no command given after --"),
         Some(mut a) => {
-            a[0] = which(&a[0]).with_context(|| format!("exec command: {:?} not found", a[0]))?;
+            a[0] = crate::util::which(&a[0]).with_context(|| format!("exec command: {:?} not found", a[0]))?;
             if !services.contains(&Service::Ssh) && !services.contains(&Service::NoAuthSsh) {
                 services.insert(Service::Exec);
             }
@@ -585,50 +585,6 @@ fn close_stdout() {
 #[cfg(not(unix))]
 fn close_stdout() {}
 
-/// Finds an executable in $PATH, like Go's exec.LookPath.
-pub fn which(name: &str) -> Option<String> {
-    if name.contains('/') {
-        return std::path::Path::new(name).exists().then(|| name.to_string());
-    }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if is_executable(&p) {
-            return Some(p.to_string_lossy().into_owned());
-        }
-        if let Some(p) = exe_in(&dir, name) {
-            return Some(p.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
-/// `name` with the `.exe` extension in `dir`, if it exists.
-#[cfg(windows)]
-fn exe_in(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let p = dir.join(format!("{name}.exe"));
-    p.exists().then_some(p)
-}
-
-/// None: executables don't need an extension here.
-#[cfg(not(windows))]
-fn exe_in(_: &std::path::Path, _: &str) -> Option<std::path::PathBuf> {
-    None
-}
-
-/// Reports whether `p` is a file with any execute bit set.
-#[cfg(unix)]
-fn is_executable(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-/// Reports whether `p` is a file: there are no execute bits here.
-#[cfg(not(unix))]
-fn is_executable(p: &std::path::Path) -> bool {
-    p.is_file()
-}
-
 /// The file service --files asks for, once its directory checks out.
 #[cfg(feature = "ssh")]
 pub fn file_service(a: &FilesArg) -> Result<tailcat::ssh::FileService> {
@@ -734,19 +690,6 @@ mod tests {
         let mut got = String::new();
         timeout(Duration::from_secs(10), c.read_to_string(&mut got)).await.expect("read timed out").unwrap();
         assert_eq!(got, "ok");
-    }
-
-    #[test]
-    fn finds_no_missing_executables() {
-        assert!(which("definitely-not-a-tailcat-command").is_none());
-        assert!(which("/definitely/not/a/path").is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn finds_executables() {
-        assert!(which("sh").is_some_and(|p| p.ends_with("/sh")));
-        assert_eq!(which("/bin/sh").as_deref(), Some("/bin/sh"));
     }
 
     #[cfg(feature = "ssh")]

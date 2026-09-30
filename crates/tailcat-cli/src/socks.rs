@@ -107,7 +107,7 @@ pub async fn socks_mode(g: &Global, listen: &ListenArg, mut args: Vec<String>) -
     // server.tailcat and exit-node destinations.
     let addr = match args.first() {
         Some(first) if Addr::new(first.as_str()).parse().is_ok() => Some(Addr::new(args.remove(0))),
-        Some(first) if first.contains('.') && crate::serve::which(first).is_none() => {
+        Some(first) if first.contains('.') && crate::util::which(first).is_none() => {
             Some(crate::addrarg::tailcat_addr_arg(&args.remove(0)).await?)
         }
         _ => None,
