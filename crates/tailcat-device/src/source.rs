@@ -139,7 +139,7 @@ impl Source {
         let paths = match &mut self.kind {
             Kind::Github(g) => return Ok(dedup(g.poll().await?)),
             Kind::Files(fs) => fs.clone(),
-            Kind::Dir(d) => match fs::read_dir(&*d) {
+            Kind::Dir(d) => match fs::read_dir(d) {
                 Ok(rd) => {
                     let mut ps: Vec<PathBuf> = rd
                         .filter_map(|e| Some(e.ok()?.path()))
