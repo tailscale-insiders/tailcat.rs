@@ -3,9 +3,11 @@
 //! node can add it as a peer. The private key never leaves the node.
 
 use std::ffi::OsString;
-use std::io::{self, Write as _};
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::{iter, process};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -119,7 +121,7 @@ impl NodeRecord {
 
     /// The prefixes routed to this node: its overlay IP plus its routes.
     pub fn allowed_ips(&self) -> Vec<IpNet> {
-        std::iter::once(IpNet::host(self.overlay_ip)).chain(self.routes.iter().copied()).collect()
+        iter::once(IpNet::host(self.overlay_ip)).chain(self.routes.iter().copied()).collect()
     }
 
     /// The node's home region: embedded, or looked up in `dm`.
@@ -152,7 +154,7 @@ pub struct DeviceKey {
 impl DeviceKey {
     /// Loads a key file.
     pub fn load(path: &Path) -> Result<DeviceKey> {
-        let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let b = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let k: DeviceKey = serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?;
         ensure!(
             k.private.public() == k.record.nodekey && k.private.disco_private().public() == k.record.discokey,
@@ -168,7 +170,7 @@ impl DeviceKey {
     pub fn save(&self, path: &Path, replace: bool) -> Result<()> {
         let j = serde_json::to_vec_pretty(self)?;
         write_file(path, &j, 0o600, replace).map_err(|e| match e.kind() {
-            io::ErrorKind::AlreadyExists => anyhow!("{} already exists; use --force to overwrite", path.display()),
+            ErrorKind::AlreadyExists => anyhow!("{} already exists; use --force to overwrite", path.display()),
             _ => anyhow::Error::new(e).context(format!("writing {}", path.display())),
         })
     }
@@ -186,37 +188,39 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 /// The temporary file is hidden and doesn't end in `.json`, so it never
 /// shows up in a records directory.
 fn write_file(path: &Path, data: &[u8], mode: u32, replace: bool) -> io::Result<()> {
-    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file name"))?;
+    let name = path.file_name().ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "not a file name"))?;
     let mut tmp = OsString::from(".");
     tmp.push(name);
-    tmp.push(format!(".{}.tmp", std::process::id()));
+    tmp.push(format!(".{}.tmp", process::id()));
     let tmp = path.with_file_name(tmp);
     // A leftover from a crash might have other permissions.
-    let _ = std::fs::remove_file(&tmp);
+    let _ = fs::remove_file(&tmp);
     let res = (|| {
-        let mut o = std::fs::OpenOptions::new();
+        let mut o = OpenOptions::new();
         o.write(true).create_new(true);
         set_mode(&mut o, mode);
         let mut f = o.open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
-        if replace { std::fs::rename(&tmp, path) } else { std::fs::hard_link(&tmp, path) }
+        if replace { fs::rename(&tmp, path) } else { fs::hard_link(&tmp, path) }
     })();
     if res.is_err() || !replace {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp);
     }
     res
 }
 
 /// Makes `o` create files with `mode`, less the umask.
 #[cfg(unix)]
-fn set_mode(o: &mut std::fs::OpenOptions, mode: u32) {
-    std::os::unix::fs::OpenOptionsExt::mode(o, mode);
+fn set_mode(o: &mut OpenOptions, mode: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    o.mode(mode);
 }
 
 /// Does nothing: files have no Unix mode here.
 #[cfg(not(unix))]
-fn set_mode(_: &mut std::fs::OpenOptions, _: u32) {}
+fn set_mode(_: &mut OpenOptions, _: u32) {}
 
 /// The default overlay address for a node: `base + attempt*256 + index`
 /// within an IPv4 prefix, so the default `100.64.0.0/16` gives
@@ -234,7 +238,6 @@ pub fn overlay_ip(prefix: &IpNet, attempt: u32, index: u32) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
