@@ -94,7 +94,12 @@ async fn stun_report(dm: &DerpMap) -> Report {
                     note_reply(&mut rep, &mut pending, &buf4[..n], true);
                 }
             }
-            r = async { match &sock6 { Some(s) => s.recv_from(&mut buf6).await, None => std::future::pending().await } } => {
+            r = async {
+                match &sock6 {
+                    Some(s) => s.recv_from(&mut buf6).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 if let Ok((n, _)) = r {
                     note_reply(&mut rep, &mut pending, &buf6[..n], false);
                 }

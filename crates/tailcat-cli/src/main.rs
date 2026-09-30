@@ -38,7 +38,13 @@ pub struct Global {
     #[arg(long, global = true)]
     pub json: bool,
     /// URL of the JSON DERP map used to resolve or auto-select a DERP region.
-    #[arg(long, global = true, env = "TAILCAT_DERPMAP_URL", default_value = tailcat::DEFAULT_DERP_MAP_URL, value_name = "URL")]
+    #[arg(
+        long,
+        global = true,
+        env = "TAILCAT_DERPMAP_URL",
+        default_value = tailcat::DEFAULT_DERP_MAP_URL,
+        value_name = "URL"
+    )]
     pub derpmap_url: String,
 }
 
@@ -102,7 +108,10 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// run a server (the default when tailcat is run with no arguments)
-    #[command(after_long_help = help::SERVE, override_usage = "tailcat serve [flags] [<port,service,...> ...] [-- <command> [args...]]")]
+    #[command(
+        after_long_help = help::SERVE,
+        override_usage = "tailcat serve [flags] [<port,service,...> ...] [-- <command> [args...]]"
+    )]
     Serve {
         #[command(flatten)]
         flags: ServeFlags,

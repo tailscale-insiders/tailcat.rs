@@ -656,7 +656,9 @@ impl Test {
         tokio::pin!(timeout);
         if self.is_server {
             return tokio::select! {
-                _ = self.all_attached.wait() => self.ctrl.send(&Message::new(MessageType::Ready)).await.map_err(|e| e.to_string()),
+                _ = self.all_attached.wait() => {
+                    self.ctrl.send(&Message::new(MessageType::Ready)).await.map_err(|e| e.to_string())
+                }
                 _ = self.done.wait() => Err(self.err()),
                 _ = &mut timeout => Err("timed out waiting for the client's streams to connect".into()),
             };

@@ -150,7 +150,8 @@ impl Overlay {
         // A peer routed a prefix around our address or routes still
         // mustn't send from them.
         engine.set_local_ips(me.allowed_ips());
-        info!(overlay_ip = %me.overlay_ip, region = home_region, "overlay: node {} up as {}", me.index, me.nodekey.short_string());
+        let key = me.nodekey.short_string();
+        info!(overlay_ip = %me.overlay_ip, region = home_region, "overlay: node {} up as {key}", me.index);
         Ok(Arc::new(Overlay {
             me,
             ms,
