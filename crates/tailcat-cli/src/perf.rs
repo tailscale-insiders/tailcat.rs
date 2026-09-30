@@ -1362,9 +1362,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
     for l in result_lines(&res) {
         println!("{l}");
     }
-    if let Some(a) = after
-        && a.direct() != before.direct()
-    {
+    if let Some(a) = after.filter(|a| a.direct() != before.direct()) {
         eprintln!("# path changed during the test, now: {a}");
     }
     Ok(())
@@ -1472,9 +1470,7 @@ fn perf_summary(res: &PerfResult) -> String {
     let rate = |sent: &Option<Stats>, recv: &Option<Stats>| {
         let Some(recv) = recv else { return "?".to_string() };
         let mut s = fmt_rate(recv.bytes, recv.duration);
-        if let (true, Some(sent)) = (udp, sent)
-            && sent.datagrams > 0
-        {
+        if let Some(sent) = sent.as_ref().filter(|s| udp && s.datagrams > 0) {
             s += &format!(" ({:.1}% lost)", loss_pct(sent, recv));
         }
         s
