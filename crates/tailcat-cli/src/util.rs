@@ -117,6 +117,7 @@ fn write_temp_beside(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
 #[cfg(unix)]
 fn owner_only(opts: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
+
     opts.mode(0o600);
 }
 
@@ -238,6 +239,7 @@ fn exe_in(_: &Path, _: &str) -> Option<PathBuf> {
 #[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
+
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
@@ -332,6 +334,7 @@ mod tests {
     #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
+
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
@@ -346,6 +349,7 @@ mod tests {
     #[test]
     fn private_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
         replace_private(&p, b"long contents").unwrap();
