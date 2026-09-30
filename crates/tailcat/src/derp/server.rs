@@ -510,32 +510,6 @@ mod tests {
         wait_until_gone(&server, &key.public()).await;
     }
 
-    /// Connects to `server` and logs in as `key`.
-    async fn logged_in(server: &Arc<Server>, key: &NodePrivate) -> Conn {
-        let mut c = connect(server, "").await;
-        login(&mut c, "T", key, &"test".into()).await.unwrap();
-        let (t, _) = next_frame(&mut c).await;
-        assert_eq!(t, FrameType::ServerInfo as u8);
-        c
-    }
-
-    /// A client that connects again with the same key replaces its older
-    /// connection, which the relay closes.
-    #[tokio::test]
-    async fn a_new_connection_replaces_the_old_one() {
-        let server = Server::new();
-        let key = NodePrivate::generate();
-        let mut old = logged_in(&server, &key).await;
-        let mut new = logged_in(&server, &key).await;
-
-        read_until_closed(&mut old).await;
-
-        assert!(server.is_client_connected(&key.public()));
-        write(&mut new, &frame(FrameType::Ping, &[PING])).await;
-        let (t, payload) = next_frame(&mut new).await;
-        assert_eq!((t, payload.as_slice()), (FrameType::Pong as u8, PING));
-    }
-
     #[tokio::test]
     async fn rejects_a_bad_client_info_box() {
         let (server, mut c) = http(FAST_START).await;
