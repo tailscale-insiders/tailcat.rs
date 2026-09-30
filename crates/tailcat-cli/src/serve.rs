@@ -2,9 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{env, io, iter, process};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
@@ -60,7 +62,7 @@ impl Service {
 
 /// The names a serve spec knows: "all", then the services'.
 fn known_names() -> String {
-    std::iter::once("all").chain(Service::ALL.map(Service::name)).collect::<Vec<_>>().join(", ")
+    iter::once("all").chain(Service::ALL.map(Service::name)).collect::<Vec<_>>().join(", ")
 }
 
 /// A parsed serve spec.
@@ -158,7 +160,7 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
     Ok(ps)
 }
 
-impl std::str::FromStr for PortSet {
+impl FromStr for PortSet {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -202,7 +204,7 @@ fn clear_unnecessary_region_fields(r: &mut DerpRegion) {
 }
 
 fn env_bool(name: &str) -> bool {
-    matches!(std::env::var(name).as_deref(), Ok("1" | "true" | "TRUE" | "True" | "t"))
+    matches!(env::var(name).as_deref(), Ok("1" | "true" | "TRUE" | "True" | "t"))
 }
 
 async fn proxy_to_local(target: String, c: TcpStream) {
@@ -220,7 +222,7 @@ async fn udp_forward_to(dst: SocketAddr, c: UdpConn) {
     let sock = async {
         let sock = tokio::net::UdpSocket::bind(SocketAddr::new(any, 0)).await?;
         sock.connect(dst).await?;
-        std::io::Result::Ok(sock)
+        io::Result::Ok(sock)
     };
     match sock.await {
         Ok(sock) => tailcat::proxy_packet_conns(&c, &sock, tailcat::DEFAULT_UDP_IDLE_TIMEOUT).await,
@@ -480,7 +482,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     }
     announce(g, &key, &conn_str).await?;
 
-    if std::env::var("TAILCAT_STATUS_LOOP").as_deref() == Ok("1") {
+    if env::var("TAILCAT_STATUS_LOOP").as_deref() == Ok("1") {
         tokio::spawn(async move {
             loop {
                 eprintln!("status = {:?}", s.status());
@@ -515,7 +517,7 @@ async fn announce(g: &Global, key: &KeyArg, conn_str: &Addr) -> Result<()> {
     if g.json {
         println!("{}", serde_json::json!({ "listenAddr": conn_str.as_str() }));
     }
-    match std::env::var("TAILCAT_ADDR_FILE") {
+    match env::var("TAILCAT_ADDR_FILE") {
         Ok(v) if v.is_empty() => {}
         Ok(v) => match v.strip_prefix("tcp:") {
             Some(tcp) => {
@@ -540,7 +542,7 @@ async fn one_shot(me: Arc<OnceLock<Server>>, mut c: TcpStream) {
         // Keep what did arrive.
         let _ = out.flush().await;
         eprintln!("{e}");
-        std::process::exit(1);
+        process::exit(1);
     }
     let _ = out.flush().await;
     drop(out);
@@ -554,7 +556,7 @@ async fn one_shot(me: Arc<OnceLock<Server>>, mut c: TcpStream) {
     if let Some(s) = me.get() {
         s.drain_tcp(Duration::from_secs(5)).await;
     }
-    std::process::exit(0);
+    process::exit(0);
 }
 
 /// Closes this process's stdout.
@@ -572,8 +574,10 @@ fn close_stdout() {}
 /// The file service --files asks for, once its directory checks out.
 #[cfg(feature = "ssh")]
 pub fn file_service(a: &FilesArg) -> Result<tailcat::ssh::FileService> {
-    let abs = std::path::absolute(&a.dir)?;
-    let md = std::fs::metadata(&abs).map_err(|e| anyhow!("--files: {}: {e}", abs.display()))?;
+    use std::{fs, path};
+
+    let abs = path::absolute(&a.dir)?;
+    let md = fs::metadata(&abs).map_err(|e| anyhow!("--files: {}: {e}", abs.display()))?;
     if !md.is_dir() {
         return Err(crate::usagef!("--files: {} is not a directory", abs.display()));
     }
@@ -679,7 +683,7 @@ mod tests {
     #[cfg(feature = "ssh")]
     #[test]
     fn files_flags() {
-        use std::{env, fs};
+        use std::fs;
 
         use tailcat::ssh::FileServeMode as M;
 
