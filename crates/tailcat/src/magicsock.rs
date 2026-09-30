@@ -673,7 +673,7 @@ impl MagicSock {
                     }
                 }
             }
-            Message::CallMeMaybe { endpoints } => {
+            Message::CallMeMaybe { mut endpoints } => {
                 let PathAddr::Derp(_) = src else {
                     trace!("magicsock: CallMeMaybe not over DERP; ignored");
                     return;
@@ -684,10 +684,7 @@ impl MagicSock {
                 // The endpoints are only the peer's claims (they might be
                 // another peer's), so they replace its earlier claims as
                 // candidates, and a pong from one maps it to the peer.
-                let endpoints: Vec<SocketAddr> = endpoints
-                    .into_iter()
-                    .filter(|e| !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()))
-                    .collect();
+                endpoints.retain(|e| !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()));
                 let p = inner.peers.get_mut(&peer_key).expect("known peer");
                 for e in std::mem::replace(&mut p.advertised, endpoints.clone()) {
                     p.forget_candidate(&e);
