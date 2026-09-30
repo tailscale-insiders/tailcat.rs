@@ -77,7 +77,8 @@ impl std::str::FromStr for IpNet {
 pub struct PeerConfig {
     /// Destinations routed to the peer, and source addresses it may send
     /// from, except where another peer's match more specifically (or as
-    /// specifically, with a lower key).
+    /// specifically, with a lower key), or one of our own prefixes (see
+    /// [`Engine::set_local_ips`]) matches as specifically.
     pub allowed_ips: Vec<IpNet>,
     pub preshared_key: PresharedKey,
     pub persistent_keepalive: Option<u16>,
@@ -113,15 +114,25 @@ struct Peers {
     by_index: HashMap<u32, Arc<WgPeer>>,
     /// Counts calls to `remove_peer`, known peer or not.
     removals: u64,
+    /// Our own prefixes, from `set_local_ips`.
+    local: Vec<IpNet>,
 }
 
 impl Peers {
     /// The peer that owns `ip`: the one whose allowed IPs match it most
-    /// specifically, the lowest key breaking ties. Outbound packets go to
-    /// it, and inbound ones are only taken from it.
+    /// specifically, the lowest key breaking ties, unless one of our own
+    /// prefixes matches it as specifically. Outbound packets go to it,
+    /// and inbound ones are only taken from it.
     fn owner(&self, ip: &IpAddr) -> Option<&Arc<WgPeer>> {
         let best = self.by_key.values().filter_map(|p| Some((p.matches(ip)?, p)));
-        best.max_by(|(la, a), (lb, b)| la.cmp(lb).then(b.key.cmp(&a.key))).map(|(_, p)| p)
+        let (len, p) = best.max_by(|(la, a), (lb, b)| la.cmp(lb).then(b.key.cmp(&a.key)))?;
+        (self.local_match(ip) < Some(len)).then_some(p)
+    }
+
+    /// The length of the most specific of our own prefixes containing
+    /// `ip`.
+    fn local_match(&self, ip: &IpAddr) -> Option<u8> {
+        self.local.iter().filter(|n| n.contains(ip)).map(|n| n.prefix_len).max()
     }
 }
 
@@ -231,11 +242,22 @@ impl Engine {
         Some((hs, tx, rx))
     }
 
-    /// The peer that owns `dst`, else the one the route hook picks.
+    /// Sets our own prefixes, replacing any set before: an address in one
+    /// of them is ours, not a peer's, unless one of the peer's allowed IPs
+    /// matches it more specifically. No packet for it is sent (nor is the
+    /// route hook asked), and none from it is taken. A peer routed a
+    /// prefix around our address thus still can't send from it.
+    pub fn set_local_ips(&self, nets: Vec<IpNet>) {
+        self.peers.lock().unwrap().local = nets;
+    }
+
+    /// The peer that owns `dst`, else, if it isn't ours, the one the
+    /// route hook picks.
     fn peer_for_dst(&self, dst: &IpAddr) -> Option<Arc<WgPeer>> {
         let peers = self.peers.lock().unwrap();
         match peers.owner(dst) {
             Some(p) => Some(p.clone()),
+            None if peers.local_match(dst).is_some() => None,
             None => peers.by_key.get(&self.route.as_ref()?(dst)?).cloned(),
         }
     }

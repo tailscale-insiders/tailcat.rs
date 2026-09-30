@@ -1,7 +1,8 @@
 //! Model-based tests of the engine's peer tables, driven by Hegel. The
 //! owner adds, reconfigures and removes peers with overlapping allowed
-//! IPs while simulated peers send packets from every address, some held
-//! in flight across the changes, and the engine sends to every address.
+//! IPs, and sets our own prefixes, while simulated peers send packets
+//! from every address, some held in flight across the changes, and the
+//! engine sends to every address.
 //! Each packet delivered, either way, is checked against the peer that
 //! owns its address; the tables are checked against the configuration.
 
@@ -76,6 +77,8 @@ struct Mesh {
     remotes: Vec<Remote>,
     /// The owner's configuration of each peer.
     configs: HashMap<NodePublic, PeerConfig>,
+    /// Our own prefixes, as the owner last set them.
+    local: Vec<IpNet>,
     /// Packets remotes sent that haven't arrived yet.
     held: Vec<(usize, Vec<u8>)>,
     /// Packets remotes received from us.
@@ -100,6 +103,7 @@ impl Mesh {
             rx,
             remotes,
             configs: HashMap::new(),
+            local: Vec::new(),
             held: Vec::new(),
             delivered: Vec::new(),
             serial: 0,
@@ -115,12 +119,13 @@ impl Mesh {
     }
 
     /// The peer that owns `ip`: the most specific match, then the lowest
-    /// key.
+    /// key; but none if one of our own prefixes matches as specifically.
     fn owner(&self, ip: IpAddr) -> Option<NodePublic> {
-        let len = |c: &PeerConfig| c.allowed_ips.iter().filter(|n| n.contains(&ip)).map(|n| n.prefix_len).max();
-        let mut best: Vec<(u8, NodePublic)> = self.configs.iter().filter_map(|(k, c)| Some((len(c)?, *k))).collect();
+        let len = |nets: &[IpNet]| nets.iter().filter(|n| n.contains(&ip)).map(|n| n.prefix_len).max();
+        let mut best: Vec<(u8, NodePublic)> =
+            self.configs.iter().filter_map(|(k, c)| Some((len(&c.allowed_ips)?, *k))).collect();
         best.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        best.first().map(|(_, k)| *k)
+        best.first().filter(|(l, _)| len(&self.local).is_none_or(|ours| ours < *l)).map(|(_, k)| *k)
     }
 
     fn index_of(&self, k: &NodePublic) -> Option<u32> {
@@ -198,6 +203,12 @@ impl Mesh {
         self.configs.insert(k, cfg);
     }
 
+    /// The owner sets our own prefixes.
+    fn set_local(&mut self, local: Vec<IpNet>) {
+        self.engine.set_local_ips(local.clone());
+        self.local = local;
+    }
+
     /// Remote `i` sends a packet from `src`, returning what reached us.
     fn send_from_addr(&mut self, i: usize, src: IpAddr) -> Vec<InboundPacket> {
         let payload = self.next_payload();
@@ -270,6 +281,15 @@ impl Mesh {
         };
         let persistent_keepalive = tc.draw_named("keepalive", gs::booleans()).then_some(25);
         self.configure(i, PeerConfig { allowed_ips, preshared_key, persistent_keepalive });
+    }
+
+    /// The owner sets our own prefixes, from the same set as peers'.
+    #[rule]
+    fn set_local_ips(&mut self, tc: TestCase) {
+        let mask = tc.draw_named("local", gs::integers::<u8>().max_value((1 << prefixes().len()) - 1));
+        self.set_local(
+            prefixes().into_iter().enumerate().filter(|(b, _)| mask >> b & 1 == 1).map(|(_, p)| p).collect(),
+        );
     }
 
     #[rule]
@@ -352,6 +372,27 @@ fn a_peer_cannot_send_from_another_peers_address() {
     assert!(m.send_from_addr(1, ip("10.0.0.1")).is_empty(), "peer 1 spoofed peer 0");
     assert_eq!(m.send_from_addr(1, ip("10.0.0.3")).len(), 1);
     assert_eq!(m.send_from_addr(0, ip("10.0.0.1")).len(), 1);
+}
+
+/// A peer routed a prefix around our address can't send from it, and
+/// isn't sent what's for it; nor is one routed our address itself. One
+/// routed an address inside one of our prefixes gets that address.
+#[test]
+fn our_own_prefixes_are_ours() {
+    let mut m = Mesh::new();
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    m.set_local(vec!["10.0.0.1/32".parse().unwrap(), "fd00::/64".parse().unwrap()]);
+    m.configure(0, allow(&["10.0.0.0/24", "0.0.0.0/0"]));
+    m.configure(1, allow(&["10.0.0.1/32", "fd00::/64", "fd00::2/128"]));
+    for i in [0, 1] {
+        assert!(m.send_from_addr(i, ip("10.0.0.1")).is_empty(), "peer {i} sent from our address");
+        assert!(m.send_from_addr(i, ip("fd00::1")).is_empty(), "peer {i} sent from our prefix");
+    }
+    assert_eq!(m.send_to_addr(ip("10.0.0.1")), []);
+    assert_eq!(m.send_to_addr(ip("fd00::1")), []);
+    assert_eq!(m.send_from_addr(0, ip("10.0.0.3")).len(), 1);
+    assert_eq!(m.send_from_addr(1, ip("fd00::2")).len(), 1);
+    assert_eq!(m.send_to_addr(ip("fd00::2")), [m.remotes[1].key.public()]);
 }
 
 /// Peers routing the same prefix share it by key, not by hash order,
