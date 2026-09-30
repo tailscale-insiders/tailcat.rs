@@ -206,10 +206,28 @@ pub struct PerfResult {
     pub rtt: Option<Rtt>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// What a control message is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MessageType {
+    Hello,
+    Ok,
+    Ready,
+    Stream,
+    Ping,
+    Pong,
+    Done,
+    Result,
+    Error,
+    /// A type this build doesn't know, kept as sent.
+    #[serde(untagged)]
+    Other(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Message {
     #[serde(rename = "type")]
-    typ: String,
+    typ: MessageType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Params>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -225,12 +243,12 @@ struct Message {
 }
 
 impl Message {
-    fn new(t: &str) -> Self {
-        Message { typ: t.into(), ..Default::default() }
+    fn new(typ: MessageType) -> Self {
+        Message { typ, params: None, id: String::new(), stream: 0, error: String::new(), t: 0, stats: None }
     }
 
     fn error(e: impl Into<String>) -> Self {
-        Message { error: e.into(), ..Message::new("error") }
+        Message { error: e.into(), ..Message::new(MessageType::Error) }
     }
 
     /// The message as a JSON line.
@@ -584,18 +602,18 @@ impl Test {
                     return;
                 }
             };
-            match m.typ.as_str() {
-                "ping" => {
-                    let _ = self.ctrl.send(&Message { t: m.t, ..Message::new("pong") }).await;
+            match m.typ {
+                MessageType::Ping => {
+                    let _ = self.ctrl.send(&Message { t: m.t, ..Message::new(MessageType::Pong) }).await;
                 }
-                "pong" => {
+                MessageType::Pong => {
                     let d = unix_nanos() - m.t;
                     self.rtt.lock().unwrap().record(Duration::from_nanos(d.max(0) as u64));
                 }
-                "ready" => self.ready.set(),
-                "done" => self.peer_sent.set(m.stats),
-                "result" => self.peer_received.set(m.stats),
-                "error" => {
+                MessageType::Ready => self.ready.set(),
+                MessageType::Done => self.peer_sent.set(m.stats),
+                MessageType::Result => self.peer_received.set(m.stats),
+                MessageType::Error => {
                     self.fail(format!("peer: {}", m.error));
                     return;
                 }
@@ -621,7 +639,7 @@ impl Test {
         tokio::pin!(timeout);
         if self.is_server {
             return tokio::select! {
-                _ = self.all_attached.wait() => self.ctrl.send(&Message::new("ready")).await.map_err(|e| e.to_string()),
+                _ = self.all_attached.wait() => self.ctrl.send(&Message::new(MessageType::Ready)).await.map_err(|e| e.to_string()),
                 _ = self.done.wait() => Err(self.err()),
                 _ = &mut timeout => Err("timed out waiting for the client's streams to connect".into()),
             };
@@ -741,7 +759,7 @@ impl Test {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let _ = self.ctrl.send(&Message { t: unix_nanos(), ..Message::new("ping") }).await;
+                    let _ = self.ctrl.send(&Message { t: unix_nanos(), ..Message::new(MessageType::Ping) }).await;
                 }
                 _ = stop.wait() => return,
                 _ = self.done.wait() => return,
@@ -785,7 +803,7 @@ impl Test {
                 return sides;
             }
         }
-        if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new("done") }).await {
+        if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new(MessageType::Done) }).await {
             self.fail(format!("sending done: {e}"));
         }
         sides
@@ -862,7 +880,7 @@ impl Test {
             stats.jitter = Duration::from_nanos(j.max(0.0) as u64);
         }
         let wire = self.rx.finish(stats);
-        if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new("result") }).await {
+        if let Err(e) = self.ctrl.send(&Message { stats: Some(wire), ..Message::new(MessageType::Result) }).await {
             self.fail(format!("sending result: {e}"));
         }
     }
@@ -988,9 +1006,9 @@ impl Server {
         let mut br: BufReader<BoxRead> = BufReader::with_capacity(CTRL_BUF_SIZE, Box::new(rd));
         let wr: BoxWrite = Box::new(wr);
         let Ok(Ok(m)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut br)).await else { return };
-        match m.typ.as_str() {
-            "hello" => self.run_test(Ctrl::new(br, wr), m, remote).await,
-            "stream" => {
+        match m.typ {
+            MessageType::Hello => self.run_test(Ctrl::new(br, wr), m, remote).await,
+            MessageType::Stream => {
                 let Some(id) = parse_id(&m.id) else { return };
                 let t = match self.lookup(id, m.stream) {
                     Ok(t) => t,
@@ -1047,7 +1065,10 @@ impl Server {
             return;
         }
         let res = async {
-            t.ctrl.send(&Message { id: hex::encode(id), ..Message::new("ok") }).await.map_err(|e| e.to_string())?;
+            t.ctrl
+                .send(&Message { id: hex::encode(id), ..Message::new(MessageType::Ok) })
+                .await
+                .map_err(|e| e.to_string())?;
             let limit = DEFAULT_MAX_DURATION + HANDSHAKE_TIMEOUT + REPORT_TIMEOUT;
             tokio::time::timeout(limit, t.clone().run()).await.unwrap_or_else(|_| Err("test timed out".into()))
         }
@@ -1067,16 +1088,16 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
     let cc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing control connection: {e}"))?;
     let (rd, wr) = tokio::io::split(cc);
     let ctrl = Ctrl::new(BufReader::with_capacity(CTRL_BUF_SIZE, Box::new(rd)), Box::new(wr));
-    ctrl.send(&Message { params: Some(p.clone()), ..Message::new("hello") })
+    ctrl.send(&Message { params: Some(p.clone()), ..Message::new(MessageType::Hello) })
         .await
         .map_err(|e| anyhow!("sending hello: {e}"))?;
     let m = tokio::time::timeout(HANDSHAKE_TIMEOUT, ctrl.recv())
         .await
         .map_err(|_| anyhow!("reading hello reply: timed out"))?
         .map_err(|e| anyhow!("reading hello reply: {e}"))?;
-    match m.typ.as_str() {
-        "error" => bail!("server rejected the test: {}", m.error),
-        "ok" => {}
+    match m.typ {
+        MessageType::Error => bail!("server rejected the test: {}", m.error),
+        MessageType::Ok => {}
         other => bail!("unexpected reply {other:?} to hello"),
     }
     let id = parse_id(&m.id).ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
@@ -1086,7 +1107,7 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
         let sc = match proto {
             Proto::Tcp => {
                 let mut dc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing stream {i}: {e}"))?;
-                let hdr = Message { id: m.id.clone(), stream: i, ..Message::new("stream") }.line();
+                let hdr = Message { id: m.id.clone(), stream: i, ..Message::new(MessageType::Stream) }.line();
                 dc.write_all(&hdr).await.map_err(|e| anyhow!("stream {i}: sending header: {e}"))?;
                 let (rd, wr) = tokio::io::split(dc);
                 tcp_stream(Box::new(rd), Box::new(wr))
@@ -1591,7 +1612,7 @@ mod tests {
 
     #[test]
     fn wire_formats() {
-        let hello = Message { params: Some(params()), ..Message::new("hello") };
+        let hello = Message { params: Some(params()), ..Message::new(MessageType::Hello) };
         assert_eq!(
             serde_json::to_string(&hello).unwrap(),
             r#"{"type":"hello","params":{"proto":"udp","dir":"both","duration":10000000000,"streams":1,"length":1232,"bitrate":1000000,"interval":1000000000}}"#
@@ -1606,13 +1627,18 @@ mod tests {
 
         // Zero fields are omitted, like Go's omitempty.
         let stats = Stats { bytes: 5, duration: Duration::from_millis(1), ..Default::default() };
-        let done = Message { stats: Some(stats), ..Message::new("done") };
+        let done = Message { stats: Some(stats), ..Message::new(MessageType::Done) };
         assert_eq!(serde_json::to_string(&done).unwrap(), r#"{"type":"done","stats":{"bytes":5,"duration":1000000}}"#);
 
         let ok: Message = serde_json::from_str(r#"{"type":"ok","id":"0102030405060708","extra":1}"#).unwrap();
         assert_eq!(parse_id(&ok.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(parse_id("0102"), None);
         assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
+
+        // A type from a newer peer is kept as sent.
+        let novel: Message = serde_json::from_str(r#"{"type":"novel"}"#).unwrap();
+        assert_eq!(novel.typ, MessageType::Other("novel".into()));
+        assert_eq!(novel.line(), b"{\"type\":\"novel\"}\n");
     }
 
     /// Any duration, well past the ~292 years Go's time.Duration holds.
@@ -1639,7 +1665,7 @@ mod tests {
             bitrate: tc.draw(gs::integers()),
             interval: draw_duration(&tc),
         };
-        let hello = Message { params: Some(p.clone()), ..Message::new("hello") };
+        let hello = Message { params: Some(p.clone()), ..Message::new(MessageType::Hello) };
 
         let back = serde_json::from_slice::<Message>(&hello.line()).unwrap().params.expect("params");
 
@@ -1704,11 +1730,11 @@ mod tests {
         let (a, b) = duplex(1 << 20);
         let (_ar, mut aw) = split(a);
         let mut br = BufReader::new(b);
-        aw.write_all(&Message::new("ready").line()).await.unwrap();
+        aw.write_all(&Message::new(MessageType::Ready).line()).await.unwrap();
         aw.write_all(b"not json\n").await.unwrap();
         aw.write_all(&vec![b' '; CTRL_BUF_SIZE + 1]).await.unwrap();
 
-        assert_eq!(read_message(&mut br).await.unwrap().typ, "ready");
+        assert_eq!(read_message(&mut br).await.unwrap().typ, MessageType::Ready);
         let e = read_message(&mut br).await.unwrap_err();
         assert!(e.to_string().contains("bad control message"), "{e}");
         let e = read_message(&mut br).await.unwrap_err();
