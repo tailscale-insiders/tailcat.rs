@@ -1285,7 +1285,7 @@ pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {
         p.duration = Duration::ZERO;
     }
     if let Some(b) = a.bitrate {
-        p.bitrate = b.0;
+        p.bitrate = b.bits_per_sec();
     }
     if p.length == 0 {
         p.length = if a.udp { tailcat::MAX_UDP_PAYLOAD } else { DEFAULT_TCP_LENGTH };

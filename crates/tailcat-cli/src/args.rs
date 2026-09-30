@@ -354,7 +354,13 @@ impl FromStr for ByteCount {
 /// A perf `--bitrate` in bits per second: zero for as fast as possible,
 /// or more, with an optional K, M, or G suffix (powers of 1000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bitrate(pub i64);
+pub struct Bitrate(i64);
+
+impl Bitrate {
+    pub fn bits_per_sec(self) -> i64 {
+        self.0
+    }
+}
 
 impl FromStr for Bitrate {
     type Err = String;
