@@ -110,6 +110,12 @@ pub enum Error {
     Verifier(#[from] rustls::client::VerifierBuilderError),
     #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
+    #[error("task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+    /// An SFTP request refused with a status.
+    #[cfg(feature = "ssh")]
+    #[error("SFTP: {0}")]
+    Sftp(#[from] russh_sftp::protocol::StatusCode),
 }
 
 impl Error {

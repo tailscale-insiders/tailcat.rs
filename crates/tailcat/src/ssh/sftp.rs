@@ -11,8 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata, OpenOptions, ReadDir};
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
+use russh_sftp::server::StatusReply;
 
 use super::{FileServeMode, FileService};
+use crate::{Error, Result};
 
 /// The most handles a session may have open at once.
 const MAX_HANDLES: usize = 128;
@@ -50,25 +52,36 @@ pub(crate) struct Sftp {
 
 /// Runs filesystem work that may block (reads, writes, listings) off the
 /// async runtime's threads.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> Result<T, StatusCode> {
-    tokio::task::spawn_blocking(f).await.map_err(|_| StatusCode::Failure)?.map_err(io_code)
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> Result<T> {
+    Ok(tokio::task::spawn_blocking(f).await??)
 }
 
 fn ok(id: u32) -> Status {
     Status { id, status_code: StatusCode::Ok, error_message: "Ok".into(), language_tag: "en-US".into() }
 }
 
-fn io_code(e: io::Error) -> StatusCode {
-    match e.kind() {
-        io::ErrorKind::NotFound => StatusCode::NoSuchFile,
-        io::ErrorKind::PermissionDenied => StatusCode::PermissionDenied,
-        _ => StatusCode::Failure,
+/// The status a failed request answers with: the one it was refused
+/// with, or the file system error's, by its kind.
+impl From<Error> for StatusCode {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Sftp(s) => s,
+            Error::Io(e) if e.kind() == io::ErrorKind::NotFound => StatusCode::NoSuchFile,
+            Error::Io(e) if e.kind() == io::ErrorKind::PermissionDenied => StatusCode::PermissionDenied,
+            _ => StatusCode::Failure,
+        }
+    }
+}
+
+impl From<Error> for StatusReply {
+    fn from(e: Error) -> Self {
+        StatusCode::from(e).into()
     }
 }
 
 /// Fails with permission denied unless `allowed`.
-fn allow(allowed: bool) -> Result<(), StatusCode> {
-    if allowed { Ok(()) } else { Err(StatusCode::PermissionDenied) }
+fn allow(allowed: bool) -> Result<()> {
+    if allowed { Ok(()) } else { Err(StatusCode::PermissionDenied.into()) }
 }
 
 /// Lexically normalizes `p` against `cwd` into a path relative to the
@@ -225,8 +238,8 @@ impl Sftp {
     }
 
     /// Fails unless another handle may be opened.
-    fn handle_room(&self) -> Result<(), StatusCode> {
-        if self.handles.len() < MAX_HANDLES { Ok(()) } else { Err(StatusCode::Failure) }
+    fn handle_room(&self) -> Result<()> {
+        if self.handles.len() < MAX_HANDLES { Ok(()) } else { Err(StatusCode::Failure.into()) }
     }
 
     fn new_handle(&mut self, o: Open) -> String {
@@ -236,42 +249,42 @@ impl Sftp {
         h
     }
 
-    fn file(&self, handle: &str) -> Result<&Arc<cap_std::fs::File>, StatusCode> {
+    fn file(&self, handle: &str) -> Result<&Arc<cap_std::fs::File>> {
         match self.handles.get(handle) {
             Some(Open::File(f, _)) => Ok(f),
-            _ => Err(StatusCode::Failure),
+            _ => Err(StatusCode::Failure.into()),
         }
     }
 
     /// Stats `p`, hiding existing files from write-only clients: they may
     /// see only what they wrote, and directories (in flat mode, only the
     /// root).
-    fn stat_path(&self, p: &str, follow: bool) -> Result<FileAttributes, StatusCode> {
+    fn stat_path(&self, p: &str, follow: bool) -> Result<FileAttributes> {
         let stat = |p: &str| if follow { self.root.metadata(p) } else { self.root.symlink_metadata(p) };
         match self.wrote.get(p) {
-            Some(actual) => stat(actual).map(|m| attrs(&m)).map_err(io_code),
-            None if !self.write_only() => stat(p).map(|m| attrs(&m)).map_err(io_code),
+            Some(actual) => Ok(attrs(&stat(actual)?)),
+            None if !self.write_only() => Ok(attrs(&stat(p)?)),
             None => match stat(p) {
                 Ok(m) if m.is_dir() && (p == "." || self.mode == Some(FileServeMode::WriteOnlyTree)) => Ok(attrs(&m)),
-                _ => Err(StatusCode::NoSuchFile),
+                _ => Err(StatusCode::NoSuchFile.into()),
             },
         }
     }
 
     /// Starts a drop-box upload to `p`, under a temporary name for now.
-    fn open_write_only(&mut self, p: String, pflags: OpenFlags) -> Result<Open, StatusCode> {
+    fn open_write_only(&mut self, p: String, pflags: OpenFlags) -> Result<Open> {
         allow(!pflags.contains(OpenFlags::READ) && pflags.contains(OpenFlags::WRITE | OpenFlags::CREATE))?;
         let flat = self.mode == Some(FileServeMode::WriteOnly);
         allow(!flat || (p != "." && !p.contains('/')))?;
         let temp = temp_upload_path(&p);
-        let f = self.root.open_with(&temp, OpenOptions::new().write(true).create_new(true)).map_err(io_code)?;
+        let f = self.root.open_with(&temp, OpenOptions::new().write(true).create_new(true))?;
         self.wrote.insert(p.clone(), temp.clone());
         Ok(Open::File(Arc::new(f), Some(Upload { requested: p, temp })))
     }
 
     /// Finishes a drop-box upload, giving it its own name: in flat mode a
     /// fresh one, in tree mode the requested one unless that's taken.
-    fn commit(&mut self, up: Upload) -> Result<(), StatusCode> {
+    fn commit(&mut self, up: Upload) -> Result<()> {
         let flat = self.mode == Some(FileServeMode::WriteOnly);
         let mut actual = if flat { unique_upload_path(&up.requested) } else { up.requested.clone() };
         let mut r = link_new(&self.root, &up.temp, &actual);
@@ -283,7 +296,7 @@ impl Sftp {
         if r.is_err() && self.wrote.get(&up.requested) == Some(&up.temp) {
             self.wrote.remove(&up.requested);
         }
-        r.map_err(io_code)?;
+        r?;
         self.wrote.insert(up.requested, actual);
         Ok(())
     }
@@ -322,10 +335,10 @@ impl Drop for Sftp {
 }
 
 impl russh_sftp::server::Handler for Sftp {
-    type Error = StatusCode;
+    type Error = Error;
 
     fn unimplemented(&self) -> Self::Error {
-        StatusCode::OpUnsupported
+        StatusCode::OpUnsupported.into()
     }
 
     async fn open(
@@ -351,7 +364,7 @@ impl russh_sftp::server::Handler for Sftp {
                 .truncate(pflags.contains(OpenFlags::TRUNCATE))
                 .create(create && !exclusive)
                 .create_new(create && exclusive);
-            Open::File(Arc::new(self.root.open_with(&p, &o).map_err(io_code)?), None)
+            Open::File(Arc::new(self.root.open_with(&p, &o)?), None)
         };
         Ok(Handle { id, handle: self.new_handle(open) })
     }
@@ -374,7 +387,7 @@ impl russh_sftp::server::Handler for Sftp {
         })
         .await?;
         if data.is_empty() && len > 0 {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         Ok(Data { id, data })
     }
@@ -394,14 +407,14 @@ impl russh_sftp::server::Handler for Sftp {
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
-        Ok(Attrs { id, attrs: attrs(&self.file(&handle)?.metadata().map_err(io_code)?) })
+        Ok(Attrs { id, attrs: attrs(&self.file(&handle)?.metadata()?) })
     }
 
     async fn setstat(&mut self, id: u32, path: String, a: FileAttributes) -> Result<Status, Self::Error> {
         allow(!self.read_only())?;
         let p = self.rel(&path);
         let target = if self.write_only() { self.wrote.get(&p).ok_or(StatusCode::PermissionDenied)? } else { &p };
-        self.setstat_path(target, &a).map_err(io_code)?;
+        self.setstat_path(target, &a)?;
         Ok(ok(id))
     }
 
@@ -409,10 +422,10 @@ impl russh_sftp::server::Handler for Sftp {
         allow(!self.read_only())?;
         let f = self.file(&handle)?;
         if let Some(size) = a.size {
-            f.set_len(size).map_err(io_code)?;
+            f.set_len(size)?;
         }
         if let Some(perms) = a.permissions.and_then(permissions) {
-            f.set_permissions(perms).map_err(io_code)?;
+            f.set_permissions(perms)?;
         }
         Ok(ok(id))
     }
@@ -426,7 +439,7 @@ impl russh_sftp::server::Handler for Sftp {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        let Some(Open::Dir(entries)) = self.handles.get_mut(&handle) else { return Err(StatusCode::Failure) };
+        let Some(Open::Dir(entries)) = self.handles.get_mut(&handle) else { return Err(StatusCode::Failure.into()) };
         let mut entries = entries.take().ok_or(StatusCode::Eof)?;
         // A batch at a time: a whole large directory in one reply would be
         // longer than clients accept.
@@ -445,7 +458,7 @@ impl russh_sftp::server::Handler for Sftp {
         })
         .await?;
         if files.is_empty() {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         if let Some(Open::Dir(slot)) = self.handles.get_mut(&handle) {
             *slot = Some(entries);
@@ -455,14 +468,14 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         allow(self.full_write())?;
-        self.root.remove_file(self.rel(&filename)).map_err(io_code)?;
+        self.root.remove_file(self.rel(&filename))?;
         Ok(ok(id))
     }
 
     async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
         allow(!matches!(self.mode, Some(FileServeMode::ReadOnly | FileServeMode::WriteOnly)))?;
         let p = self.rel(&path);
-        self.root.create_dir(&p).map_err(io_code)?;
+        self.root.create_dir(&p)?;
         if self.write_only() {
             self.wrote.insert(p.clone(), p);
         }
@@ -471,7 +484,7 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         allow(self.full_write())?;
-        self.root.remove_dir(self.rel(&path)).map_err(io_code)?;
+        self.root.remove_dir(self.rel(&path))?;
         Ok(ok(id))
     }
 
@@ -483,13 +496,13 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
         allow(self.full_write())?;
-        self.root.rename(self.rel(&oldpath), &self.root, self.rel(&newpath)).map_err(io_code)?;
+        self.root.rename(self.rel(&oldpath), &self.root, self.rel(&newpath))?;
         Ok(ok(id))
     }
 
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         allow(!self.write_only())?;
-        let t = self.root.read_link_contents(self.rel(&path)).map_err(io_code)?;
+        let t = self.root.read_link_contents(self.rel(&path))?;
         Ok(Name { id, files: vec![File::dummy(t.to_string_lossy())] })
     }
 
@@ -498,7 +511,7 @@ impl russh_sftp::server::Handler for Sftp {
         // OpenSSH's sftp sends (target, link) despite the spec's order.
         let link = self.rel(&targetpath);
         let target = if self.mode.is_some() { self.rel(&linkpath) } else { linkpath };
-        cap_fs_ext::DirExt::symlink(&*self.root, target, link).map_err(io_code)?;
+        cap_fs_ext::DirExt::symlink(&*self.root, target, link)?;
         Ok(ok(id))
     }
 }
@@ -650,15 +663,15 @@ mod tests {
     }
 
     async fn open(sftp: &mut Sftp, p: &str, f: OpenFlags) -> Result<String, StatusCode> {
-        sftp.open(0, p.into(), f, FileAttributes::default()).await.map(|h| h.handle)
+        Ok(sftp.open(0, p.into(), f, FileAttributes::default()).await?.handle)
     }
 
     async fn opendir(sftp: &mut Sftp, p: &str) -> Result<String, StatusCode> {
-        sftp.opendir(0, p.into()).await.map(|h| h.handle)
+        Ok(sftp.opendir(0, p.into()).await?.handle)
     }
 
     async fn stat(sftp: &mut Sftp, p: &str) -> Result<FileAttributes, StatusCode> {
-        sftp.stat(0, p.into()).await.map(|a| a.attrs)
+        Ok(sftp.stat(0, p.into()).await?.attrs)
     }
 
     async fn stat_size(sftp: &mut Sftp, p: &str) -> Option<u64> {
@@ -666,7 +679,7 @@ mod tests {
     }
 
     async fn mkdir(sftp: &mut Sftp, p: &str) -> Result<Status, StatusCode> {
-        sftp.mkdir(0, p.into(), FileAttributes::default()).await
+        Ok(sftp.mkdir(0, p.into(), FileAttributes::default()).await?)
     }
 
     /// The names in one page of a listing.
@@ -677,15 +690,16 @@ mod tests {
 
     async fn read_file(sftp: &mut Sftp, p: &str) -> Result<Vec<u8>, StatusCode> {
         let h = open(sftp, p, R).await?;
-        let data = sftp.read(0, h.clone(), 0, 1 << 10).await.map(|d| d.data);
+        let read = sftp.read(0, h.clone(), 0, 1 << 10).await;
         sftp.close(0, h).await?;
-        data
+        Ok(read?.data)
     }
 
     async fn upload(sftp: &mut Sftp, p: &str, data: &[u8]) -> Result<(), StatusCode> {
         let h = open(sftp, p, wc()).await?;
         sftp.write(0, h.clone(), 0, data.to_vec()).await?;
-        sftp.close(0, h).await.map(drop)
+        sftp.close(0, h).await?;
+        Ok(())
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -700,8 +714,8 @@ mod tests {
         names(dir).into_iter().filter(|n| !before.contains(n)).collect()
     }
 
-    fn denied<T>(r: Result<T, StatusCode>) {
-        assert_eq!(r.err(), Some(StatusCode::PermissionDenied));
+    fn denied<T>(r: Result<T, impl Into<StatusCode>>) {
+        assert_eq!(r.err().map(Into::into), Some(StatusCode::PermissionDenied));
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use hegel::TestCase;
@@ -241,14 +242,19 @@ impl Fs {
 }
 
 /// Lists `/dir` to the end, and closes the listing.
+/// Runs a request to its answer, failing with the status a client gets.
+fn answer<T>(rt: &Runtime, request: impl Future<Output = Result<T>>) -> Result<T, StatusCode> {
+    Ok(rt.block_on(request)?)
+}
+
 async fn list_all(sftp: &mut Sftp, dir: &str) -> Result<Vec<String>, StatusCode> {
     let h = sftp.opendir(0, format!("/{dir}")).await?.handle;
     let mut listed = Vec::new();
     loop {
         match sftp.readdir(0, h.clone()).await {
             Ok(n) => listed.extend(n.files.into_iter().map(|f| f.filename)),
-            Err(StatusCode::Eof) => break,
-            Err(e) => return Err(e),
+            Err(Error::Sftp(StatusCode::Eof)) => break,
+            Err(e) => return Err(e.into()),
         }
     }
     sftp.close(0, h).await?;
@@ -264,7 +270,7 @@ impl Fs {
         let flags = tc.draw(gs::sampled_from(vec![Flags::Read, Flags::Write, Flags::ReadWrite, Flags::Exclusive]));
         let expect_ok = self.may_open(path, flags);
 
-        let r = self.rt.block_on(self.sftp.open(0, path.into(), flags.bits(), FileAttributes::default()));
+        let r = answer(&self.rt, self.sftp.open(0, path.into(), flags.bits(), FileAttributes::default()));
 
         let r = r.map(|h| h.handle);
         assert_eq!(r.is_ok(), expect_ok, "open {path} {flags:?}: {r:?}");
@@ -292,7 +298,7 @@ impl Fs {
         let off = tc.draw(gs::integers::<usize>().max_value(len + 3));
         let data = tc.draw(gs::binary().max_size(16));
         let h = self.open[i].0.clone();
-        let r = self.rt.block_on(self.sftp.write(0, h.clone(), off as u64, data.clone()));
+        let r = answer(&self.rt, self.sftp.write(0, h.clone(), off as u64, data.clone()));
         match &mut self.open[i].1 {
             Kind::File { inode, flags } => {
                 // Writing nothing touches nothing, and succeeds.
@@ -316,7 +322,7 @@ impl Fs {
         let readable = matches!(k, Kind::File { flags, .. } if flags.readable());
         let off = tc.draw(gs::integers::<usize>().max_value(contents.len() + 2));
         let n = tc.draw(gs::integers::<u32>().max_value(24));
-        let r = self.rt.block_on(self.sftp.read(0, h.clone(), off as u64, n)).map(|d| d.data);
+        let r = answer(&self.rt, self.sftp.read(0, h.clone(), off as u64, n)).map(|d| d.data);
         if !readable && n > 0 {
             // Opened for writing only.
             assert!(r.is_err(), "read {h}: {r:?}");
@@ -335,7 +341,7 @@ impl Fs {
     fn close(&mut self, tc: TestCase) {
         let Some(i) = self.draw_open(&tc) else { return };
         let (h, k) = self.open.remove(i);
-        let r = self.rt.block_on(self.sftp.close(0, h.clone()));
+        let r = answer(&self.rt, self.sftp.close(0, h.clone()));
         assert!(r.is_ok(), "close {h}: {r:?}");
         self.closed.push(h);
         if let Kind::Upload { requested, data } = k {
@@ -359,10 +365,10 @@ impl Fs {
         let h = self.closed[i].clone();
         let (rt, sftp) = (&self.rt, &mut self.sftp);
         let failed = |r: Result<_, StatusCode>| assert_eq!(r.err(), Some(StatusCode::Failure), "{h}");
-        failed(rt.block_on(sftp.read(0, h.clone(), 0, 1)).map(drop));
-        failed(rt.block_on(sftp.write(0, h.clone(), 0, b"x".to_vec())).map(drop));
-        failed(rt.block_on(sftp.fstat(0, h.clone())).map(drop));
-        failed(rt.block_on(sftp.close(0, h.clone())).map(drop));
+        failed(answer(rt, sftp.read(0, h.clone(), 0, 1)).map(drop));
+        failed(answer(rt, sftp.write(0, h.clone(), 0, b"x".to_vec())).map(drop));
+        failed(answer(rt, sftp.fstat(0, h.clone())).map(drop));
+        failed(answer(rt, sftp.close(0, h.clone())).map(drop));
     }
 
     #[rule]
@@ -370,7 +376,7 @@ impl Fs {
         let path = self.draw_file(&tc);
         let want = self.visible_size(path).map(|n| Some(n as u64)).ok_or(StatusCode::NoSuchFile);
 
-        let r = self.rt.block_on(self.sftp.stat(0, path.into())).map(|a| a.attrs.size);
+        let r = answer(&self.rt, self.sftp.stat(0, path.into())).map(|a| a.attrs.size);
 
         assert_eq!(r, want, "stat {path}");
     }
@@ -385,7 +391,7 @@ impl Fs {
     #[rule]
     fn rename(&mut self, tc: TestCase) {
         let (from, to) = (self.draw_file(&tc), self.draw_file(&tc));
-        let r = self.rt.block_on(self.sftp.rename(0, from.into(), to.into()));
+        let r = answer(&self.rt, self.sftp.rename(0, from.into(), to.into()));
         if self.mode != FileServeMode::ReadWrite {
             assert_eq!(r.err(), Some(StatusCode::PermissionDenied));
             return;
@@ -400,7 +406,7 @@ impl Fs {
     #[rule]
     fn remove(&mut self, tc: TestCase) {
         let path = self.draw_file(&tc);
-        let r = self.rt.block_on(self.sftp.remove(0, path.into()));
+        let r = answer(&self.rt, self.sftp.remove(0, path.into()));
         if self.mode != FileServeMode::ReadWrite {
             assert_eq!(r.err(), Some(StatusCode::PermissionDenied));
             return;
@@ -411,7 +417,7 @@ impl Fs {
     #[rule]
     fn mkdir(&mut self, tc: TestCase) {
         let dir = tc.draw(gs::sampled_from(&DIRS[..]));
-        let r = self.rt.block_on(self.sftp.mkdir(0, dir.into(), FileAttributes::default()));
+        let r = answer(&self.rt, self.sftp.mkdir(0, dir.into(), FileAttributes::default()));
         if matches!(self.mode, FileServeMode::ReadOnly | FileServeMode::WriteOnly) {
             assert_eq!(r.err(), Some(StatusCode::PermissionDenied));
             return;
