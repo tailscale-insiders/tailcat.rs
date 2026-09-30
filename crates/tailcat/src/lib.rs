@@ -112,6 +112,10 @@ pub enum Error {
     Certificate(#[from] rcgen::Error),
     #[error("task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    #[error("base64 decode: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("CBOR unmarshal: {0}")]
+    Cbor(#[from] ciborium::de::Error<io::Error>),
     /// An SFTP request refused with a status.
     #[cfg(feature = "ssh")]
     #[error("SFTP: {0}")]

@@ -546,8 +546,8 @@ fn decode_region(v: Value, idx: usize) -> Result<DerpRegion> {
 impl Wire {
     fn decode(addr: &Addr) -> Result<Self> {
         let rest = addr.0.strip_prefix("tc").ok_or_else(|| bad("tailcat address doesn't start with \"tc\""))?;
-        let raw = URL_SAFE_NO_PAD.decode(rest).map_err(|e| bad(format!("base64 decode: {e}")))?;
-        let v: Value = ciborium::from_reader(raw.as_slice()).map_err(|e| bad(format!("CBOR unmarshal: {e}")))?;
+        let raw = URL_SAFE_NO_PAD.decode(rest)?;
+        let v: Value = ciborium::from_reader(raw.as_slice())?;
         let (mut server_public, mut server_disco_public, mut preshared_key) = (None, None, None);
         let (mut region, mut region_id) = (Vec::new(), 0);
         for (k, v) in entries(v, "address")? {
