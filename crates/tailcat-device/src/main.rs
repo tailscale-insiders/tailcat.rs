@@ -137,7 +137,7 @@ struct UpArgs {
     /// Write peer status JSON here, periodically.
     #[arg(long)]
     status_file: Option<PathBuf>,
-    /// Create this file once every expected peer has answered a ping.
+    /// Create this file once every expected peer has answered a ping, and no other node has our address.
     #[arg(long)]
     ready_file: Option<PathBuf>,
     /// How often to log peer status.
@@ -338,9 +338,12 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
                     Err(e) => warn!("polling records: {e:#}"),
                 }
             }
+            // Pings go by node key, so they're answered even when our run's
+            // nodes send what's for our address to another node.
             if let Some(n) = expected
                 && !ready
                 && overlay.peer_count() >= n
+                && !overlay.contested().iter().any(|(net, _)| *net == IpNet::host(me.overlay_ip))
                 && all_reachable(&overlay).await
             {
                 ready = true;

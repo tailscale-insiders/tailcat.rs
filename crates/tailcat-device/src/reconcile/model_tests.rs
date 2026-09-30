@@ -301,6 +301,36 @@ fn our_runs_nodes_agree(tc: TestCase) {
     }
 }
 
+/// The claims of ours that `contested` lists, and to whom, are those
+/// that a node of our run attempt, polling the same records and ours,
+/// routes to another node; in a run or outside one.
+#[hegel::test(test_cases = 1000)]
+fn contested_claims_are_routed_elsewhere(tc: TestCase) {
+    let no_run = tc.draw(gs::booleans());
+    let run =
+        |r: NodeRecord| if no_run { NodeRecord { run_id: String::new(), run_attempt: String::new(), ..r } } else { r };
+    // A key in the middle, so that records of our run can outrank us.
+    let me = run(NodeRecord { routes: draw_me(&tc).routes, ..record(3, 0, 0, 0, &[]) });
+    let viewer = run(record(6, 4, 0, 4, &[]));
+    let mut polled: Vec<NodeRecord> = draw_poll(&tc)
+        .into_iter()
+        .filter(|r| ![me.nodekey, viewer.nodekey].contains(&r.nodekey) && r.overlay_ip != viewer.overlay_ip)
+        .collect();
+    polled.extend([me.clone(), viewer.clone()]);
+    let seen = installed(&from_scratch(&viewer, &polled));
+    let got = contested(&me, &polled);
+    let ours = claims_of(&me);
+    for (n, _) in &ours {
+        let routed = seen.iter().find(|(_, nets)| nets.iter().any(|m| same(m, n))).map(|(k, _)| *k);
+        let listed = got.iter().find(|(m, _)| same(m, n)).map(|(_, r)| r.nodekey);
+        assert_eq!(listed, routed.filter(|k| *k != me.nodekey), "{n}, polling {polled:?}");
+    }
+    for (n, r) in &got {
+        assert!(ours.iter().any(|(m, _)| same(m, n)), "{n} isn't ours");
+        assert!(polled.contains(r), "{r:?} wasn't polled");
+    }
+}
+
 /// Polling the same records again changes nothing.
 #[hegel::test(test_cases = 500)]
 fn repeated_polls_change_nothing(tc: TestCase) {

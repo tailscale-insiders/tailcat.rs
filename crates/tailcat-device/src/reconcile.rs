@@ -49,7 +49,7 @@ pub enum Change {
 /// record, the peer there is the best of those records by [`rank`];
 /// peers missing from the poll are removed. Records with our node key,
 /// or at an address we claim, never become peers. The prefixes the
-/// peers claim are then shared out, as `assign` says.
+/// peers claim are then shared out, as `owners` says.
 pub fn reconcile(me: &NodeRecord, current: &HashMap<NodePublic, Peer>, polled: &[NodeRecord]) -> Vec<Change> {
     let want = select(me, polled);
     let mut removed: Vec<NodePublic> = current.keys().filter(|k| !want.contains_key(k)).copied().collect();
@@ -59,36 +59,59 @@ pub fn reconcile(me: &NodeRecord, current: &HashMap<NodePublic, Peer>, polled: &
     removed.into_iter().map(Change::Remove).chain(upserted.into_iter().map(Change::Upsert)).collect()
 }
 
+/// Those of our claims that the nodes of our own run attempt route to
+/// another node, each with the record of the node it goes to. They rank
+/// records as we do, so they share out a poll as [`reconcile`] would if
+/// we weren't us: a better record at our address takes it, and with it
+/// everything we claim, and a better claim to one of our routes takes
+/// that. When we're from a GitHub Actions run, a node of another run
+/// never outranks us, so concurrent runs' separate meshes don't count.
+/// Each node leaves out records at its own claims, so a node that claims
+/// one of ours itself may see that claim differently.
+pub fn contested<'a>(me: &'a NodeRecord, polled: &'a [NodeRecord]) -> Vec<(IpNet, &'a NodeRecord)> {
+    let others = polled.iter().filter(|r| r.nodekey != me.nodekey);
+    let chosen = chosen(me, others.chain(std::iter::once(me)), |_| false);
+    let owner = owners(me, &HashSet::new(), &chosen);
+    let mut out: Vec<(IpNet, &NodeRecord)> = Vec::new();
+    for (n, _) in claims(me) {
+        if let Some(&(_, o)) = owner.get(&n)
+            && o.nodekey != me.nodekey
+            && !out.iter().any(|(m, _)| *m == n)
+        {
+            out.push((n, o));
+        }
+    }
+    out
+}
+
 /// The peers `polled` calls for.
 fn select(me: &NodeRecord, polled: &[NodeRecord]) -> HashMap<NodePublic, Peer> {
     let ours: HashSet<IpNet> = claims(me).map(|(n, _)| n).collect();
     let mine = |r: &NodeRecord| r.nodekey == me.nodekey || ours.contains(&IpNet::host(r.overlay_ip));
+    assign(me, &ours, &chosen(me, polled, mine))
+}
+
+/// The best record for each key in `records`, then, of those `skip`
+/// leaves, the best at each address.
+fn chosen<'a>(
+    me: &NodeRecord,
+    records: impl IntoIterator<Item = &'a NodeRecord>,
+    skip: impl Fn(&NodeRecord) -> bool,
+) -> Vec<&'a NodeRecord> {
     let mut by_key: HashMap<NodePublic, &NodeRecord> = HashMap::new();
-    for r in polled {
+    for r in records {
         offer(me, &mut by_key, r.nodekey, r);
     }
     let mut by_ip: HashMap<IpAddr, &NodeRecord> = HashMap::new();
-    for r in by_key.values().filter(|r| !mine(r)) {
+    for r in by_key.into_values().filter(|r| !skip(r)) {
         offer(me, &mut by_ip, r.overlay_ip, r);
     }
-    let chosen: Vec<&NodeRecord> = by_ip.into_values().collect();
-    assign(me, &ours, &chosen)
+    by_ip.into_values().collect()
 }
 
-/// Shares out the prefixes `peers` claim, excluding `ours`: a peer's
-/// address is its own, and a route that is no one's address goes to the
-/// best of the peers claiming it by [`rank`]. Prefixes are compared with
-/// their host bits cleared, as the engine matches them.
+/// Routes each peer the prefixes it owns, as `owners` says.
 fn assign(me: &NodeRecord, ours: &HashSet<IpNet>, peers: &[&NodeRecord]) -> HashMap<NodePublic, Peer> {
-    let mut owner: HashMap<IpNet, (Claim, &NodeRecord)> = HashMap::new();
-    for &r in peers {
-        for (n, c) in claims(r).filter(|(n, _)| !ours.contains(n)) {
-            let best = owner.entry(n).or_insert((c, r));
-            if c.cmp(&best.0).then_with(|| rank(me, r, best.1)).is_lt() {
-                *best = (c, r);
-            }
-        }
-    }
+    let owner = owners(me, ours, peers);
     peers
         .iter()
         .map(|&r| {
@@ -101,6 +124,27 @@ fn assign(me: &NodeRecord, ours: &HashSet<IpNet>, peers: &[&NodeRecord]) -> Hash
             (r.nodekey, Peer { record: r.clone(), allowed_ips })
         })
         .collect()
+}
+
+/// Shares out the prefixes `peers` claim, excluding `ours`: a peer's
+/// address is its own, and a route that is no one's address goes to the
+/// best of the peers claiming it by [`rank`]. Prefixes are compared with
+/// their host bits cleared, as the engine matches them.
+fn owners<'a>(
+    me: &NodeRecord,
+    ours: &HashSet<IpNet>,
+    peers: &[&'a NodeRecord],
+) -> HashMap<IpNet, (Claim, &'a NodeRecord)> {
+    let mut owner: HashMap<IpNet, (Claim, &NodeRecord)> = HashMap::new();
+    for &r in peers {
+        for (n, c) in claims(r).filter(|(n, _)| !ours.contains(n)) {
+            let best = owner.entry(n).or_insert((c, r));
+            if c.cmp(&best.0).then_with(|| rank(me, r, best.1)).is_lt() {
+                *best = (c, r);
+            }
+        }
+    }
+    owner
 }
 
 /// How a record claims a prefix, strongest first.
@@ -287,6 +331,41 @@ mod tests {
             from_scratch(&[me(), squatter, at_our_route, greedy.clone()]),
             [peer(&greedy, &["100.64.1.1", "10.42.0.0/16"])]
         );
+    }
+
+    /// Our run's nodes give our address to a better record there, and our
+    /// routes to better claims to them; we're told which, and to whom.
+    #[test]
+    fn contested_claims() {
+        let net = |s: &str| s.parse::<IpNet>().unwrap();
+        let me = routing(record(5, 0, 0, 0), &["10.42.9.0/24", "100.64.1.9"]);
+        let stale = NodeRecord { index: 7, ..me.clone() };
+        let foreign = record(1, 0, 1, 0);
+        let higher = routing(record(6, 2, 0, 2), &["10.42.9.0/24"]);
+        assert_eq!(
+            contested(&me, &[stale.clone(), foreign.clone(), higher.clone()]),
+            [],
+            "another run is its own mesh"
+        );
+
+        let lower = routing(record(2, 1, 0, 1), &["10.42.9.0/24"]);
+        let at_route = record(7, 9, 0, 9);
+        assert_eq!(
+            contested(&me, &[me.clone(), lower.clone(), at_route.clone(), higher.clone()]),
+            [(net("10.42.9.0/24"), &lower), (net("100.64.1.9/32"), &at_route)],
+            "a lower key takes a route, and an address beats a route"
+        );
+
+        // Our address goes, and with it our routes, to whoever else claims them.
+        let squatter = record(3, 0, 0, 0);
+        assert_eq!(
+            contested(&me, &[squatter.clone(), higher.clone(), lower.clone()]),
+            [(net("100.64.1.0/32"), &squatter), (net("10.42.9.0/24"), &lower)]
+        );
+
+        // Outside GitHub Actions, the lower key wins.
+        let me = NodeRecord { run_id: String::new(), run_attempt: String::new(), ..me };
+        assert_eq!(contested(&me, std::slice::from_ref(&foreign)), [(net("100.64.1.0/32"), &foreign)]);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tailcat::derp::server::DevDerp;
+use tailcat::wg::IpNet;
 use tailcat::{DerpMap, DerpNode, DerpRegion, NodePrivate};
 use tailcat_device::overlay::EMBEDDED_REGION_BASE;
 use tailcat_device::{ChannelDevice, DeviceKey, NodeRecord, Overlay, OverlayConfig, PacketDevice};
@@ -164,6 +165,29 @@ async fn duplicate_addresses_settle() {
         assert_eq!(st.iter().map(|p| p.nodekey).collect::<Vec<_>>(), [ours.nodekey], "our own run's node wins");
         assert!(st[0].handshake_age_secs.is_some(), "the session was torn down");
     }
+}
+
+/// A node of our run with a lower key at our address takes it from us,
+/// and the overlay says so until its record is gone; another run's node
+/// there doesn't.
+#[tokio::test]
+async fn a_lost_address_is_reported() {
+    let dev = DevDerp::start_local().await.unwrap();
+    let run = |r: NodeRecord, id: &str| NodeRecord { run_id: id.into(), routes: Vec::new(), ..r };
+    let private = NodePrivate::generate();
+    let me = start(private.clone(), run(record(0, &private, &dev), "7")).await.overlay;
+    let mine = me.record().clone();
+    let lower = || std::iter::repeat_with(NodePrivate::generate).find(|k| k.public() < mine.nodekey).unwrap();
+    let squatter = run(record(0, &lower(), &dev), "7");
+    let foreign = run(record(0, &lower(), &dev), "8");
+    let dm = DerpMap::default();
+    me.sync(&[mine.clone(), foreign.clone()], &dm);
+    assert_eq!(me.contested(), []);
+    me.sync(&[mine.clone(), squatter.clone(), foreign.clone()], &dm);
+    assert_eq!(me.contested(), [(IpNet::host(mine.overlay_ip), squatter.nodekey)]);
+    assert_eq!(me.peer_count(), 0, "neither is a peer");
+    me.sync(&[mine.clone(), foreign], &dm);
+    assert_eq!(me.contested(), []);
 }
 
 /// Sends packets from `a` to `b` until one arrives.

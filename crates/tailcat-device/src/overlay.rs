@@ -22,7 +22,7 @@ use tailcat::{DerpMap, DerpRegion, NodePublic, PresharedKey};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::reconcile::{Change, Peer, reconcile};
+use crate::reconcile::{Change, Peer, contested, reconcile};
 use crate::record::{DeviceKey, NodeRecord};
 
 /// Something that carries raw IP packets: a TUN device, or a channel in
@@ -94,6 +94,9 @@ pub struct Overlay {
 #[derive(Default)]
 struct State {
     peers: HashMap<NodePublic, Peer>,
+    /// Our claims that our run's nodes route elsewhere, as of the last
+    /// sync, and the node each goes to.
+    contested: Vec<(IpNet, NodePublic)>,
     /// Distinct embedded regions (with their IDs zeroed), each known by
     /// `EMBEDDED_REGION_BASE` plus its position.
     embedded: Vec<DerpRegion>,
@@ -180,9 +183,29 @@ impl Overlay {
     /// route to one peer, chosen the same way however often and in
     /// whatever order records are polled. Records whose home region isn't
     /// known are skipped, and peers whose records the poll leaves out are
-    /// removed.
+    /// removed. Claims of ours that our run's nodes route elsewhere, as
+    /// [`contested`] says, are logged when that changes.
     pub fn sync(&self, polled: &[NodeRecord], dm: &DerpMap) {
         let mut st = self.state.lock().unwrap();
+        let contested = contested(&self.me, polled);
+        for (n, r) in &contested {
+            if st.contested.contains(&(*n, r.nodekey)) {
+                continue;
+            }
+            let who = format!("node {} ({})", r.index, r.nodekey.short_string());
+            if *n == IpNet::host(self.me.overlay_ip) {
+                let ip = self.me.overlay_ip;
+                warn!("overlay: {who} outranks us at our address {ip}, so our run's nodes send it all of our traffic");
+            } else {
+                warn!("overlay: {who} outranks our claim to {n}, so our run's nodes route {n} to it");
+            }
+        }
+        for (n, _) in &st.contested {
+            if !contested.iter().any(|(m, _)| m == n) {
+                info!("overlay: our run's nodes route {n} to us again");
+            }
+        }
+        st.contested = contested.into_iter().map(|(n, r)| (n, r.nodekey)).collect();
         let usable: Vec<NodeRecord> = polled
             .iter()
             .filter(|r| {
@@ -274,6 +297,12 @@ impl Overlay {
     /// The number of peers.
     pub fn peer_count(&self) -> usize {
         self.state.lock().unwrap().peers.len()
+    }
+
+    /// Our claims that our run's nodes route elsewhere, as of the last
+    /// [`Overlay::sync`], and the node each goes to.
+    pub fn contested(&self) -> Vec<(IpNet, NodePublic)> {
+        self.state.lock().unwrap().contested.clone()
     }
 
     /// Carries packets between `dev` and the peers until either fails or
