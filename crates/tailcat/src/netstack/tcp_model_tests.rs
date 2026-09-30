@@ -7,11 +7,19 @@
 //! ended, and the stack's flow table against its sockets.
 
 use std::collections::HashSet;
+use std::future::poll_fn;
+use std::mem;
+use std::pin::pin;
+use std::ptr;
+use std::sync::atomic::AtomicUsize;
 use std::task::Waker;
 
 use hegel::TestCase;
 use hegel::generators as gs;
 use smoltcp::wire::{TcpControl, TcpSeqNumber};
+use tokio::runtime::{self, Runtime};
+use tokio::task::yield_now;
+use tokio::time::{self, Instant};
 
 use super::model_tests::segment;
 use super::*;
@@ -30,6 +38,39 @@ fn local_ip() -> IpAddr {
 
 fn remote_ip() -> IpAddr {
     "fd7a:115c:a1e0::2".parse().unwrap()
+}
+
+/// The 4-tuple of a connection to us from the remote's `port`.
+fn inbound(port: u16) -> FlowKey {
+    (SocketAddr::new(local_ip(), SERVICE), SocketAddr::new(remote_ip(), port))
+}
+
+/// A current-thread runtime on a paused clock.
+fn paused_runtime() -> Runtime {
+    runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap()
+}
+
+fn stack_config() -> StackConfig {
+    StackConfig { addrs: vec![local_ip()], any_ip: false, mtu: 1280 }
+}
+
+/// A policy that accepts every connection, handing its stream to `accepted`.
+fn accept_into(accepted: Arc<Mutex<Vec<TcpStream>>>) -> TcpPolicy {
+    Arc::new(move |_src, _dst| {
+        let accepted = accepted.clone();
+        TcpDecision::Accept(Box::new(move |s| accepted.lock().unwrap().push(s)))
+    })
+}
+
+/// Polls `f` once, with a waker that does nothing.
+fn poll_once<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
+    f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// Draws one of `items`, or rejects the rule if there are none.
+fn draw_from<T: Copy>(tc: &TestCase, items: &[T]) -> T {
+    tc.assume(!items.is_empty());
+    items[tc.draw(gs::integers::<usize>().max_value(items.len() - 1))]
 }
 
 type Dial = Pin<Box<dyn Future<Output = io::Result<TcpStream>>>>;
@@ -52,11 +93,11 @@ struct Conn {
     fin: bool,
     reset: bool,
     /// Whether the remote has gone silent for good, and since when.
-    dead: Option<tokio::time::Instant>,
+    dead: Option<Instant>,
     /// When the stack started trying to reach the remote (its dial), and
     /// when the remote answered.
-    started: tokio::time::Instant,
-    answered: Option<tokio::time::Instant>,
+    started: Instant,
+    answered: Option<Instant>,
     /// What the remote got from the stack.
     got: Vec<u8>,
     got_fin: bool,
@@ -73,13 +114,13 @@ struct Conn {
     /// We aborted it, or closed the stack.
     aborted: bool,
     /// When the stream was dropped (or the dial given up).
-    dropped: Option<tokio::time::Instant>,
+    dropped: Option<Instant>,
     received: Vec<u8>,
     end: Option<Result<(), io::ErrorKind>>,
 }
 
 impl Conn {
-    fn new(remote: SocketAddr, dialed: bool, isn: TcpSeqNumber, now: tokio::time::Instant) -> Conn {
+    fn new(remote: SocketAddr, dialed: bool, isn: TcpSeqNumber, now: Instant) -> Conn {
         Conn {
             key: None,
             remote,
@@ -137,6 +178,83 @@ impl Conn {
         self.reset || self.got_rst || self.aborted
     }
 
+    /// Whether the remote got our SYN-ACK, and could still ack it.
+    fn awaiting_ack(&self) -> bool {
+        !self.dialed && self.stack_isn.is_some() && !self.established && self.talking()
+    }
+
+    /// Whether the remote got our SYN, and could still answer it.
+    fn awaiting_answer(&self) -> bool {
+        self.dialed && self.stack_isn.is_some() && self.answered.is_none() && self.talking()
+    }
+
+    /// Whether the remote can send data or a FIN.
+    fn can_send(&self) -> bool {
+        self.established && self.talking() && !self.fin
+    }
+
+    /// Whether an accepted connection's handshake has had more than its
+    /// time.
+    fn handshake_overdue(&self, now: Instant) -> bool {
+        now - self.started > ACCEPT_TIMEOUT + SLACK
+    }
+
+    /// Whether the remote was silent long enough for the stack to give up
+    /// on the connection: it went away, or never answered our SYN.
+    fn silent_for(&self, now: Instant) -> Option<Duration> {
+        if let Some(t) = self.dead {
+            return Some(now - t);
+        }
+        if self.dialed && self.answered.is_none() && !self.reset {
+            return Some(now - self.started);
+        }
+        None
+    }
+
+    /// Whether the remote was silent long enough for the stack to time
+    /// the connection out.
+    fn may_have_timed_out(&self, now: Instant) -> bool {
+        self.silent_for(now).is_some_and(|d| d + SLACK >= TCP_TIMEOUT)
+    }
+
+    /// Whether the stack should have timed the connection out by now.
+    fn must_have_timed_out(&self, now: Instant) -> bool {
+        self.silent_for(now).is_some_and(|d| d > TCP_TIMEOUT + SLACK)
+    }
+
+    /// Whether a RST from the stack is for this connection, as a real
+    /// peer would check.
+    fn is_our_rst(&self, tcp: &TcpPacket<&[u8]>) -> bool {
+        match self.ack() {
+            None => tcp.ack() && tcp.ack_number() == self.isn + 1,
+            Some(ack) => tcp.seq_number() == ack,
+        }
+    }
+
+    /// The errors a write may fail with, given how the connection ended.
+    fn write_errors(&self) -> &'static [io::ErrorKind] {
+        if self.aborted {
+            &[io::ErrorKind::ConnectionAborted]
+        } else if self.reset {
+            &[io::ErrorKind::ConnectionReset]
+        } else if self.write_closed {
+            &[io::ErrorKind::BrokenPipe, io::ErrorKind::TimedOut]
+        } else {
+            // Any RST of ours was for a timeout.
+            &[io::ErrorKind::TimedOut]
+        }
+    }
+
+    /// Whether a read failing with `kind` fits how the connection ended.
+    fn read_error_fits(&self, kind: io::ErrorKind, now: Instant) -> bool {
+        match kind {
+            io::ErrorKind::ConnectionReset => self.reset,
+            io::ErrorKind::ConnectionAborted => self.aborted,
+            io::ErrorKind::TimedOut => self.may_have_timed_out(now) && !self.reset && !self.aborted,
+            _ => false,
+        }
+    }
+
     /// Reads whatever `stream` has, without waiting.
     fn read(&mut self) {
         let Some(s) = &mut self.stream else { return };
@@ -163,7 +281,7 @@ impl Conn {
 }
 
 struct Net {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     stack: Stack,
     out: Arc<Mutex<Vec<Vec<u8>>>>,
     accepted: Arc<Mutex<Vec<TcpStream>>>,
@@ -176,21 +294,13 @@ struct Net {
 
 impl Net {
     fn new() -> Net {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        let rt = paused_runtime();
         let _guard = rt.enter();
         let out: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let accepted: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
-        let (o, a) = (out.clone(), accepted.clone());
-        let policy: TcpPolicy = Arc::new(move |_src, _dst| {
-            let a = a.clone();
-            TcpDecision::Accept(Box::new(move |s| a.lock().unwrap().push(s)))
-        });
-        let stack = Stack::new(
-            StackConfig { addrs: vec![local_ip()], any_ip: false, mtu: 1280 },
-            Arc::new(move |p| o.lock().unwrap().push(p)),
-            Some(policy),
-            None,
-        );
+        let o = out.clone();
+        let emit: Output = Arc::new(move |p| o.lock().unwrap().push(p));
+        let stack = Stack::new(stack_config(), emit, Some(accept_into(accepted.clone())), None);
         Net { rt, stack, out, accepted, conns: Vec::new(), live: HashMap::new(), next_isn: 1000, closed: false }
     }
 
@@ -200,13 +310,27 @@ impl Net {
         self.stack.inject(pkt);
     }
 
-    fn now(&self) -> tokio::time::Instant {
-        self.rt.block_on(async { tokio::time::Instant::now() })
+    fn now(&self) -> Instant {
+        self.rt.block_on(async { Instant::now() })
     }
 
     fn isn(&mut self) -> TcpSeqNumber {
         self.next_isn += 100_000;
         TcpSeqNumber(self.next_isn)
+    }
+
+    /// Whether `c` is the latest connection on its 4-tuple.
+    fn is_latest(&self, c: &Conn) -> bool {
+        c.key.and_then(|key| self.live.get(&key)).is_some_and(|&i| ptr::eq(&self.conns[i], c))
+    }
+
+    /// Lets the runtime's tasks, the stack's poll loop among them, run.
+    fn let_tasks_run(&self) {
+        self.rt.block_on(async {
+            for _ in 0..16 {
+                yield_now().await;
+            }
+        });
     }
 
     /// Lets the stack run until it's quiet: the remotes see what it sent
@@ -217,40 +341,35 @@ impl Net {
         let rt = self.rt.handle().clone();
         let _guard = rt.enter();
         for _ in 0..64 {
-            self.rt.block_on(async {
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
-            });
+            self.let_tasks_run();
             let dialed = self.poll_dials();
-            let out = std::mem::take(&mut *self.out.lock().unwrap());
-            let accepted = std::mem::take(&mut *self.accepted.lock().unwrap());
+            let out = mem::take(&mut *self.out.lock().unwrap());
+            let accepted = mem::take(&mut *self.accepted.lock().unwrap());
             if out.is_empty() && accepted.is_empty() && !dialed {
                 break;
             }
             out.into_iter().for_each(|p| self.deliver(p));
-            for s in accepted {
-                let key = (s.local_addr(), s.peer_addr());
-                let c = self
-                    .live
-                    .get(&key)
-                    .map(|&i| &mut self.conns[i])
-                    .unwrap_or_else(|| panic!("{s:?} was accepted, but never connected"));
-                assert!(!c.dialed && !c.handed_off, "{} was handed off twice", c.name());
-                c.handed_off = true;
-                c.stream = Some(s);
-            }
+            accepted.into_iter().for_each(|s| self.hand_off(s));
         }
         self.conns.iter_mut().for_each(Conn::read);
     }
 
+    /// The handler passes us a connection it accepted.
+    fn hand_off(&mut self, s: TcpStream) {
+        let key = (s.local_addr(), s.peer_addr());
+        let Some(&i) = self.live.get(&key) else { panic!("{s:?} was accepted, but never connected") };
+        let c = &mut self.conns[i];
+        assert!(!c.dialed && !c.handed_off, "{} was handed off twice", c.name());
+        c.handed_off = true;
+        c.stream = Some(s);
+    }
+
     /// Polls the dials in progress, and says whether any finished.
     fn poll_dials(&mut self) -> bool {
-        let mut cx = Context::from_waker(Waker::noop());
         let mut done = false;
         for c in &mut self.conns {
             let Some(d) = &mut c.dial else { continue };
-            let Poll::Ready(r) = d.as_mut().poll(&mut cx) else { continue };
+            let Poll::Ready(r) = poll_once(d.as_mut()) else { continue };
             c.dial = None;
             done = true;
             match r {
@@ -264,31 +383,32 @@ impl Net {
         done
     }
 
+    /// The connection a segment from the stack on `key` is for: the latest
+    /// on its 4-tuple, or, for a dial's first SYN, the dial it starts.
+    fn conn_for(&mut self, key: FlowKey, tcp: &TcpPacket<&[u8]>) -> Option<usize> {
+        let latest = self.live.get(&key).copied();
+        let retransmitted = latest.is_some_and(|i| self.conns[i].stack_isn == Some(tcp.seq_number()));
+        if !tcp.syn() || tcp.ack() || retransmitted {
+            return latest;
+        }
+        let (_, remote) = key;
+        let i = self.conns.iter().position(|c| c.dialed && c.key.is_none() && c.remote == remote)?;
+        self.conns[i].key = Some(key);
+        self.live.insert(key, i);
+        Some(i)
+    }
+
     /// A segment from the stack reaches its remote.
     fn deliver(&mut self, p: Vec<u8>) {
         let ip = Ipv6Packet::new_checked(&p[..]).unwrap();
         let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else { return };
         let local = SocketAddr::new(IpAddr::from(ip.src_addr()), tcp.src_port());
         let remote = SocketAddr::new(IpAddr::from(ip.dst_addr()), tcp.dst_port());
-        let key = (local, remote);
-        let mut i = self.live.get(&key).copied();
-        if tcp.syn() && !tcp.ack() && i.is_none_or(|i| self.conns[i].stack_isn != Some(tcp.seq_number())) {
-            // A dial's first SYN.
-            let Some(j) = self.conns.iter().position(|c| c.dialed && c.key.is_none() && c.remote == remote) else {
-                return;
-            };
-            self.conns[j].key = Some(key);
-            self.live.insert(key, j);
-            i = Some(j);
-        }
-        let Some(i) = i else { return };
+        let Some(i) = self.conn_for((local, remote), &tcp) else { return };
         let c = &mut self.conns[i];
         if tcp.rst() {
             // Like a real peer, ignore RSTs that aren't for this connection.
-            c.got_rst |= match c.stack_isn {
-                None => tcp.ack() && tcp.ack_number() == c.isn + 1,
-                Some(isn) => tcp.seq_number() == isn + 1 + c.got.len() + usize::from(c.got_fin),
-            };
+            c.got_rst |= c.is_our_rst(&tcp);
             return;
         }
         if tcp.syn() {
@@ -317,11 +437,15 @@ impl Net {
         }
     }
 
+    /// Picks a connection whose index satisfies `f`, or rejects the rule.
+    fn pick_where(&self, tc: &TestCase, f: impl Fn(usize) -> bool) -> usize {
+        let ok: Vec<usize> = (0..self.conns.len()).filter(|&i| f(i)).collect();
+        draw_from(tc, &ok)
+    }
+
     /// Picks a connection that satisfies `f`, or rejects the rule.
     fn pick(&self, tc: &TestCase, f: impl Fn(&Conn) -> bool) -> usize {
-        let ok: Vec<usize> = (0..self.conns.len()).filter(|&i| f(&self.conns[i])).collect();
-        tc.assume(!ok.is_empty());
-        ok[tc.draw(gs::integers::<usize>().max_value(ok.len() - 1))]
+        self.pick_where(tc, |i| f(&self.conns[i]))
     }
 
     /// The remote sends a segment on connection `i`.
@@ -339,15 +463,11 @@ impl Net {
     /// Lets `d` pass, a little at a time so the remotes keep up.
     fn wait(&mut self, d: Duration) {
         let end = self.now() + d;
-        loop {
-            let now = self.now();
-            if now >= end {
-                break;
-            }
-            let step = (end - now).min(Duration::from_secs(1));
+        while self.now() < end {
+            let step = (end - self.now()).min(Duration::from_secs(1));
             // advance rather than sleep: a busy poll loop would keep a
             // paused clock from moving on by itself.
-            self.rt.block_on(tokio::time::advance(step));
+            self.rt.block_on(time::advance(step));
             self.settle();
         }
     }
@@ -355,30 +475,18 @@ impl Net {
     /// Runs `f` for up to `limit`, stepping the paused clock.
     fn run_for<F: Future>(&self, f: F, limit: Duration) -> Option<F::Output> {
         self.rt.block_on(async {
-            let mut f = std::pin::pin!(f);
-            let end = tokio::time::Instant::now() + limit;
+            let mut f = pin!(f);
+            let end = Instant::now() + limit;
             loop {
-                if let Poll::Ready(v) = std::future::poll_fn(|cx| Poll::Ready(f.as_mut().poll(cx))).await {
+                if let Poll::Ready(v) = poll_fn(|cx| Poll::Ready(f.as_mut().poll(cx))).await {
                     return Some(v);
                 }
-                if tokio::time::Instant::now() >= end {
+                if Instant::now() >= end {
                     return None;
                 }
-                tokio::time::advance(Duration::from_millis(10)).await;
+                time::advance(Duration::from_millis(10)).await;
             }
         })
-    }
-
-    /// Whether the remote was silent long enough for the stack to give up
-    /// on the connection: it went away, or never answered our SYN.
-    fn silent_for(&self, c: &Conn, now: tokio::time::Instant) -> Option<Duration> {
-        if let Some(t) = c.dead {
-            return Some(now - t);
-        }
-        if c.dialed && c.answered.is_none() && !c.reset {
-            return Some(now - c.started);
-        }
-        None
     }
 }
 
@@ -387,15 +495,16 @@ impl Net {
     /// A remote opens a connection to us from `port`, and gets a SYN-ACK
     /// unless the stack is closed.
     fn open(&mut self, port: u16) -> usize {
-        let key = (SocketAddr::new(local_ip(), SERVICE), SocketAddr::new(remote_ip(), port));
+        let key = inbound(port);
+        let (local, remote) = key;
         let (isn, now) = (self.isn(), self.now());
-        let mut c = Conn::new(key.1, false, isn, now);
+        let mut c = Conn::new(remote, false, isn, now);
         c.key = Some(key);
         c.answered = Some(now);
         self.conns.push(c);
         let i = self.conns.len() - 1;
         self.live.insert(key, i);
-        self.inject(segment(key.1, key.0, TcpControl::Syn, isn, None, &[]));
+        self.inject(segment(remote, local, TcpControl::Syn, isn, None, &[]));
         self.settle();
         let c = &self.conns[i];
         if !self.closed {
@@ -417,14 +526,14 @@ impl Net {
         let mut c = Conn::new(remote, true, isn, now);
         let stack = self.stack.clone();
         let mut d: Dial = Box::pin(async move { stack.dial_tcp(local_ip(), remote).await });
-        {
+        let polled = {
             let _guard = self.rt.enter();
-            let mut cx = Context::from_waker(Waker::noop());
-            match d.as_mut().poll(&mut cx) {
-                Poll::Ready(Ok(s)) => panic!("dial connected at once: {s:?}"),
-                Poll::Ready(Err(e)) => c.dial_result = Some(Err(e.kind())),
-                Poll::Pending => c.dial = Some(d),
-            }
+            poll_once(d.as_mut())
+        };
+        match polled {
+            Poll::Ready(Ok(s)) => panic!("dial connected at once: {s:?}"),
+            Poll::Ready(Err(e)) => c.dial_result = Some(Err(e.kind())),
+            Poll::Pending => c.dial = Some(d),
         }
         self.conns.push(c);
         self.settle();
@@ -473,45 +582,49 @@ impl Net {
         self.conns[i].dead = Some(self.now());
     }
 
+    /// The remote sends `data` on connection `i`.
+    fn remote_data(&mut self, i: usize, data: &[u8]) {
+        self.remote_send(i, TcpControl::Psh, data);
+    }
+
+    /// The remote closes its side of connection `i`.
+    fn remote_fin(&mut self, i: usize) {
+        self.remote_send(i, TcpControl::Fin, &[]);
+    }
+
+    /// The remote resets connection `i`.
+    fn remote_reset(&mut self, i: usize) {
+        self.remote_send(i, TcpControl::Rst, &[]);
+    }
+
     /// We write `data`, and check the result.
     fn write(&mut self, i: usize, data: &[u8]) {
         let mut cx = Context::from_waker(Waker::noop());
         let c = &mut self.conns[i];
         let r = Pin::new(c.stream.as_mut().unwrap()).poll_write(&mut cx, data);
-        let name = c.name();
         match r {
             Poll::Ready(Ok(n)) => {
-                assert!(!c.write_closed && !c.broken(), "{name}: a write after it ended succeeded");
+                assert!(!c.write_closed && !c.broken(), "{}: a write after it ended succeeded", c.name());
                 c.written.extend_from_slice(&data[..n]);
             }
-            Poll::Ready(Err(e)) => {
-                let kind = e.kind();
-                let expected: &[io::ErrorKind] = if c.aborted {
-                    &[io::ErrorKind::ConnectionAborted]
-                } else if c.reset {
-                    &[io::ErrorKind::ConnectionReset]
-                } else if c.write_closed {
-                    &[io::ErrorKind::BrokenPipe, io::ErrorKind::TimedOut]
-                } else {
-                    // Any RST of ours was for a timeout.
-                    &[io::ErrorKind::TimedOut]
-                };
-                // A connection that had ended by a FIN before it broke
-                // reports a broken pipe.
-                let fin_first = matches!(c.end, Some(Ok(()))) && kind == io::ErrorKind::BrokenPipe;
-                assert!(expected.contains(&kind) || fin_first, "{name}: write failed with {kind:?}");
-                if kind == io::ErrorKind::TimedOut {
-                    let now = self.now();
-                    let silent = self.silent_for(&self.conns[i], now);
-                    assert!(
-                        silent.is_some_and(|d| d + SLACK >= TCP_TIMEOUT),
-                        "{name} timed out, silent for {silent:?}"
-                    );
-                }
-            }
+            Poll::Ready(Err(e)) => self.check_write_error(i, e.kind()),
             Poll::Pending => {}
         }
         self.settle();
+    }
+
+    /// Checks that a write on connection `i` failed the way it ended.
+    fn check_write_error(&self, i: usize, kind: io::ErrorKind) {
+        let c = &self.conns[i];
+        let name = c.name();
+        // A connection that had ended by a FIN before it broke reports a
+        // broken pipe.
+        let fin_first = matches!(c.end, Some(Ok(()))) && kind == io::ErrorKind::BrokenPipe;
+        assert!(c.write_errors().contains(&kind) || fin_first, "{name}: write failed with {kind:?}");
+        if kind == io::ErrorKind::TimedOut {
+            let silent = c.silent_for(self.now());
+            assert!(silent.is_some_and(|d| d + SLACK >= TCP_TIMEOUT), "{name} timed out, silent for {silent:?}");
+        }
     }
 
     /// We half-close a connection.
@@ -559,10 +672,11 @@ impl Net {
     /// Whether connection `i` is the latest on its 4-tuple, and our socket
     /// for it is in TIME-WAIT.
     fn time_wait(&self, i: usize) -> bool {
-        let Some(key) = self.conns[i].key else { return false };
+        let c = &self.conns[i];
+        let Some(key) = c.key.filter(|_| self.is_latest(c)) else { return false };
         let st = self.stack.shared.lock();
-        self.live.get(&key) == Some(&i)
-            && st.tuples.get(&key).is_some_and(|&h| st.sockets.get::<tcp::Socket>(h).state() == tcp::State::TimeWait)
+        let in_time_wait = |&h: &SocketHandle| st.sockets.get::<tcp::Socket>(h).state() == tcp::State::TimeWait;
+        st.tuples.get(&key).is_some_and(in_time_wait)
     }
 
     /// A delayed duplicate of connection `j`'s SYN arrives while our
@@ -570,18 +684,16 @@ impl Net {
     /// TIME-WAIT. It starts below where `i` ended, so it's old: it opens
     /// no connection, and `i`'s socket keeps the 4-tuple.
     fn replay_syn(&mut self, i: usize, j: usize) {
-        let key = self.conns[i].key.unwrap();
-        assert_eq!(
-            self.conns[j].key,
-            Some(key),
-            "{} isn't on {}'s 4-tuple",
-            self.conns[j].name(),
-            self.conns[i].name()
-        );
+        let (first, dup) = (&self.conns[i], &self.conns[j]);
+        let key = first.key.unwrap();
+        let (local, remote) = key;
+        assert_eq!(dup.key, Some(key), "{} isn't on {}'s 4-tuple", dup.name(), first.name());
         let socket = |net: &Net| net.stack.shared.lock().tuples.get(&key).copied();
-        let (before, stack_isn) = (socket(self), self.conns[i].stack_isn);
-        self.inject(segment(key.1, key.0, TcpControl::Syn, self.conns[j].isn, None, &[]));
+        let (before, stack_isn) = (socket(self), first.stack_isn);
+
+        self.inject(segment(remote, local, TcpControl::Syn, dup.isn, None, &[]));
         self.settle();
+
         let name = self.conns[i].name();
         assert_eq!(self.conns[i].stack_isn, stack_isn, "{name}: an old SYN was answered with a SYN-ACK");
         assert_eq!(socket(self), before, "{name}: an old SYN took the 4-tuple from its TIME-WAIT socket");
@@ -606,13 +718,13 @@ impl Net {
     }
 
     /// Whether the model knows connection `i` to be finished.
-    fn finished(&self, i: usize, now: tokio::time::Instant) -> bool {
+    fn finished(&self, i: usize, now: Instant) -> bool {
         let c = &self.conns[i];
         c.broken()
             || (c.fin && c.fin_acked)
             || (c.dial.is_none() && c.key.is_none())
-            || self.silent_for(c, now).is_some_and(|d| d > TCP_TIMEOUT + SLACK)
-            || (!c.dialed && !c.established && now - c.started > ACCEPT_TIMEOUT + SLACK)
+            || c.must_have_timed_out(now)
+            || (!c.dialed && !c.established && c.handshake_overdue(now))
     }
 
     /// Waits for the stack to drain, which should be at once.
@@ -625,21 +737,38 @@ impl Net {
     }
 }
 
+/// Composite steps, for directed tests.
+impl Net {
+    /// A remote opens a connection to us from `port`, and completes the
+    /// handshake.
+    fn accept_from(&mut self, port: u16) -> usize {
+        let i = self.open(port);
+        self.complete(i);
+        i
+    }
+
+    /// The stack dials the remote, and it answers.
+    fn dial_answered(&mut self) -> usize {
+        let i = self.dial();
+        self.answer(i);
+        i
+    }
+}
+
 #[hegel::state_machine]
 impl Net {
     /// A remote opens a connection to us, on a 4-tuple that's free as far
     /// as it knows.
     #[rule]
     fn open_rule(&mut self, tc: TestCase) {
-        let port = SOURCE_PORTS[tc.draw(gs::integers::<usize>().max_value(SOURCE_PORTS.len() - 1))];
-        let key = (SocketAddr::new(local_ip(), SERVICE), SocketAddr::new(remote_ip(), port));
-        tc.assume(self.live.get(&key).is_none_or(|&i| self.conns[i].over()));
+        let port = draw_from(&tc, &SOURCE_PORTS);
+        tc.assume(self.live.get(&inbound(port)).is_none_or(|&i| self.conns[i].over()));
         self.open(port);
     }
 
     #[rule]
     fn complete_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| !c.dialed && c.stack_isn.is_some() && !c.established && c.talking());
+        let i = self.pick(&tc, Conn::awaiting_ack);
         self.complete(i);
     }
 
@@ -650,13 +779,13 @@ impl Net {
 
     #[rule]
     fn answer_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| c.dialed && c.stack_isn.is_some() && c.answered.is_none() && c.talking());
+        let i = self.pick(&tc, Conn::awaiting_answer);
         self.answer(i);
     }
 
     #[rule]
     fn refuse_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| c.dialed && c.stack_isn.is_some() && c.answered.is_none() && c.talking());
+        let i = self.pick(&tc, Conn::awaiting_answer);
         self.refuse(i);
     }
 
@@ -669,23 +798,23 @@ impl Net {
     /// An established remote sends some data.
     #[rule]
     fn data_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| c.established && c.talking() && !c.fin);
+        let i = self.pick(&tc, Conn::can_send);
         let payload = tc.draw(gs::binary().min_size(1).max_size(16));
-        self.remote_send(i, TcpControl::Psh, &payload);
+        self.remote_data(i, &payload);
     }
 
     /// An established remote closes its side.
     #[rule]
     fn fin_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| c.established && c.talking() && !c.fin);
-        self.remote_send(i, TcpControl::Fin, &[]);
+        let i = self.pick(&tc, Conn::can_send);
+        self.remote_fin(i);
     }
 
     /// A remote resets its connection.
     #[rule]
     fn reset_rule(&mut self, tc: TestCase) {
         let i = self.pick(&tc, |c| c.established && c.talking());
-        self.remote_send(i, TcpControl::Rst, &[]);
+        self.remote_reset(i);
     }
 
     #[rule]
@@ -711,10 +840,10 @@ impl Net {
     /// in TIME-WAIT: rare as two separate steps.
     #[rule]
     fn close_both_rule(&mut self, tc: TestCase) {
-        let i = self.pick(&tc, |c| c.stream.is_some() && c.established && c.talking() && !c.fin && !c.write_closed);
+        let i = self.pick(&tc, |c| c.stream.is_some() && c.can_send() && !c.write_closed);
         self.close_write(i);
         if self.conns[i].talking() {
-            self.remote_send(i, TcpControl::Fin, &[]);
+            self.remote_fin(i);
         }
     }
 
@@ -741,9 +870,7 @@ impl Net {
     /// our side holds in TIME-WAIT.
     #[rule]
     fn replay_syn_rule(&mut self, tc: TestCase) {
-        let waiting: Vec<usize> = (0..self.conns.len()).filter(|&i| self.time_wait(i)).collect();
-        tc.assume(!waiting.is_empty());
-        let i = waiting[tc.draw(gs::integers::<usize>().max_value(waiting.len() - 1))];
+        let i = self.pick_where(&tc, |i| self.time_wait(i));
         let j = self.pick(&tc, |c| c.key == self.conns[i].key);
         self.replay_syn(i, j);
     }
@@ -751,7 +878,7 @@ impl Net {
     /// Time passes.
     #[rule(weight = 2.0)]
     fn pass_time(&mut self, tc: TestCase) {
-        let secs = [1, 5, 31, 125][tc.draw(gs::integers::<usize>().max_value(3))];
+        let secs = draw_from(&tc, &[1, 5, 31, 125]);
         self.wait(Duration::from_secs(secs));
     }
 
@@ -787,17 +914,13 @@ impl Net {
                     assert!(c.fin, "{name} read EOF, but the remote sent no FIN");
                     assert_eq!(c.received, c.sent, "{name} read EOF before all its data");
                 }
-                Some(Err(kind)) => {
-                    let ok = match kind {
-                        io::ErrorKind::ConnectionReset => c.reset,
-                        io::ErrorKind::ConnectionAborted => c.aborted,
-                        io::ErrorKind::TimedOut => {
-                            self.silent_for(c, now).is_some_and(|d| d + SLACK >= TCP_TIMEOUT) && !c.reset && !c.aborted
-                        }
-                        _ => false,
-                    };
-                    assert!(ok, "{name} read {kind:?} (reset {}, aborted {}, dead {:?})", c.reset, c.aborted, c.dead);
-                }
+                Some(Err(kind)) => assert!(
+                    c.read_error_fits(kind, now),
+                    "{name} read {kind:?} (reset {}, aborted {}, dead {:?})",
+                    c.reset,
+                    c.aborted,
+                    c.dead
+                ),
                 None if c.stream.is_some() && c.fin && !c.broken() => {
                     panic!("{name}: the remote sent a FIN, but reads don't end")
                 }
@@ -837,23 +960,21 @@ impl Net {
         let now = self.now();
         let st = self.stack.shared.lock();
         for c in &self.conns {
-            let stalled = !c.dialed && c.stack_isn.is_some() && !c.established && c.talking();
-            if stalled && now - c.started > ACCEPT_TIMEOUT + SLACK {
-                panic!("{}: the stack gave up on the handshake without a RST", c.name());
-            }
+            let name = c.name();
+            let stalled = c.awaiting_ack() && c.handshake_overdue(now);
+            assert!(!stalled, "{name}: the stack gave up on the handshake without a RST");
             let Some(h) = self.socket_locked(c, &st) else { continue };
             let state = st.sockets.get::<tcp::Socket>(h).state();
-            let silent = self.silent_for(c, now);
-            if silent.is_some_and(|d| d > TCP_TIMEOUT + SLACK) {
+            if c.must_have_timed_out(now) {
+                let silent = c.silent_for(now);
                 assert!(
                     matches!(state, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen),
-                    "{}: the remote has been silent for {silent:?}, but the socket is {state}",
-                    c.name()
+                    "{name}: the remote has been silent for {silent:?}, but the socket is {state}"
                 );
             }
-            if c.established && silent.is_none() && !c.broken() && !c.over() {
-                let end = st.end(h);
-                assert_ne!(end, Some(End::TimedOut), "{}: a live remote timed out ({state})", c.name());
+            let alive = c.established && c.silent_for(now).is_none() && !c.broken() && !c.over();
+            if alive {
+                assert_ne!(st.end(h), Some(End::TimedOut), "{name}: a live remote timed out ({state})");
             }
         }
     }
@@ -867,57 +988,74 @@ impl Net {
             return;
         }
         let now = self.now();
-        let mut st = self.stack.shared.lock();
+        self.check_socket_owners();
+        self.check_nothing_overdue();
+        self.check_dropped_sockets_reaped(now);
+    }
+}
+
+/// The parts of the `bookkeeping` invariant.
+impl Net {
+    /// Every socket has exactly one flow and one owner, and removed
+    /// sockets leave nothing behind.
+    fn check_socket_owners(&self) {
+        let st = self.stack.shared.lock();
         let held: HashSet<SocketHandle> = self.conns.iter().filter_map(|c| Some(c.stream.as_ref()?.handle)).collect();
         let live: HashSet<SocketHandle> = st.sockets.iter().map(|(h, _)| h).collect();
         let orphans: HashSet<SocketHandle> = st.orphans.iter().map(|&(h, _)| h).collect();
         assert_eq!(orphans.len(), st.orphans.len(), "a socket was orphaned twice");
-        let dials = self.conns.iter().filter(|c| c.dial.is_some()).count();
-        let mut unowned = 0;
         for (h, s) in st.sockets.iter() {
             let flows: Vec<_> = st.tuples.iter().filter(|&(_, &v)| v == h).map(|(k, _)| k).collect();
             let state = tcp::Socket::downcast(s).unwrap().state();
+            let (is_held, is_orphan) = (held.contains(&h), orphans.contains(&h));
             // A closed socket a stream holds may have given its flow up.
-            let flowless = flows.is_empty() && state == tcp::State::Closed && held.contains(&h);
+            let flowless = flows.is_empty() && state == tcp::State::Closed && is_held;
             assert!(flows.len() == 1 || flowless, "{state} socket {h} has flows {flows:?}");
-            assert!(!(held.contains(&h) && orphans.contains(&h)), "held socket for {flows:?} is an orphan");
-            if orphans.contains(&h) {
-                assert!(
-                    !matches!(state, tcp::State::Closed | tcp::State::TimeWait),
-                    "{state} orphan for {flows:?} is left over"
-                );
-            } else if !held.contains(&h) && !st.accepting.contains_key(&h) {
-                unowned += 1;
-            }
+            assert!(!(is_held && is_orphan), "held socket for {flows:?} is an orphan");
+            let reapable = matches!(state, tcp::State::Closed | tcp::State::TimeWait);
+            assert!(!(is_orphan && reapable), "{state} orphan for {flows:?} is left over");
         }
+        let dials = self.conns.iter().filter(|c| c.dial.is_some()).count();
+        let owned = |h: &SocketHandle| held.contains(h) || orphans.contains(h) || st.accepting.contains_key(h);
+        let unowned = live.iter().filter(|h| !owned(h)).count();
         assert!(unowned <= dials, "{unowned} sockets belong to nobody");
         assert!(st.tuples.values().all(|h| live.contains(h)), "a flow's socket was removed");
         assert!(st.ends.keys().all(|h| live.contains(h)), "a removed socket's end is kept");
         assert!(st.fins.keys().all(|h| live.contains(h)), "a removed socket's FIN is kept");
         assert!(st.orphans.iter().all(|(h, _)| live.contains(h)), "a removed socket is an orphan");
+    }
+
+    /// Timers may have just come due, but nothing is overdue, and no
+    /// socket has something to send whatever the time.
+    fn check_nothing_overdue(&self) {
+        let mut st = self.stack.shared.lock();
         let t = st.now();
         let State { iface, sockets, .. } = &mut *st;
-        // Timers may have just come due, but nothing is overdue, and no
-        // socket has something to send whatever the time.
         let at = iface.poll_at(t, sockets);
         let overdue =
             at.is_some_and(|a| a == smoltcp::time::Instant::ZERO || a + Duration::from_millis(100).into() < t);
         assert!(!overdue, "the stack is settled, but wants polling at {at:?} (now {t})");
-        drop(st);
-        for c in &self.conns {
-            let Some(dropped) = c.dropped else { continue };
-            let Some(key) = c.key else { continue };
-            if !self.live.get(&key).is_some_and(|&i| std::ptr::eq(&self.conns[i], c)) {
-                continue;
-            }
+    }
+
+    /// A dropped connection's socket is gone within a while.
+    fn check_dropped_sockets_reaped(&self, now: Instant) {
+        for c in self.conns.iter().filter(|c| self.is_latest(c)) {
+            let (Some(dropped), Some(key)) = (c.dropped, c.key) else { continue };
             let lingering = self.stack.shared.lock().tuples.contains_key(&key);
-            assert!(
-                !(lingering && now - dropped > TCP_TIMEOUT + SLACK),
-                "{} was dropped {:?} ago, but its socket lingers",
-                c.name(),
-                now - dropped
-            );
+            let since = now - dropped;
+            let overdue = lingering && since > TCP_TIMEOUT + SLACK;
+            assert!(!overdue, "{} was dropped {since:?} ago, but its socket lingers", c.name());
         }
+    }
+
+    fn socket_locked(&self, c: &Conn, st: &State) -> Option<SocketHandle> {
+        if let Some(s) = &c.stream {
+            return Some(s.handle);
+        }
+        if !self.is_latest(c) {
+            return None;
+        }
+        st.tuples.get(&c.key?).copied()
     }
 }
 
@@ -925,17 +1063,6 @@ impl Drop for Net {
     fn drop(&mut self) {
         // A failed check may have poisoned the lock; let the streams go.
         self.stack.shared.state.clear_poison();
-    }
-}
-
-impl Net {
-    fn socket_locked(&self, c: &Conn, st: &State) -> Option<SocketHandle> {
-        if let Some(s) = &c.stream {
-            return Some(s.handle);
-        }
-        let key = c.key?;
-        let latest = self.live.get(&key).is_some_and(|&i| std::ptr::eq(&self.conns[i], c));
-        if latest { st.tuples.get(&key).copied() } else { None }
     }
 }
 
@@ -950,17 +1077,19 @@ fn tcp_lifecycle_state_machine(tc: TestCase) {
 fn dial_after_close_fails() {
     let net = Net::new();
     net.stack.close();
-    let stack = net.stack.clone();
-    let dial = stack.dial_tcp(local_ip(), SocketAddr::new(remote_ip(), DIALED));
-    let r = net.rt.block_on(async { tokio::time::timeout(Duration::from_secs(1), dial).await });
-    assert_eq!(r.expect("dial hangs").unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+
+    let dial = net.stack.dial_tcp(local_ip(), SocketAddr::new(remote_ip(), DIALED));
+    let r = net.rt.block_on(async { time::timeout(Duration::from_secs(1), dial).await });
+
+    let err = r.expect("dial hangs").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
 }
 
 /// A SYN whose policy decision races with closing the stack opens no
 /// connection on the closed stack.
 #[test]
 fn syn_racing_close_opens_nothing() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    let rt = paused_runtime();
     let _guard = rt.enter();
     let closing: Arc<Mutex<Option<Stack>>> = Arc::default();
     let c = closing.clone();
@@ -970,17 +1099,14 @@ fn syn_racing_close_opens_nothing() {
         }
         TcpDecision::Accept(Box::new(|_| panic!("accepted on a closed stack")))
     });
-    let stack = Stack::new(
-        StackConfig { addrs: vec![local_ip()], any_ip: false, mtu: 1280 },
-        Arc::new(|_| {}),
-        Some(policy),
-        None,
-    );
+    let stack = Stack::new(stack_config(), Arc::new(|_| {}), Some(policy), None);
     *closing.lock().unwrap() = Some(stack.clone());
-    let (local, remote) = (SocketAddr::new(local_ip(), SERVICE), SocketAddr::new(remote_ip(), SOURCE_PORTS[0]));
+    let (local, remote) = inbound(SOURCE_PORTS[0]);
+
     stack.inject(segment(remote, local, TcpControl::Syn, TcpSeqNumber(1000), None, &[]));
-    let st = stack.shared.lock();
-    assert_eq!(st.sockets.iter().count(), 0, "a socket was opened on the closed stack");
+
+    let sockets = stack.shared.lock().sockets.iter().count();
+    assert_eq!(sockets, 0, "a socket was opened on the closed stack");
 }
 
 /// An idle connection to a live peer stays up: smoltcp's timeout counts
@@ -989,15 +1115,19 @@ fn syn_racing_close_opens_nothing() {
 #[test]
 fn idle_connection_stays_up() {
     let mut net = Net::new();
-    let (dialed, accepted) = (net.dial(), net.open(SOURCE_PORTS[0]));
+    let dialed = net.dial();
+    let accepted = net.open(SOURCE_PORTS[0]);
     net.answer(dialed);
     net.complete(accepted);
+
     net.wait(TCP_TIMEOUT * 2);
+
     for i in [dialed, accepted] {
         let c = &net.conns[i];
         assert_eq!((c.end, c.got_rst), (None, false), "{} ended", c.name());
         net.write(i, b"still here");
-        assert_eq!(net.conns[i].got, b"still here", "{} lost a write", net.conns[i].name());
+        let c = &net.conns[i];
+        assert_eq!(c.got, b"still here", "{} lost a write", c.name());
     }
 }
 
@@ -1007,13 +1137,13 @@ fn idle_connection_stays_up() {
 #[test]
 fn reused_tuple_reaches_the_policy() {
     let mut net = Net::new();
-    let first = net.open(SOURCE_PORTS[0]);
-    net.complete(first);
-    net.remote_send(first, TcpControl::Rst, &[]);
+    let first = net.accept_from(SOURCE_PORTS[0]);
+    net.remote_reset(first);
     assert!(net.conns[first].stream.is_some());
-    let second = net.open(SOURCE_PORTS[0]);
-    net.complete(second);
-    net.remote_send(second, TcpControl::Psh, b"hello");
+
+    let second = net.accept_from(SOURCE_PORTS[0]);
+    net.remote_data(second, b"hello");
+
     assert_eq!(net.conns[second].received, b"hello");
     assert_eq!(net.conns[first].end, Some(Err(io::ErrorKind::ConnectionReset)));
 }
@@ -1024,11 +1154,11 @@ fn reused_tuple_reaches_the_policy() {
 #[test]
 fn aborted_connection_is_drained() {
     let mut net = Net::new();
-    let i = net.dial();
-    net.answer(i);
+    let i = net.dial_answered();
     net.vanish(i);
     net.write(i, b"unacked");
     net.abort(i);
+
     net.drain_stream(i);
     net.drain_tcp();
 }
@@ -1038,13 +1168,14 @@ fn aborted_connection_is_drained() {
 #[test]
 fn orphan_in_fin_wait_2_is_reaped() {
     let mut net = Net::new();
-    let i = net.dial();
-    net.answer(i);
+    let i = net.dial_answered();
+
     net.drop_stream(i);
     for _ in 0..3 {
         net.wait(TCP_TIMEOUT / 2);
-        net.remote_send(i, TcpControl::Psh, b"still here");
+        net.remote_data(i, b"still here");
     }
+
     let st = net.stack.shared.lock();
     let states: Vec<_> = st.tcp_sockets().map(|s| s.state()).collect();
     assert!(states.is_empty(), "sockets left: {states:?}");
@@ -1057,7 +1188,9 @@ fn orphan_in_fin_wait_2_is_reaped() {
 fn stalled_handshake_is_reset() {
     let mut net = Net::new();
     let i = net.open(SOURCE_PORTS[0]);
+
     net.wait(ACCEPT_TIMEOUT + SLACK);
+
     assert!(net.conns[i].got_rst, "the peer wasn't told");
 }
 
@@ -1066,14 +1199,15 @@ fn stalled_handshake_is_reset() {
 #[test]
 fn tuple_reused_after_time_wait() {
     let mut net = Net::new();
-    let first = net.open(SOURCE_PORTS[0]);
-    net.complete(first);
+    let first = net.accept_from(SOURCE_PORTS[0]);
     net.close_write(first);
-    net.remote_send(first, TcpControl::Fin, &[]);
-    assert!(net.conns[first].over() && net.conns[first].stream.is_some());
-    let second = net.open(SOURCE_PORTS[0]);
-    net.complete(second);
-    net.remote_send(second, TcpControl::Psh, b"hello");
+    net.remote_fin(first);
+    assert!(net.conns[first].over());
+    assert!(net.conns[first].stream.is_some());
+
+    let second = net.accept_from(SOURCE_PORTS[0]);
+    net.remote_data(second, b"hello");
+
     assert_eq!(net.conns[second].received, b"hello");
 }
 
@@ -1085,17 +1219,25 @@ fn tuple_reused_after_time_wait() {
 #[test]
 fn old_syn_in_time_wait_is_a_duplicate() {
     let mut net = Net::new();
-    let first = net.open(SOURCE_PORTS[0]);
-    net.complete(first);
-    net.remote_send(first, TcpControl::Psh, b"hello");
+    let first = net.accept_from(SOURCE_PORTS[0]);
+    net.remote_data(first, b"hello");
     net.close_write(first);
-    net.remote_send(first, TcpControl::Fin, &[]);
+    net.remote_fin(first);
     assert!(net.time_wait(first));
+
     net.replay_syn(first, first);
-    let second = net.open(SOURCE_PORTS[0]);
-    net.complete(second);
-    net.remote_send(second, TcpControl::Psh, b"again");
+    let second = net.accept_from(SOURCE_PORTS[0]);
+    net.remote_data(second, b"again");
+
     assert_eq!(net.conns[second].received, b"again");
+}
+
+/// Counts the stack's polls into `polls`, until aborted.
+async fn count_polls(shared: Arc<Shared>, polls: Arc<AtomicUsize>) {
+    loop {
+        shared.polled.notified().await;
+        polls.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Waiting for a busy connection to drain doesn't spin: drain_tcp woke
@@ -1104,18 +1246,13 @@ fn old_syn_in_time_wait_is_a_duplicate() {
 #[test]
 fn drain_tcp_waits_quietly() {
     let mut net = Net::new();
-    let i = net.dial();
-    net.answer(i);
-    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (shared, p) = (net.stack.shared.clone(), polls.clone());
-    let counter = net.rt.spawn(async move {
-        loop {
-            shared.polled.notified().await;
-            p.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+    net.dial_answered();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = net.rt.spawn(count_polls(net.stack.shared.clone(), polls.clone()));
+
     let drained = net.run_for(net.stack.drain_tcp(Duration::from_millis(500)), Duration::from_secs(1));
     counter.abort();
+
     assert_eq!(drained, Some(false), "an open connection drained");
     let n = polls.load(Ordering::Relaxed);
     assert!(n < 20, "{n} polls in half a second");
