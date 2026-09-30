@@ -16,7 +16,8 @@ use crate::key::NodePublic;
 /// An empty set allows no clients (unlike having no allow hook at all,
 /// which allows everyone). Removing a connected client's key doesn't
 /// disconnect it; call [`crate::Server::disconnect_client`] after
-/// removing it, which also drops a join the set approved just before.
+/// removing it, which tears down its connections and also drops a join
+/// the set approved just before.
 #[derive(Clone, Default)]
 pub struct KeySet(Arc<Mutex<HashSet<NodePublic>>>);
 

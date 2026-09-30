@@ -1,19 +1,21 @@
 //! Model-based tests of how a server dispatches inbound UDP flows,
-//! driven by Hegel. Datagrams from a few sources go straight into the
+//! driven by Hegel. Datagrams from a few clients go straight into the
 //! server's stack for a port with an `on_udp` handler and a port outside
-//! the served ranges, while listeners come and go on both, and flows are
-//! closed and dropped. Each new flow must go to the listener if there is
-//! one, else to the handler if the port is served, else nowhere, and each
-//! datagram for a live flow must reach exactly that flow.
+//! the served ranges, while listeners come and go on both, flows are
+//! closed and dropped, and clients are revoked and rejoin. Each new flow
+//! must go to the listener if there is one, else to the handler if the
+//! port is served, else nowhere, and each datagram for a live flow must
+//! reach exactly that flow. A revoked client's flows must close at once,
+//! and it must open no more until it rejoins.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU16;
 
 use hegel::TestCase;
 use hegel::generators as gs;
 
 use super::*;
 use crate::derp::server::DevDerp;
+use crate::key::DiscoPrivate;
 use crate::netstack::build_udp;
 
 /// Served, with a handler.
@@ -71,7 +73,11 @@ struct Flow {
 
 struct Dispatch {
     w: &'static World,
+    keys: [NodePublic; 2],
+    /// Each client's source address.
     srcs: [SocketAddr; 2],
+    /// Which clients are revoked.
+    revoked: [bool; 2],
     listeners: HashMap<u16, Listener<UdpConn>>,
     /// Live flows by (source, port).
     flows: HashMap<(SocketAddr, u16), Flow>,
@@ -82,19 +88,27 @@ struct Dispatch {
 
 impl Dispatch {
     fn new() -> Dispatch {
-        // Fresh sources for each test case, so flows from earlier ones
+        // Fresh clients for each test case, so flows from earlier ones
         // can't interfere.
-        static NEXT: AtomicU16 = AtomicU16::new(1);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let src = |i| SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, n, i)), 1000);
+        let w = world();
+        let keys = [(); 2].map(|_| NodePrivate::generate().public());
+        for k in keys {
+            assert!(w.rt.block_on(w.server.on_meow(k, DiscoPrivate::generate().public())));
+        }
         Dispatch {
-            w: world(),
-            srcs: [src(1), src(2)],
+            w,
+            keys,
+            srcs: keys.map(|k| SocketAddr::new(IpAddr::V6(k.tailcat_ip()), 1000)),
+            revoked: [false; 2],
             listeners: HashMap::new(),
             flows: HashMap::new(),
             closed: Vec::new(),
             next: 0,
         }
+    }
+
+    fn client(&self, tc: &TestCase) -> usize {
+        tc.draw(gs::integers::<usize>().max_value(self.keys.len() - 1))
     }
 
     fn port(tc: &TestCase) -> u16 {
@@ -143,7 +157,10 @@ impl Dispatch {
                 assert_eq!(buf[..n], seq.to_be_bytes(), "{src} -> {port}: wrong datagram");
                 return;
             }
-            let want = if self.listeners.contains_key(&port) {
+            let revoked = self.srcs.iter().zip(self.revoked).any(|(s, r)| *s == src && r);
+            let want = if revoked {
+                None
+            } else if self.listeners.contains_key(&port) {
                 Some(Via::Listener)
             } else {
                 (port == SERVED).then_some(Via::Handler)
@@ -171,8 +188,37 @@ impl Dispatch {
 impl Dispatch {
     #[rule]
     fn datagram(&mut self, tc: TestCase) {
-        let src = self.srcs[tc.draw(gs::integers::<usize>().max_value(self.srcs.len() - 1))];
+        let src = self.srcs[self.client(&tc)];
         self.send(src, Self::port(&tc));
+    }
+
+    /// The server revokes a client, whose flows close at once, even
+    /// ones nobody is using.
+    #[rule]
+    fn revoke(&mut self, tc: TestCase) {
+        let i = self.client(&tc);
+        let was_connected = !self.revoked[i];
+        assert_eq!(self.w.server.disconnect_client(&self.keys[i]), was_connected);
+        self.revoked[i] = true;
+        let src = self.srcs[i];
+        let gone: Vec<_> = self.flows.extract_if(|(s, _), _| *s == src).collect();
+        self.w.rt.block_on(async {
+            for ((_, port), f) in gone {
+                let mut buf = [0u8; 16];
+                let r = tokio::time::timeout(Duration::from_secs(1), f.conn.recv(&mut buf)).await;
+                let r = r.unwrap_or_else(|_| panic!("{src} -> {port}: a revoked client's flow stayed open"));
+                assert!(r.is_err(), "{src} -> {port}: a revoked client's flow got a datagram");
+            }
+        });
+    }
+
+    /// A revoked client joins again, or a connected one refreshes.
+    #[rule]
+    fn rejoin(&mut self, tc: TestCase) {
+        let i = self.client(&tc);
+        let w = self.w;
+        assert!(w.rt.block_on(w.server.on_meow(self.keys[i], DiscoPrivate::generate().public())));
+        self.revoked[i] = false;
     }
 
     #[rule]
@@ -220,6 +266,14 @@ impl Dispatch {
     fn flows_came_the_right_way(&self, _: TestCase) {
         for ((_, port), f) in &self.flows {
             assert!(f.via == Via::Listener || *port == SERVED, "an unserved port's flow went to the handler");
+        }
+    }
+}
+
+impl Drop for Dispatch {
+    fn drop(&mut self) {
+        for k in &self.keys {
+            self.w.server.disconnect_client(k);
         }
     }
 }

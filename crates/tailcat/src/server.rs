@@ -245,6 +245,12 @@ impl Inner {
         close_tunnel(&self.stack, &self.engine, &self.ms);
         self.task.abort();
     }
+
+    /// The connected client at `remote`, if any.
+    fn client_at(&self, remote: SocketAddr) -> Option<NodePublic> {
+        let IpAddr::V6(ip) = remote.ip() else { return None };
+        self.clients.lock().unwrap().ids.keys().find(|k| k.tailcat_ip() == ip).copied()
+    }
 }
 
 /// Closes a tunnel from the top: the stack at once, aborting its
@@ -434,8 +440,8 @@ impl Server {
         let any_ip = b.cfg.on_tcp_forward.is_some() || b.cfg.on_udp_forward.is_some();
         let tcp_server = server.clone();
         let tcp_policy: TcpPolicy =
-            Arc::new(move |_, dst| tcp_server().map_or(TcpDecision::Drop, |s| s.tcp_decision(dst)));
-        let udp_policy: UdpPolicy = Arc::new(move |_, dst| server()?.udp_decision(dst));
+            Arc::new(move |src, dst| tcp_server().map_or(TcpDecision::Drop, |s| s.tcp_decision(src, dst)));
+        let udp_policy: UdpPolicy = Arc::new(move |src, dst| server()?.udp_decision(src, dst));
         let out_engine = Arc::downgrade(&engine);
         let stack = Stack::new(
             StackConfig { addrs: vec![IpAddr::V6(addr)], any_ip, mtu: crate::TUNNEL_MTU },
@@ -520,14 +526,15 @@ impl Server {
     /// of an accepted connection or flow. The tunnel has already
     /// authenticated the peer by this key.
     pub fn peer_key(&self, remote: SocketAddr) -> Option<NodePublic> {
-        let IpAddr::V6(ip) = remote.ip() else { return None };
-        self.inner.clients.lock().unwrap().ids.keys().find(|k| k.tailcat_ip() == ip).copied()
+        self.inner.client_at(remote)
     }
 
     /// Drops the connected client `k` and reports whether it was
-    /// connected. Its connections stall rather than reset. Nothing stops
-    /// it reconnecting unless the allow hook now rejects it (a join the
-    /// hook approved before this call is dropped, and asked about again).
+    /// connected. Its TCP connections are aborted and its UDP flows
+    /// closed, so their handlers see errors (the RSTs don't reach it,
+    /// since it's no longer a peer). Nothing stops it reconnecting unless
+    /// the allow hook now rejects it (a join the hook approved before
+    /// this call is dropped, and asked about again).
     pub fn disconnect_client(&self, k: &NodePublic) -> bool {
         let mut clients = self.inner.clients.lock().unwrap();
         clients.disconnects += 1;
@@ -535,6 +542,11 @@ impl Server {
         debug!("tailcat: disconnecting client {} (peer {id})", k.short_string());
         self.inner.engine.remove_peer(k);
         self.inner.ms.remove_peer(k);
+        // It's no longer a client, so it opens nothing new (see
+        // `for_client`), and this gets every connection it has. The stack
+        // never calls out to us holding its lock, so taking it under ours
+        // is safe.
+        self.inner.stack.abort_peer(IpAddr::V6(k.tailcat_ip()));
         true
     }
 
@@ -660,12 +672,30 @@ impl Server {
         true
     }
 
-    fn tcp_decision(&self, dst: SocketAddr) -> TcpDecision {
+    /// Wraps the hand-off of a new connection or flow from `src`. The
+    /// stack makes it after the policy says yes, and a revocation in
+    /// between would miss it, so it's dropped, which closes it, if `src`
+    /// is no longer a client by then.
+    fn for_client<T: 'static>(&self, src: SocketAddr, f: impl FnOnce(T) + Send + 'static) -> Box<dyn FnOnce(T) + Send> {
+        let inner = Arc::downgrade(&self.inner);
+        Box::new(move |t| {
+            if inner.upgrade().is_some_and(|i| i.client_at(src).is_some()) {
+                f(t);
+            }
+        })
+    }
+
+    fn tcp_decision(&self, src: SocketAddr, dst: SocketAddr) -> TcpDecision {
+        // The tunnel only admits clients, but packets a client sent just
+        // before it was revoked can still be on their way in.
+        if self.inner.client_at(src).is_none() {
+            return TcpDecision::Drop;
+        }
         let cfg = &self.inner.cfg;
         let h = if dst.ip() == IpAddr::V6(self.inner.addr) {
             let port = dst.port();
             if let Some(tx) = self.inner.listeners.lock().unwrap().tcp.get(&port).cloned() {
-                return TcpDecision::Accept(Box::new(move |s| {
+                return TcpDecision::Accept(self.for_client(src, move |s| {
                     tokio::spawn(async move { tx.send(s).await });
                 }));
             }
@@ -678,20 +708,22 @@ impl Server {
             fwd(unmap_nat64(dst))
         };
         match h {
-            Some(h) => TcpDecision::Accept(Box::new(move |s| {
+            Some(h) => TcpDecision::Accept(self.for_client(src, move |s| {
                 tokio::spawn(h(s));
             })),
             None => TcpDecision::Reset,
         }
     }
 
-    fn udp_decision(&self, dst: SocketAddr) -> Option<Box<dyn FnOnce(UdpConn) + Send>> {
+    fn udp_decision(&self, src: SocketAddr, dst: SocketAddr) -> Option<Box<dyn FnOnce(UdpConn) + Send>> {
+        // As for TCP.
+        self.inner.client_at(src)?;
         let cfg = &self.inner.cfg;
         let idle = Some(cfg.udp_idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT));
         let h: UdpHandler = if dst.ip() == IpAddr::V6(self.inner.addr) {
             let port = dst.port();
             if let Some(tx) = self.inner.listeners.lock().unwrap().udp.get(&port).cloned() {
-                return Some(Box::new(move |c: UdpConn| {
+                return Some(self.for_client(src, move |c: UdpConn| {
                     c.set_idle_timeout(idle);
                     tokio::spawn(async move { tx.send(c).await });
                 }));
@@ -703,7 +735,7 @@ impl Server {
         } else {
             cfg.on_udp_forward.as_ref()?(unmap_nat64(dst))?
         };
-        Some(Box::new(move |c: UdpConn| {
+        Some(self.for_client(src, move |c: UdpConn| {
             c.set_idle_timeout(idle);
             tokio::spawn(h(c));
         }))
@@ -817,6 +849,46 @@ mod tests {
         tokio::task::spawn_blocking(move || resume.wait()).await.unwrap();
         assert!(!join.await.unwrap(), "revoked client was acked");
         assert_eq!(membership(&server, &k), (false, false, false));
+        server.close();
+    }
+
+    /// Revoking a client tears down its connections at once, idle ones
+    /// included, whether a handler or a listener holds them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_tears_down_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let dev = DevDerp::start_local().await.unwrap();
+        let key = NodePrivate::generate();
+        let allow = KeySet::default();
+        allow.add(key.public());
+        let (tx, mut handled) = mpsc::unbounded_channel();
+        let server = Server::builder()
+            .region(dev.region.clone())
+            .allow_client(allow.checker())
+            .on_tcp(move |_| {
+                let tx = tx.clone();
+                Some(handler(move |c| {
+                    let _ = tx.send(c);
+                    async {}
+                }))
+            })
+            .start()
+            .await
+            .unwrap();
+        let mut listener = server.listen_tcp(2).unwrap();
+        let opts = crate::ClientOptions { key: Some(key.clone()), ..Default::default() };
+        let client = crate::Client::with_options(server.tailcat_addr(), opts);
+        let _held = (client.dial_tcp_port(1).await.unwrap(), client.dial_tcp_port(2).await.unwrap());
+        let mut conns = [handled.recv().await.unwrap(), listener.accept().await.unwrap()];
+
+        allow.remove(&key.public());
+        assert!(server.disconnect_client(&key.public()));
+        for c in &mut conns {
+            let r = tokio::time::timeout(Duration::from_secs(5), c.read(&mut [0u8; 1])).await;
+            let r = r.unwrap_or_else(|_| panic!("{c:?}: a revoked client's connection stayed open"));
+            assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionAborted, "{c:?}");
+        }
         server.close();
     }
 

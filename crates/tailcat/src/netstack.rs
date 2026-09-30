@@ -556,6 +556,21 @@ impl Stack {
         drop(guard);
         self.shared.wake.notify_one();
     }
+
+    /// Aborts every TCP connection with the peer at `ip`, and closes its
+    /// UDP flows.
+    pub fn abort_peer(&self, ip: IpAddr) {
+        let mut guard = self.shared.lock();
+        let State { sockets, tuples, ends, udp, .. } = &mut *guard;
+        for (&(_, remote), &h) in tuples.iter() {
+            if remote.ip() == ip {
+                abort(sockets.get_mut::<tcp::Socket>(h), h, ends);
+            }
+        }
+        udp.retain(|&(_, remote), _| remote.ip() != ip);
+        drop(guard);
+        self.shared.wake.notify_one();
+    }
 }
 
 fn new_tcp_socket() -> tcp::Socket<'static> {
