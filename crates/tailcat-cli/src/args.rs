@@ -182,7 +182,15 @@ impl FromStr for ForwardArg {
 /// where a bare IP also means its port 22.
 #[cfg(feature = "ssh")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SshTarget(pub Dest);
+pub struct SshTarget(Dest);
+
+#[cfg(feature = "ssh")]
+impl SshTarget {
+    /// Dials it through `cl`.
+    pub async fn dial(self, cl: &tailcat::Client) -> std::io::Result<tailcat::TcpStream> {
+        self.0.dial(cl).await
+    }
+}
 
 #[cfg(feature = "ssh")]
 impl FromStr for SshTarget {

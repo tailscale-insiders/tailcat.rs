@@ -258,7 +258,7 @@ async fn login_without_credentials(
 }
 
 async fn dial(cl: &tailcat::Client, port: SshTarget) -> Result<tailcat::TcpStream> {
-    Ok(port.0.dial(cl).await?)
+    Ok(port.dial(cl).await?)
 }
 
 /// Reports whether the server at `addr` lets a stranger (a fresh node
