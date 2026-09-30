@@ -72,6 +72,18 @@ impl std::str::FromStr for IpNet {
     }
 }
 
+impl serde::Serialize for IpNet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IpNet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// WireGuard configuration for one peer.
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -488,6 +500,13 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn ipnet_serializes_as_text() {
+        assert_eq!(serde_json::to_string(&net("10.42.0.0/16")).unwrap(), "\"10.42.0.0/16\"");
+        assert_eq!(serde_json::from_str::<IpNet>("\"100.64.1.3\"").unwrap(), net("100.64.1.3/32"));
+        assert!(serde_json::from_str::<IpNet>("\"10.0.0.0/33\"").is_err());
     }
 
     #[test]
