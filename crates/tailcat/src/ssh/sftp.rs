@@ -538,6 +538,10 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
     use russh_sftp::server::Handler as _;
@@ -558,6 +562,7 @@ mod tests {
         let n = unique_upload_path("dir/report.pdf");
         assert!(n.starts_with("dir/report.") && n.ends_with(".pdf"), "{n}");
         assert_eq!(n.len(), "dir/report..pdf".len() + 14 + 1 + 16);
+
         let n = unique_upload_path(".profile");
         assert!(n.starts_with(".profile.") && !n.contains('/'), "{n}");
         assert_eq!(utc_timestamp().len(), 14);
@@ -574,37 +579,44 @@ mod tests {
 
     impl TempDir {
         pub(super) fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("tailcat-sftp-{}", hex::encode(rand::random::<[u8; 8]>())));
-            std::fs::create_dir(&p).unwrap();
+            let p = temp_dir().join(format!("tailcat-sftp-{}", hex::encode(rand::random::<[u8; 8]>())));
+            fs::create_dir(&p).unwrap();
             TempDir(p)
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct Fixture {
+        /// Holds `root`, and the secret beside it.
+        tmp: TempDir,
+        root: PathBuf,
+        sftp: Sftp,
     }
 
     /// A service root holding `a.txt` and `sub/`, and a secret outside it
     /// that the symlinks `out` (absolute) and `up` (relative) point to.
-    fn fixture(mode: FileServeMode) -> (TempDir, Sftp) {
-        let t = TempDir::new();
-        let root = t.0.join("root");
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        std::fs::write(root.join("a.txt"), "hi").unwrap();
-        std::fs::write(t.0.join("secret"), "s3cret").unwrap();
-        link_out(&t.0, &root);
-        let fs = Sftp::new(Some(FileService { dir: root, mode })).unwrap();
-        (t, fs)
+    fn fixture(mode: FileServeMode) -> Fixture {
+        let tmp = TempDir::new();
+        let root = tmp.0.join("root");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), "hi").unwrap();
+        fs::write(tmp.0.join("secret"), "s3cret").unwrap();
+        link_out(&tmp.0, &root);
+        let sftp = Sftp::new(Some(FileService { dir: root.clone(), mode })).unwrap();
+        Fixture { tmp, root, sftp }
     }
 
     /// Makes the symlinks `out` (absolute) and `up` (relative) in `root`,
     /// to its parent `base`.
     #[cfg(unix)]
     fn link_out(base: &Path, root: &Path) {
-        std::os::unix::fs::symlink(base, root.join("out")).unwrap();
-        std::os::unix::fs::symlink("..", root.join("up")).unwrap();
+        symlink(base, root.join("out")).unwrap();
+        symlink("..", root.join("up")).unwrap();
     }
 
     /// Makes no symlinks: making them here may need privileges.
@@ -622,28 +634,60 @@ mod tests {
         OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
     }
 
-    async fn open(fs: &mut Sftp, p: &str, f: OpenFlags) -> Result<String, StatusCode> {
-        fs.open(0, p.into(), f, FileAttributes::default()).await.map(|h| h.handle)
+    /// Attributes that set only the size.
+    fn size(n: u64) -> FileAttributes {
+        FileAttributes { size: Some(n), ..Default::default() }
     }
 
-    async fn read_file(fs: &mut Sftp, p: &str) -> Result<Vec<u8>, StatusCode> {
-        let h = open(fs, p, R).await?;
-        let data = fs.read(0, h.clone(), 0, 1 << 10).await.map(|d| d.data);
-        fs.close(0, h).await?;
+    async fn open(sftp: &mut Sftp, p: &str, f: OpenFlags) -> Result<String, StatusCode> {
+        sftp.open(0, p.into(), f, FileAttributes::default()).await.map(|h| h.handle)
+    }
+
+    async fn opendir(sftp: &mut Sftp, p: &str) -> Result<String, StatusCode> {
+        sftp.opendir(0, p.into()).await.map(|h| h.handle)
+    }
+
+    async fn stat(sftp: &mut Sftp, p: &str) -> Result<FileAttributes, StatusCode> {
+        sftp.stat(0, p.into()).await.map(|a| a.attrs)
+    }
+
+    async fn stat_size(sftp: &mut Sftp, p: &str) -> Option<u64> {
+        stat(sftp, p).await.unwrap().size
+    }
+
+    async fn mkdir(sftp: &mut Sftp, p: &str) -> Result<Status, StatusCode> {
+        sftp.mkdir(0, p.into(), FileAttributes::default()).await
+    }
+
+    /// The names in one page of a listing.
+    async fn readdir(sftp: &mut Sftp, h: &str) -> Result<Vec<String>, StatusCode> {
+        let page = sftp.readdir(0, h.into()).await?;
+        Ok(page.files.into_iter().map(|f| f.filename).collect())
+    }
+
+    async fn read_file(sftp: &mut Sftp, p: &str) -> Result<Vec<u8>, StatusCode> {
+        let h = open(sftp, p, R).await?;
+        let data = sftp.read(0, h.clone(), 0, 1 << 10).await.map(|d| d.data);
+        sftp.close(0, h).await?;
         data
     }
 
-    async fn upload(fs: &mut Sftp, p: &str, data: &[u8]) -> Result<(), StatusCode> {
-        let h = open(fs, p, wc()).await?;
-        fs.write(0, h.clone(), 0, data.to_vec()).await?;
-        fs.close(0, h).await.map(drop)
+    async fn upload(sftp: &mut Sftp, p: &str, data: &[u8]) -> Result<(), StatusCode> {
+        let h = open(sftp, p, wc()).await?;
+        sftp.write(0, h.clone(), 0, data.to_vec()).await?;
+        sftp.close(0, h).await.map(drop)
     }
 
     fn names(dir: &Path) -> Vec<String> {
-        let mut v: Vec<_> =
-            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let entries = fs::read_dir(dir).unwrap();
+        let mut v: Vec<_> = entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         v.sort();
         v
+    }
+
+    /// The names in `dir` that aren't among `before`.
+    fn new_names(dir: &Path, before: &[String]) -> Vec<String> {
+        names(dir).into_iter().filter(|n| !before.contains(n)).collect()
     }
 
     fn denied<T>(r: Result<T, StatusCode>) {
@@ -652,130 +696,135 @@ mod tests {
 
     #[tokio::test]
     async fn paths_stay_inside_the_root() {
-        let (_t, mut fs) = fixture(FileServeMode::ReadWrite);
-        assert_eq!(read_file(&mut fs, "a.txt").await.unwrap(), b"hi");
+        let Fixture { tmp: _tmp, mut sftp, .. } = fixture(FileServeMode::ReadWrite);
+        assert_eq!(read_file(&mut sftp, "a.txt").await.unwrap(), b"hi");
         // `..` clamps at the root.
-        assert_eq!(read_file(&mut fs, "../../sub/../a.txt").await.unwrap(), b"hi");
-        assert_eq!(read_file(&mut fs, "../secret").await.unwrap_err(), StatusCode::NoSuchFile);
-        let n = fs.realpath(0, "sub/../../x".into()).await.unwrap();
+        assert_eq!(read_file(&mut sftp, "../../sub/../a.txt").await.unwrap(), b"hi");
+        assert_eq!(read_file(&mut sftp, "../secret").await.unwrap_err(), StatusCode::NoSuchFile);
+        let n = sftp.realpath(0, "sub/../../x".into()).await.unwrap();
         assert_eq!(n.files[0].filename, "/x");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinks_stay_inside_the_root() {
-        let (t, mut fs) = fixture(FileServeMode::ReadWrite);
+        let Fixture { tmp: _tmp, root, mut sftp } = fixture(FileServeMode::ReadWrite);
         // Symlinks out of the root don't resolve, absolute or relative.
-        assert!(read_file(&mut fs, "out/secret").await.is_err());
-        assert!(read_file(&mut fs, "up/secret").await.is_err());
-        assert!(fs.stat(0, "out".into()).await.is_err());
-        assert!(fs.opendir(0, "up".into()).await.is_err());
-        assert!(upload(&mut fs, "out/new", b"x").await.is_err());
+        assert!(read_file(&mut sftp, "out/secret").await.is_err());
+        assert!(read_file(&mut sftp, "up/secret").await.is_err());
+        assert!(stat(&mut sftp, "out").await.is_err());
+        assert!(opendir(&mut sftp, "up").await.is_err());
+        assert!(upload(&mut sftp, "out/new", b"x").await.is_err());
         // The links themselves are visible.
-        assert!(fs.lstat(0, "out".into()).await.is_ok());
+        assert!(sftp.lstat(0, "out".into()).await.is_ok());
         // New links are made relative to the root, and can't escape it.
-        fs.symlink(0, "/a.txt".into(), "link".into()).await.unwrap();
-        assert_eq!(read_file(&mut fs, "link").await.unwrap(), b"hi");
-        fs.symlink(0, "../secret".into(), "link2".into()).await.unwrap();
-        assert_eq!(std::fs::read_link(t.0.join("root/link2")).unwrap(), Path::new("secret"));
-        assert_eq!(read_file(&mut fs, "link2").await.unwrap_err(), StatusCode::NoSuchFile);
+        sftp.symlink(0, "/a.txt".into(), "link".into()).await.unwrap();
+        assert_eq!(read_file(&mut sftp, "link").await.unwrap(), b"hi");
+        sftp.symlink(0, "../secret".into(), "link2".into()).await.unwrap();
+        assert_eq!(fs::read_link(root.join("link2")).unwrap(), Path::new("secret"));
+        assert_eq!(read_file(&mut sftp, "link2").await.unwrap_err(), StatusCode::NoSuchFile);
     }
 
     #[tokio::test]
     async fn read_only_denies_changes() {
-        let (t, mut fs) = fixture(FileServeMode::ReadOnly);
-        denied(open(&mut fs, "a.txt", OpenFlags::WRITE).await);
-        denied(open(&mut fs, "a.txt", R | OpenFlags::APPEND).await);
-        denied(open(&mut fs, "new", wc()).await);
-        denied(fs.remove(0, "a.txt".into()).await);
-        denied(fs.rename(0, "a.txt".into(), "b".into()).await);
-        denied(fs.mkdir(0, "d".into(), FileAttributes::default()).await);
-        denied(fs.rmdir(0, "sub".into()).await);
-        denied(fs.setstat(0, "a.txt".into(), FileAttributes { size: Some(0), ..Default::default() }).await);
-        denied(fs.symlink(0, "a.txt".into(), "l".into()).await);
-        let h = open(&mut fs, "a.txt", R).await.unwrap();
-        denied(fs.fsetstat(0, h, FileAttributes { size: Some(0), ..Default::default() }).await);
-        assert_eq!(std::fs::read(t.0.join("root/a.txt")).unwrap(), b"hi");
+        let Fixture { tmp: _tmp, root, mut sftp } = fixture(FileServeMode::ReadOnly);
+        denied(open(&mut sftp, "a.txt", OpenFlags::WRITE).await);
+        denied(open(&mut sftp, "a.txt", R | OpenFlags::APPEND).await);
+        denied(open(&mut sftp, "new", wc()).await);
+        denied(sftp.remove(0, "a.txt".into()).await);
+        denied(sftp.rename(0, "a.txt".into(), "b".into()).await);
+        denied(mkdir(&mut sftp, "d").await);
+        denied(sftp.rmdir(0, "sub".into()).await);
+        denied(sftp.setstat(0, "a.txt".into(), size(0)).await);
+        denied(sftp.symlink(0, "a.txt".into(), "l".into()).await);
+        let h = open(&mut sftp, "a.txt", R).await.unwrap();
+        denied(sftp.fsetstat(0, h, size(0)).await);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hi");
 
         // Listing works, once.
-        let h = fs.opendir(0, "/".into()).await.unwrap().handle;
-        let listed: Vec<_> = fs.readdir(0, h.clone()).await.unwrap().files.into_iter().map(|f| f.filename).collect();
-        assert!(listed.contains(&"a.txt".into()) && listed.contains(&"sub".into()), "{listed:?}");
-        assert_eq!(fs.readdir(0, h).await.unwrap_err(), StatusCode::Eof);
-        assert_eq!(fs.stat(0, "a.txt".into()).await.unwrap().attrs.size, Some(2));
+        let h = opendir(&mut sftp, "/").await.unwrap();
+        let listed = readdir(&mut sftp, &h).await.unwrap();
+        assert!(listed.contains(&"a.txt".into()), "{listed:?}");
+        assert!(listed.contains(&"sub".into()), "{listed:?}");
+        assert_eq!(readdir(&mut sftp, &h).await.unwrap_err(), StatusCode::Eof);
+        assert_eq!(stat_size(&mut sftp, "a.txt").await, Some(2));
     }
 
     #[tokio::test]
     async fn read_write_allows_changes() {
-        let (t, mut fs) = fixture(FileServeMode::ReadWrite);
-        let root = t.0.join("root");
-        upload(&mut fs, "sub/new.txt", b"data").await.unwrap();
-        assert_eq!(std::fs::read(root.join("sub/new.txt")).unwrap(), b"data");
+        let Fixture { tmp: _tmp, root, mut sftp } = fixture(FileServeMode::ReadWrite);
+        upload(&mut sftp, "sub/new.txt", b"data").await.unwrap();
+        assert_eq!(fs::read(root.join("sub/new.txt")).unwrap(), b"data");
         let excl = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
-        assert_eq!(open(&mut fs, "sub/new.txt", excl).await.unwrap_err(), StatusCode::Failure);
-        fs.rename(0, "sub/new.txt".into(), "moved".into()).await.unwrap();
-        fs.setstat(0, "moved".into(), FileAttributes { size: Some(2), ..Default::default() }).await.unwrap();
-        assert_eq!(std::fs::read(root.join("moved")).unwrap(), b"da");
-        fs.remove(0, "moved".into()).await.unwrap();
-        fs.mkdir(0, "d".into(), FileAttributes::default()).await.unwrap();
-        fs.rmdir(0, "d".into()).await.unwrap();
-        fs.rmdir(0, "sub".into()).await.unwrap();
+        assert_eq!(open(&mut sftp, "sub/new.txt", excl).await.unwrap_err(), StatusCode::Failure);
+
+        sftp.rename(0, "sub/new.txt".into(), "moved".into()).await.unwrap();
+        sftp.setstat(0, "moved".into(), size(2)).await.unwrap();
+        assert_eq!(fs::read(root.join("moved")).unwrap(), b"da");
+
+        sftp.remove(0, "moved".into()).await.unwrap();
+        mkdir(&mut sftp, "d").await.unwrap();
+        sftp.rmdir(0, "d".into()).await.unwrap();
+        sftp.rmdir(0, "sub".into()).await.unwrap();
         let want: Vec<_> = ["a.txt"].iter().chain(LINKS).copied().collect();
         assert_eq!(names(&root), want);
     }
 
     #[tokio::test]
     async fn write_only_is_a_flat_drop_box() {
-        let (t, mut fs) = fixture(FileServeMode::WriteOnly);
-        let root = t.0.join("root");
+        let Fixture { tmp: _tmp, root, mut sftp } = fixture(FileServeMode::WriteOnly);
         // Nothing existing is visible or readable.
-        assert_eq!(fs.stat(0, "a.txt".into()).await.unwrap_err(), StatusCode::NoSuchFile);
-        assert_eq!(fs.stat(0, "sub".into()).await.unwrap_err(), StatusCode::NoSuchFile);
-        assert!(fs.stat(0, "/".into()).await.is_ok());
-        denied(open(&mut fs, "a.txt", R).await);
-        denied(open(&mut fs, "a.txt", R | wc()).await);
-        denied(fs.opendir(0, ".".into()).await);
-        denied(fs.readlink(0, "out".into()).await);
-        denied(fs.mkdir(0, "d".into(), FileAttributes::default()).await);
-        denied(open(&mut fs, "sub/x", wc()).await);
+        assert_eq!(stat(&mut sftp, "a.txt").await.unwrap_err(), StatusCode::NoSuchFile);
+        assert_eq!(stat(&mut sftp, "sub").await.unwrap_err(), StatusCode::NoSuchFile);
+        assert!(stat(&mut sftp, "/").await.is_ok());
+        denied(open(&mut sftp, "a.txt", R).await);
+        denied(open(&mut sftp, "a.txt", R | wc()).await);
+        denied(opendir(&mut sftp, ".").await);
+        denied(sftp.readlink(0, "out".into()).await);
+        denied(mkdir(&mut sftp, "d").await);
+        denied(open(&mut sftp, "sub/x", wc()).await);
 
         // Uploads land under fresh names, even over existing files.
-        upload(&mut fs, "a.txt", b"new").await.unwrap();
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hi");
+        upload(&mut sftp, "a.txt", b"new").await.unwrap();
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hi");
         let stored: Vec<_> = names(&root).into_iter().filter(|n| n.starts_with("a.") && n != "a.txt").collect();
         assert_eq!(stored.len(), 1, "{stored:?}");
         assert!(stored[0].ends_with(".txt"));
-        assert_eq!(std::fs::read(root.join(&stored[0])).unwrap(), b"new");
+        let stored = root.join(&stored[0]);
+        assert_eq!(fs::read(&stored).unwrap(), b"new");
+
         // The uploader may stat and setstat what it wrote, by its name.
-        assert_eq!(fs.stat(0, "a.txt".into()).await.unwrap().attrs.size, Some(3));
-        fs.setstat(0, "a.txt".into(), FileAttributes { size: Some(1), ..Default::default() }).await.unwrap();
-        assert_eq!(std::fs::read(root.join(&stored[0])).unwrap(), b"n");
-        denied(fs.setstat(0, "sub".into(), FileAttributes::default()).await);
-        denied(fs.remove(0, "a.txt".into()).await);
-        denied(fs.rename(0, "a.txt".into(), "b".into()).await);
+        assert_eq!(stat_size(&mut sftp, "a.txt").await, Some(3));
+        sftp.setstat(0, "a.txt".into(), size(1)).await.unwrap();
+        assert_eq!(fs::read(&stored).unwrap(), b"n");
+        denied(sftp.setstat(0, "sub".into(), FileAttributes::default()).await);
+        denied(sftp.remove(0, "a.txt".into()).await);
+        denied(sftp.rename(0, "a.txt".into(), "b".into()).await);
     }
 
     #[tokio::test]
     async fn write_only_tree_keeps_names() {
-        let (t, mut fs) = fixture(FileServeMode::WriteOnlyTree);
-        let root = t.0.join("root");
-        assert!(fs.stat(0, "sub".into()).await.unwrap().attrs.is_dir());
-        assert_eq!(fs.stat(0, "a.txt".into()).await.unwrap_err(), StatusCode::NoSuchFile);
-        fs.mkdir(0, "d".into(), FileAttributes::default()).await.unwrap();
-        assert!(fs.stat(0, "d".into()).await.is_ok());
-        upload(&mut fs, "d/f.bin", b"1").await.unwrap();
-        upload(&mut fs, "d/f.bin", b"2").await.unwrap();
-        let stored = names(&root.join("d"));
+        let Fixture { tmp, root, mut sftp } = fixture(FileServeMode::WriteOnlyTree);
+        assert!(stat(&mut sftp, "sub").await.unwrap().is_dir());
+        assert_eq!(stat(&mut sftp, "a.txt").await.unwrap_err(), StatusCode::NoSuchFile);
+        mkdir(&mut sftp, "d").await.unwrap();
+        assert!(stat(&mut sftp, "d").await.is_ok());
+
+        upload(&mut sftp, "d/f.bin", b"1").await.unwrap();
+        upload(&mut sftp, "d/f.bin", b"2").await.unwrap();
+
+        let d = root.join("d");
+        let stored = names(&d);
         assert_eq!(stored.len(), 2);
-        assert_eq!(std::fs::read(root.join("d/f.bin")).unwrap(), b"1");
+        assert_eq!(fs::read(d.join("f.bin")).unwrap(), b"1");
         let other = stored.iter().find(|n| *n != "f.bin").unwrap();
         assert!(other.starts_with("f.") && other.ends_with(".bin"), "{other}");
-        assert_eq!(std::fs::read(root.join("d").join(other)).unwrap(), b"2");
-        denied(fs.opendir(0, "d".into()).await);
-        denied(fs.rmdir(0, "d".into()).await);
+        assert_eq!(fs::read(d.join(other)).unwrap(), b"2");
+        denied(opendir(&mut sftp, "d").await);
+        denied(sftp.rmdir(0, "d".into()).await);
         // Through a symlink out of the root, where there is one.
-        assert!(upload(&mut fs, "out/escaped", b"x").await.is_err());
-        assert!(!t.0.join("escaped").exists());
+        assert!(upload(&mut sftp, "out/escaped", b"x").await.is_err());
+        assert!(!tmp.0.join("escaped").exists());
     }
 
     /// An upload to a drop box is visible under its name only once it's
@@ -783,26 +832,28 @@ mod tests {
     #[tokio::test]
     async fn drop_box_uploads_appear_when_closed() {
         for mode in [FileServeMode::WriteOnly, FileServeMode::WriteOnlyTree] {
-            let (t, mut fs) = fixture(mode);
-            let root = t.0.join("root");
+            let Fixture { tmp: _tmp, root, mut sftp } = fixture(mode);
             let before = names(&root);
-            let h = open(&mut fs, "new.bin", wc()).await.unwrap();
-            fs.write(0, h.clone(), 0, b"half".to_vec()).await.unwrap();
-            let during: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n)).collect();
-            assert!(during.len() == 1 && during[0].starts_with(".new.bin."), "{mode:?}: {during:?}");
-            assert_eq!(fs.stat(0, "new.bin".into()).await.unwrap().attrs.size, Some(4));
-            fs.write(0, h.clone(), 4, b" done".to_vec()).await.unwrap();
-            fs.close(0, h).await.unwrap();
-            let after: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n)).collect();
-            assert_eq!(after.len(), 1, "{mode:?}: {after:?}");
-            assert!(after[0].starts_with("new.") && after[0].ends_with(".bin"), "{after:?}");
-            assert_eq!(std::fs::read(root.join(&after[0])).unwrap(), b"half done");
-            assert_eq!(fs.stat(0, "new.bin".into()).await.unwrap().attrs.size, Some(9));
 
-            let h = open(&mut fs, "cut.bin", wc()).await.unwrap();
-            fs.write(0, h, 0, b"partial".to_vec()).await.unwrap();
-            drop(fs);
-            let left: Vec<_> = names(&root).into_iter().filter(|n| !before.contains(n) && *n != after[0]).collect();
+            let h = open(&mut sftp, "new.bin", wc()).await.unwrap();
+            sftp.write(0, h.clone(), 0, b"half".to_vec()).await.unwrap();
+            let during = new_names(&root, &before);
+            assert!(during.len() == 1 && during[0].starts_with(".new.bin."), "{mode:?}: {during:?}");
+            assert_eq!(stat_size(&mut sftp, "new.bin").await, Some(4));
+
+            sftp.write(0, h.clone(), 4, b" done".to_vec()).await.unwrap();
+            sftp.close(0, h).await.unwrap();
+            let after = new_names(&root, &before);
+            assert_eq!(after.len(), 1, "{mode:?}: {after:?}");
+            let done = &after[0];
+            assert!(done.starts_with("new.") && done.ends_with(".bin"), "{after:?}");
+            assert_eq!(fs::read(root.join(done)).unwrap(), b"half done");
+            assert_eq!(stat_size(&mut sftp, "new.bin").await, Some(9));
+
+            let h = open(&mut sftp, "cut.bin", wc()).await.unwrap();
+            sftp.write(0, h, 0, b"partial".to_vec()).await.unwrap();
+            drop(sftp);
+            let left: Vec<_> = new_names(&root, &before).into_iter().filter(|n| n != done).collect();
             assert!(left.is_empty(), "{mode:?}: {left:?}");
         }
     }
@@ -810,41 +861,40 @@ mod tests {
     /// Listings come a batch at a time, small enough for any client.
     #[tokio::test]
     async fn listings_are_paged() {
-        let (t, mut fs) = fixture(FileServeMode::ReadOnly);
-        let dir = t.0.join("root/sub");
+        let Fixture { tmp: _tmp, root, mut sftp } = fixture(FileServeMode::ReadOnly);
+        let dir = root.join("sub");
         for i in 0..250 {
-            std::fs::write(dir.join(format!("f{i:03}")), "").unwrap();
+            fs::write(dir.join(format!("f{i:03}")), "").unwrap();
         }
-        let h = fs.opendir(0, "sub".into()).await.unwrap().handle;
+        let h = opendir(&mut sftp, "sub").await.unwrap();
+
         let mut listed = Vec::new();
-        loop {
-            match fs.readdir(0, h.clone()).await {
-                Ok(n) => {
-                    assert!(n.files.len() <= READDIR_BATCH);
-                    listed.extend(n.files.into_iter().map(|f| f.filename));
-                }
-                Err(e) => {
-                    assert_eq!(e, StatusCode::Eof);
-                    break;
-                }
-            }
+        let mut page = readdir(&mut sftp, &h).await;
+        while let Ok(batch) = page {
+            assert!(batch.len() <= READDIR_BATCH);
+            listed.extend(batch);
+            page = readdir(&mut sftp, &h).await;
         }
+
+        assert_eq!(page.unwrap_err(), StatusCode::Eof);
         listed.sort();
         assert_eq!(listed, names(&dir));
-        assert_eq!(fs.readdir(0, h).await.unwrap_err(), StatusCode::Eof);
+        assert_eq!(readdir(&mut sftp, &h).await.unwrap_err(), StatusCode::Eof);
     }
 
     /// A session can't hold unlimited handles (and descriptors) open.
     #[tokio::test]
     async fn open_handles_are_limited() {
-        let (_t, mut fs) = fixture(FileServeMode::ReadOnly);
+        let Fixture { tmp: _tmp, mut sftp, .. } = fixture(FileServeMode::ReadOnly);
         let mut hs = Vec::new();
         for _ in 0..MAX_HANDLES {
-            hs.push(open(&mut fs, "a.txt", R).await.unwrap());
+            hs.push(open(&mut sftp, "a.txt", R).await.unwrap());
         }
-        assert_eq!(open(&mut fs, "a.txt", R).await.unwrap_err(), StatusCode::Failure);
-        assert_eq!(fs.opendir(0, "/".into()).await.unwrap_err(), StatusCode::Failure);
-        fs.close(0, hs.pop().unwrap()).await.unwrap();
-        fs.opendir(0, "/".into()).await.unwrap();
+
+        assert_eq!(open(&mut sftp, "a.txt", R).await.unwrap_err(), StatusCode::Failure);
+        assert_eq!(opendir(&mut sftp, "/").await.unwrap_err(), StatusCode::Failure);
+
+        sftp.close(0, hs.pop().unwrap()).await.unwrap();
+        opendir(&mut sftp, "/").await.unwrap();
     }
 }

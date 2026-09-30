@@ -7,11 +7,13 @@
 //! a drop box shows only finished uploads.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use hegel::TestCase;
 use hegel::generators::{self as gs, Generator as _};
 use russh_sftp::server::Handler as _;
+use tokio::runtime::{Builder, Runtime};
 
 use super::tests::TempDir;
 use super::*;
@@ -20,6 +22,8 @@ use super::*;
 /// directory "new" doesn't until it's made.
 const FILES: [&str; 5] = ["a.txt", "b", "sub/c", "new/d", "sub/a.txt"];
 const DIRS: [&str; 2] = ["sub", "new"];
+const MODES: [FileServeMode; 4] =
+    [FileServeMode::ReadOnly, FileServeMode::ReadWrite, FileServeMode::WriteOnly, FileServeMode::WriteOnlyTree];
 
 #[derive(Clone, Copy, Debug, hegel::PrettyPrintable)]
 enum Flags {
@@ -68,7 +72,7 @@ enum Wrote {
 }
 
 struct Fs {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     tmp: TempDir,
     mode: FileServeMode,
     sftp: Sftp,
@@ -81,23 +85,26 @@ struct Fs {
     inodes: Vec<Vec<u8>>,
     dirs: BTreeSet<String>,
     /// The tree at the start, which read-only mode must leave alone.
-    initial: BTreeMap<String, Option<Vec<u8>>>,
+    initial: Snapshot,
     /// Drop boxes: finished uploads stored under server-chosen names.
     renamed_uploads: Vec<Vec<u8>>,
     wrote: BTreeMap<String, Wrote>,
 }
 
+/// Files by path, with their contents, and directories (`None`).
+type Snapshot = BTreeMap<String, Option<Vec<u8>>>;
+
 /// Every file (with its contents) and directory (`None`) under `root`.
-fn snapshot(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Option<Vec<u8>>>) {
-        for e in std::fs::read_dir(dir).unwrap() {
+fn snapshot(root: &Path) -> Snapshot {
+    fn walk(root: &Path, dir: &Path, out: &mut Snapshot) {
+        for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
             if p.is_dir() {
                 out.insert(rel, None);
                 walk(root, &p, out);
             } else {
-                out.insert(rel, Some(std::fs::read(&p).unwrap()));
+                out.insert(rel, Some(fs::read(&p).unwrap()));
             }
         }
     }
@@ -115,19 +122,18 @@ fn write_at(buf: &mut Vec<u8>, off: usize, data: &[u8]) {
     if data.is_empty() {
         return;
     }
-    if buf.len() < off + data.len() {
-        buf.resize(off + data.len(), 0);
-    }
-    buf[off..off + data.len()].copy_from_slice(data);
+    let end = off + data.len();
+    buf.resize(buf.len().max(end), 0);
+    buf[off..end].copy_from_slice(data);
 }
 
 impl Fs {
     fn new(mode: FileServeMode) -> Fs {
         let tmp = TempDir::new();
-        std::fs::create_dir(tmp.0.join("sub")).unwrap();
-        std::fs::write(tmp.0.join("a.txt"), "hi").unwrap();
-        std::fs::write(tmp.0.join("sub/a.txt"), "deep").unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        fs::create_dir(tmp.0.join("sub")).unwrap();
+        fs::write(tmp.0.join("a.txt"), "hi").unwrap();
+        fs::write(tmp.0.join("sub/a.txt"), "deep").unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let sftp = Sftp::new(Some(FileService { dir: tmp.0.clone(), mode })).unwrap();
         Fs {
             rt,
@@ -173,6 +179,81 @@ impl Fs {
             Kind::Upload { data, .. } => data,
         }
     }
+
+    /// Whether this mode lets `path` be opened with `flags`.
+    fn may_open(&self, path: &str, flags: Flags) -> bool {
+        let exists = self.names.contains_key(path);
+        match (self.mode, flags) {
+            (FileServeMode::ReadOnly, f) => !f.writable() && exists,
+            (FileServeMode::ReadWrite, Flags::Read) => exists,
+            (FileServeMode::ReadWrite, Flags::Exclusive) => self.parent_exists(path) && !exists,
+            (FileServeMode::ReadWrite, _) => self.parent_exists(path),
+            (_, Flags::Read | Flags::ReadWrite) => false,
+            (FileServeMode::WriteOnly, _) => !path.contains('/'),
+            (FileServeMode::WriteOnlyTree, _) => self.parent_exists(path),
+        }
+    }
+
+    /// The size a stat of `path` should report, if it should find it: in
+    /// a drop box, only what this session wrote is visible.
+    fn visible_size(&self, path: &str) -> Option<usize> {
+        if !self.write_only() {
+            return self.names.get(path).map(|&i| self.inodes[i].len());
+        }
+        match self.wrote.get(path)? {
+            Wrote::Open(h) => {
+                let (_, k) = self.open.iter().find(|(o, _)| o == h).expect("open upload");
+                Some(self.contents(k).len())
+            }
+            Wrote::Done(n) => Some(*n),
+        }
+    }
+
+    /// What listing `dir` should give.
+    fn listing(&self, dir: &str) -> Result<Vec<String>, StatusCode> {
+        if self.write_only() {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if !dir.is_empty() && !self.dirs.contains(dir) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        let children = self.names.keys().chain(&self.dirs).filter(|p| parent(p) == dir);
+        let base = |p: &String| p.rsplit('/').next().unwrap().to_string();
+        let mut want: Vec<_> = children.map(base).collect();
+        want.sort();
+        Ok(want)
+    }
+
+    /// Checks what a drop box holds beyond the names the model knows:
+    /// finished uploads under new names, and unfinished ones, under hidden
+    /// names.
+    fn check_uploads(&self, rest: Snapshot) {
+        let hidden = |p: &String| p.rsplit('/').next().unwrap().starts_with('.') && p.ends_with(".part");
+        let (temps, finished): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(p, _)| hidden(p));
+        let uploading = self.open.iter().filter(|(_, k)| matches!(k, Kind::Upload { .. })).count();
+        assert_eq!(temps.len(), uploading, "unfinished uploads: {temps:?}");
+        let mut got: Vec<_> = finished.into_iter().map(|(p, f)| f.unwrap_or_else(|| panic!("{p} is a dir"))).collect();
+        let mut want = self.renamed_uploads.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "visible uploads don't match the finished ones");
+    }
+}
+
+/// Lists `/dir` to the end, and closes the listing.
+async fn list_all(sftp: &mut Sftp, dir: &str) -> Result<Vec<String>, StatusCode> {
+    let h = sftp.opendir(0, format!("/{dir}")).await?.handle;
+    let mut listed = Vec::new();
+    loop {
+        match sftp.readdir(0, h.clone()).await {
+            Ok(n) => listed.extend(n.files.into_iter().map(|f| f.filename)),
+            Err(StatusCode::Eof) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    sftp.close(0, h).await?;
+    listed.sort();
+    Ok(listed)
 }
 
 #[hegel::state_machine]
@@ -181,18 +262,11 @@ impl Fs {
     fn open(&mut self, tc: TestCase) {
         let path = self.draw_file(&tc);
         let flags = tc.draw(gs::sampled_from(vec![Flags::Read, Flags::Write, Flags::ReadWrite, Flags::Exclusive]));
+        let expect_ok = self.may_open(path, flags);
+
         let r = self.rt.block_on(self.sftp.open(0, path.into(), flags.bits(), FileAttributes::default()));
+
         let r = r.map(|h| h.handle);
-        let exists = self.names.get(path).copied();
-        let expect_ok = match (self.mode, flags) {
-            (FileServeMode::ReadOnly, f) => !f.writable() && exists.is_some(),
-            (FileServeMode::ReadWrite, Flags::Read) => exists.is_some(),
-            (FileServeMode::ReadWrite, Flags::Exclusive) => self.parent_exists(path) && exists.is_none(),
-            (FileServeMode::ReadWrite, _) => self.parent_exists(path),
-            (_, Flags::Read | Flags::ReadWrite) => false,
-            (FileServeMode::WriteOnly, _) => !path.contains('/'),
-            (FileServeMode::WriteOnlyTree, _) => self.parent_exists(path),
-        };
         assert_eq!(r.is_ok(), expect_ok, "open {path} {flags:?}: {r:?}");
         let Ok(h) = r else { return };
         if self.write_only() {
@@ -200,7 +274,7 @@ impl Fs {
             self.open.push((h, Kind::Upload { requested: path.into(), data: Vec::new() }));
             return;
         }
-        let inode = exists.unwrap_or_else(|| {
+        let inode = self.names.get(path).copied().unwrap_or_else(|| {
             self.inodes.push(Vec::new());
             self.names.insert(path.into(), self.inodes.len() - 1);
             self.inodes.len() - 1
@@ -281,65 +355,31 @@ impl Fs {
         if self.closed.is_empty() {
             return;
         }
-        let h = self.closed[tc.draw(gs::integers::<usize>().max_value(self.closed.len() - 1))].clone();
+        let i = tc.draw(gs::integers::<usize>().max_value(self.closed.len() - 1));
+        let h = self.closed[i].clone();
+        let (rt, sftp) = (&self.rt, &mut self.sftp);
         let failed = |r: Result<_, StatusCode>| assert_eq!(r.err(), Some(StatusCode::Failure), "{h}");
-        failed(self.rt.block_on(self.sftp.read(0, h.clone(), 0, 1)).map(drop));
-        failed(self.rt.block_on(self.sftp.write(0, h.clone(), 0, b"x".to_vec())).map(drop));
-        failed(self.rt.block_on(self.sftp.fstat(0, h.clone())).map(drop));
-        failed(self.rt.block_on(self.sftp.close(0, h.clone())).map(drop));
+        failed(rt.block_on(sftp.read(0, h.clone(), 0, 1)).map(drop));
+        failed(rt.block_on(sftp.write(0, h.clone(), 0, b"x".to_vec())).map(drop));
+        failed(rt.block_on(sftp.fstat(0, h.clone())).map(drop));
+        failed(rt.block_on(sftp.close(0, h.clone())).map(drop));
     }
 
     #[rule]
     fn stat(&mut self, tc: TestCase) {
         let path = self.draw_file(&tc);
+        let want = self.visible_size(path).map(|n| Some(n as u64)).ok_or(StatusCode::NoSuchFile);
+
         let r = self.rt.block_on(self.sftp.stat(0, path.into())).map(|a| a.attrs.size);
-        let want = if self.write_only() {
-            match self.wrote.get(path) {
-                Some(Wrote::Open(h)) => {
-                    let (_, k) = self.open.iter().find(|(o, _)| o == h).expect("open upload");
-                    Some(self.contents(k).len())
-                }
-                Some(Wrote::Done(n)) => Some(*n),
-                None => None,
-            }
-        } else {
-            self.names.get(path).map(|&i| self.inodes[i].len())
-        };
-        match want {
-            Some(n) => assert_eq!(r, Ok(Some(n as u64)), "stat {path}"),
-            None => assert_eq!(r, Err(StatusCode::NoSuchFile), "stat {path}"),
-        }
+
+        assert_eq!(r, want, "stat {path}");
     }
 
     #[rule]
     fn list(&mut self, tc: TestCase) {
         let dir = tc.draw(gs::sampled_from(vec!["", "sub", "new"]));
-        let sftp = &mut self.sftp;
-        let r = self.rt.block_on(async {
-            let h = sftp.opendir(0, format!("/{dir}")).await?.handle;
-            let mut listed = Vec::new();
-            loop {
-                match sftp.readdir(0, h.clone()).await {
-                    Ok(n) => listed.extend(n.files.into_iter().map(|f| f.filename)),
-                    Err(StatusCode::Eof) => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            sftp.close(0, h).await?;
-            listed.sort();
-            Ok(listed)
-        });
-        if self.write_only() {
-            assert_eq!(r, Err(StatusCode::PermissionDenied));
-        } else if dir.is_empty() || self.dirs.contains(dir) {
-            let children = self.names.keys().chain(&self.dirs).filter(|p| parent(p) == dir);
-            let base = |p: &String| p.rsplit('/').next().unwrap().to_string();
-            let mut want: Vec<_> = children.map(base).collect();
-            want.sort();
-            assert_eq!(r, Ok(want), "list {dir:?}");
-        } else {
-            assert_eq!(r, Err(StatusCode::NoSuchFile), "list {dir:?}");
-        }
+        let r = self.rt.block_on(list_all(&mut self.sftp, dir));
+        assert_eq!(r, self.listing(dir), "list {dir:?}");
     }
 
     #[rule]
@@ -401,28 +441,16 @@ impl Fs {
         for (name, &i) in &self.names {
             assert_eq!(disk.remove(name).flatten().as_ref(), Some(&self.inodes[i]), "file {name}");
         }
-        if !self.write_only() {
+        if self.write_only() {
+            self.check_uploads(disk);
+        } else {
             assert!(disk.is_empty(), "unexpected files: {:?}", disk.keys().collect::<Vec<_>>());
-            return;
         }
-        // What's left: finished uploads under new names, and unfinished
-        // ones, under hidden names.
-        let hidden = |p: &String| p.rsplit('/').next().unwrap().starts_with('.') && p.ends_with(".part");
-        let (temps, finished): (Vec<_>, Vec<_>) = disk.into_iter().partition(|(p, _)| hidden(p));
-        let uploading = self.open.iter().filter(|(_, k)| matches!(k, Kind::Upload { .. })).count();
-        assert_eq!(temps.len(), uploading, "unfinished uploads: {temps:?}");
-        let mut got: Vec<_> = finished.into_iter().map(|(p, f)| f.unwrap_or_else(|| panic!("{p} is a dir"))).collect();
-        let mut want = self.renamed_uploads.clone();
-        got.sort();
-        want.sort();
-        assert_eq!(got, want, "visible uploads don't match the finished ones");
     }
 }
 
 #[hegel::test(test_cases = 200)]
 fn sftp_state_machine(tc: TestCase) {
-    let modes =
-        vec![FileServeMode::ReadOnly, FileServeMode::ReadWrite, FileServeMode::WriteOnly, FileServeMode::WriteOnlyTree];
-    let mode = tc.draw(gs::sampled_from(modes).print_as_debug());
+    let mode = tc.draw(gs::sampled_from(MODES.to_vec()).print_as_debug());
     hegel::stateful::machine(Fs::new(mode)).steps(40).run(tc);
 }

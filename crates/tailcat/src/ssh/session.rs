@@ -783,49 +783,92 @@ fn default_path(u: &User) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
+    use std::fs;
+    use std::io;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use futures::future::join_all;
     use russh::client;
-    use russh::keys::{PrivateKey, PrivateKeyWithHashAlg};
+    use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key};
+    use russh_sftp::client::SftpSession;
+    use tokio::io::duplex;
+    use tokio::time::{sleep, timeout};
 
     use super::*;
-    use crate::key::NodePrivate;
-    use crate::ssh::{FileServeMode, FileService, SshOptions};
+    use crate::key::{NodePrivate, NodePublic};
+    use crate::ssh::{FileServeMode, FileService, SshOptions, pkcs8_ed25519_pem};
+
+    type Conn = client::Handle<Client>;
+    type ClientChannel = Channel<client::Msg>;
 
     fn test_key(seed: u8) -> PrivateKey {
-        russh::keys::decode_secret_key(&super::super::pkcs8_ed25519_pem(&[seed; 32]), None).unwrap()
+        decode_secret_key(&pkcs8_ed25519_pem(&[seed; 32]), None).unwrap()
+    }
+
+    fn signer(seed: u8) -> PrivateKeyWithHashAlg {
+        PrivateKeyWithHashAlg::new(Arc::new(test_key(seed)), None)
+    }
+
+    /// The tunnel identity of every test client.
+    fn peer_key() -> NodePublic {
+        NodePrivate::from_bytes([9; 32]).public()
     }
 
     struct Client;
 
     impl client::Handler for Client {
         type Error = russh::Error;
-        async fn check_server_key(&mut self, _: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
             Ok(true)
         }
     }
 
     /// Serves `opts` on one end of an in-memory pipe, connecting a client
-    /// to the other; the peer's tunnel identity is `NodePrivate([9; 32])`.
-    async fn connect(opts: SshOptions) -> client::Handle<Client> {
+    /// to the other; the peer's tunnel identity is `peer_key()`.
+    async fn connect(opts: SshOptions) -> Conn {
         connect_with(opts, client::Config::default()).await
     }
 
-    async fn connect_with(opts: SshOptions, config: client::Config) -> client::Handle<Client> {
-        let peer = NodePrivate::from_bytes([9; 32]).public();
+    async fn connect_with(opts: SshOptions, config: client::Config) -> Conn {
+        let peer = peer_key();
         let shared = Arc::new(Shared::new(Arc::new(move |_| Some(peer)), opts, test_key(1)).unwrap());
-        let (a, b) = tokio::io::duplex(1 << 16);
+        let (a, b) = duplex(1 << 16);
         let local = "[fd7a:115c:a1e0::1]:22".parse().unwrap();
-        tokio::spawn(shared.serve(a, local, "[fd7a:115c:a1e0::2]:4242".parse().unwrap()));
+        let remote = "[fd7a:115c:a1e0::2]:4242".parse().unwrap();
+        tokio::spawn(shared.serve(a, local, remote));
         client::connect_stream(Arc::new(config), b, Client).await.unwrap()
     }
 
-    async fn login(opts: SshOptions) -> client::Handle<Client> {
+    async fn login(opts: SshOptions) -> Conn {
         login_with(opts, client::Config::default()).await
     }
 
-    async fn login_with(opts: SshOptions, config: client::Config) -> client::Handle<Client> {
+    async fn login_with(opts: SshOptions, config: client::Config) -> Conn {
         let mut h = connect_with(opts, config).await;
         assert!(h.authenticate_none("u").await.unwrap().success());
         h
+    }
+
+    async fn open_session(h: &Conn) -> ClientChannel {
+        h.channel_open_session().await.unwrap()
+    }
+
+    /// Opens a session that asks for the `name` subsystem.
+    async fn open_subsystem(h: &Conn, name: &str) -> ClientChannel {
+        let ch = open_session(h).await;
+        ch.request_subsystem(true, name).await.unwrap();
+        ch
+    }
+
+    async fn request_pty(ch: &ClientChannel) {
+        ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+    }
+
+    /// Options offering the user's login shell.
+    fn shell() -> SshOptions {
+        SshOptions { shell: true, ..Default::default() }
     }
 
     /// Options forcing every session to run `script` with /bin/sh, which
@@ -834,44 +877,54 @@ mod tests {
         SshOptions { exec: ["/bin/sh", "-c", script].map(String::from).to_vec(), ..Default::default() }
     }
 
+    /// Parses the first complete line `pids <a> <b>…` in `out`.
+    #[cfg(unix)]
+    fn parse_pids(out: &str) -> Option<Vec<libc::pid_t>> {
+        let i = out.find("pids ")?;
+        let (line, _) = out[i..].split_once('\n')?;
+        Some(line.split_whitespace().skip(1).map(|p| p.parse().unwrap()).collect())
+    }
+
     /// Reads a channel's output until it holds a line `pids <a> <b>…`.
     #[cfg(unix)]
-    async fn read_pids(ch: &mut Channel<client::Msg>) -> Vec<libc::pid_t> {
+    async fn read_pids(ch: &mut ClientChannel) -> Vec<libc::pid_t> {
         let mut out = String::new();
         loop {
-            match ch.wait().await {
-                Some(ChannelMsg::Data { data }) => out.push_str(&String::from_utf8_lossy(&data)),
-                Some(_) => continue,
-                None => panic!("no pids in {out:?}"),
+            let Some(msg) = ch.wait().await else { panic!("no pids in {out:?}") };
+            if let ChannelMsg::Data { data } = msg {
+                out.push_str(&String::from_utf8_lossy(&data));
             }
-            if let Some(i) = out.find("pids ")
-                && let Some((line, _)) = out[i..].split_once('\n')
-            {
-                return line.split_whitespace().skip(1).map(|p| p.parse().unwrap()).collect();
+            if let Some(pids) = parse_pids(&out) {
+                return pids;
             }
         }
     }
 
     /// Polls `cond` until it holds, reporting whether it did in time.
-    async fn wait_for(within: std::time::Duration, cond: impl Fn() -> bool) -> bool {
-        tokio::time::timeout(within, async {
+    async fn wait_for(within: Duration, cond: impl Fn() -> bool) -> bool {
+        let poll = async {
             while !cond() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await
-        .is_ok()
+        };
+        timeout(within, poll).await.is_ok()
     }
 
     /// Reports whether this machine (or sandbox) has PTYs.
     #[cfg(unix)]
     fn have_pty() -> bool {
-        let (mut m, mut s) = (-1, -1);
         use std::ptr::null_mut;
+        let (mut m, mut s) = (-1, -1);
         if unsafe { libc::openpty(&mut m, &mut s, null_mut(), null_mut(), null_mut()) } != 0 {
             return false;
         }
         unsafe { libc::close(m) + libc::close(s) == 0 }
+    }
+
+    /// Reports whether process `pid` is gone (reaped, not a zombie).
+    #[cfg(unix)]
+    fn is_gone(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) != 0 }
     }
 
     #[derive(Debug, Default)]
@@ -882,43 +935,39 @@ mod tests {
     }
 
     /// Runs `cmd` on a prepared channel, sending `input` then EOF.
-    async fn run(ch: Channel<client::Msg>, cmd: &str, input: &[u8]) -> Output {
+    async fn run(ch: ClientChannel, cmd: &str, input: &[u8]) -> Output {
         ch.exec(true, cmd).await.unwrap();
         run_started(ch, input).await
     }
 
     /// Sends `input` then EOF to a started session, and collects its output.
-    async fn run_started(ch: Channel<client::Msg>, input: &[u8]) -> Output {
+    async fn run_started(ch: ClientChannel, input: &[u8]) -> Output {
         ch.data(input).await.unwrap();
         ch.eof().await.unwrap();
         collect(ch).await
     }
 
     /// Collects a session's output until the channel closes.
-    async fn collect(mut ch: Channel<client::Msg>) -> Output {
-        let (mut out, mut err, mut o) = (Vec::new(), Vec::new(), Output::default());
+    async fn collect(mut ch: ClientChannel) -> Output {
+        let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), None);
         while let Some(m) = ch.wait().await {
             match m {
                 ChannelMsg::Data { data } => out.extend_from_slice(&data),
                 ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
-                ChannelMsg::ExitStatus { exit_status } => o.code = Some(exit_status),
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
                 _ => {}
             }
         }
-        o.out = String::from_utf8_lossy(&out).into();
-        o.err = String::from_utf8_lossy(&err).into();
-        o
+        let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+        Output { out: text(out), err: text(err), code }
     }
 
     /// Shell sessions run the user's login shell in their home, which a
     /// build sandbox's user may lack.
     fn have_shell() -> bool {
         let u = current_user();
-        std::process::Command::new(login_shell(&u))
-            .args(["-c", "true"])
-            .current_dir(&u.home)
-            .status()
-            .is_ok_and(|s| s.success())
+        let status = Command::new(login_shell(&u)).args(["-c", "true"]).current_dir(&u.home).status();
+        status.is_ok_and(|s| s.success())
     }
 
     fn pubkey_line(k: &PrivateKey) -> String {
@@ -930,10 +979,8 @@ mod tests {
         let opts = SshOptions { authorized_keys: vec![pubkey_line(&test_key(2))], ..Default::default() };
         let mut h = connect(opts).await;
         assert!(!h.authenticate_none("u").await.unwrap().success());
-        let wrong = PrivateKeyWithHashAlg::new(Arc::new(test_key(3)), None);
-        assert!(!h.authenticate_publickey("u", wrong).await.unwrap().success());
-        let right = PrivateKeyWithHashAlg::new(Arc::new(test_key(2)), None);
-        assert!(h.authenticate_publickey("u", right).await.unwrap().success());
+        assert!(!h.authenticate_publickey("u", signer(3)).await.unwrap().success());
+        assert!(h.authenticate_publickey("u", signer(2)).await.unwrap().success());
     }
 
     #[tokio::test]
@@ -946,18 +993,20 @@ mod tests {
         if !have_shell() {
             return;
         }
-        let h = login(SshOptions { shell: true, ..Default::default() }).await;
-        let ch = h.channel_open_session().await.unwrap();
+        let h = login(shell()).await;
+        let ch = open_session(&h).await;
         ch.set_env(true, "LC_TEST", "yes").await.unwrap();
         ch.set_env(true, "EVIL", "no").await.unwrap();
-        let o = run(ch, "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; cat; echo oops >&2; exit 3", b"in\n").await;
-        let key = NodePrivate::from_bytes([9; 32]).public();
-        assert_eq!(o.out, format!("{key} yes []\nin\n"));
+
+        let script = "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; cat; echo oops >&2; exit 3";
+        let o = run(ch, script, b"in\n").await;
+
+        assert_eq!(o.out, format!("{} yes []\nin\n", peer_key()));
         assert_eq!(o.err, "oops\n");
         assert_eq!(o.code, Some(3));
 
         // A command killed by a signal reports 128 + the signal number.
-        let o = run(h.channel_open_session().await.unwrap(), "kill -9 $$", b"").await;
+        let o = run(open_session(&h).await, "kill -9 $$", b"").await;
         assert_eq!(o.code, Some(128 + 9));
     }
 
@@ -967,12 +1016,14 @@ mod tests {
         if !have_shell() {
             return;
         }
-        let h = login(SshOptions { shell: true, ..Default::default() }).await;
-        let ch = h.channel_open_session().await.unwrap();
-        ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+        let h = login(shell()).await;
+        let ch = open_session(&h).await;
+        request_pty(&ch).await;
         // A resize before the session starts replaces the requested size.
         ch.window_change(100, 50, 0, 0).await.unwrap();
+
         let o = run(ch, "stty size; echo $TERM; tty -s && echo tty", b"").await;
+
         if o.err.starts_with("pty open:") || o.err.starts_with("start:") {
             return; // No PTYs in this sandbox.
         }
@@ -985,12 +1036,24 @@ mod tests {
     #[tokio::test]
     async fn pipes_feed_a_command_with_closed_output() {
         let h = login(sh("exec >/dev/null 2>&1; test \"$(wc -c)\" -eq 100000")).await;
-        let ch = h.channel_open_session().await.unwrap();
+        let ch = open_session(&h).await;
         ch.exec(true, "x").await.unwrap();
         // Let the command close its output first.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let o = tokio::time::timeout(std::time::Duration::from_secs(10), run_started(ch, &[b'x'; 100_000])).await;
+        sleep(Duration::from_millis(300)).await;
+
+        let o = timeout(Duration::from_secs(10), run_started(ch, &[b'x'; 100_000])).await;
+
         assert_eq!(o.expect("the session hung").code, Some(0));
+    }
+
+    /// Ends a session by closing its channel, or by disconnecting.
+    #[cfg(unix)]
+    async fn hang_up(h: &Conn, ch: &ClientChannel, disconnect: bool) {
+        if disconnect {
+            h.disconnect(russh::Disconnect::ByApplication, "", "").await.unwrap();
+        } else {
+            ch.close().await.unwrap();
+        }
     }
 
     /// Hanging up a PTY session, by closing its channel or by going away
@@ -999,12 +1062,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pty_sessions_end_when_the_client_goes() {
-        use std::time::Duration;
         if !have_pty() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("tailcat-hup-{}", hex::encode(rand::random::<[u8; 8]>())));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = temp_dir().join(format!("tailcat-hup-{}", hex::encode(rand::random::<[u8; 8]>())));
+        fs::create_dir(&dir).unwrap();
         // The background job notes its hangup in a file: once orphaned, it
         // may linger as a zombie where nothing reaps orphans. It reports
         // the shell's pid ($$ in a subshell) once it's ready.
@@ -1013,30 +1075,41 @@ mod tests {
             let trap = format!("trap 'echo > {}; exit' HUP", marker.display());
             (format!("({trap}; echo pids $$; while :; do sleep 0.1; done) & wait"), Some(marker))
         };
-        let cases = [
-            (with_job("close"), false),
-            (with_job("disconnect"), true),
-            (("trap '' HUP; echo pids $$; while :; do sleep 1; done".to_string(), None), false),
-        ];
+        let ignores_hup = "trap '' HUP; echo pids $$; while :; do sleep 1; done".to_string();
+        let cases = [(with_job("close"), false), (with_job("disconnect"), true), ((ignores_hup, None), false)];
         for ((script, marker), disconnect) in cases {
             let h = login(sh(&script)).await;
-            let mut ch = h.channel_open_session().await.unwrap();
-            ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+            let mut ch = open_session(&h).await;
+            request_pty(&ch).await;
             ch.exec(true, "x").await.unwrap();
-            let pids = tokio::time::timeout(Duration::from_secs(10), read_pids(&mut ch)).await.unwrap();
-            if disconnect {
-                h.disconnect(russh::Disconnect::ByApplication, "", "").await.unwrap();
-            } else {
-                ch.close().await.unwrap();
-            }
+            let pids = timeout(Duration::from_secs(10), read_pids(&mut ch)).await.unwrap();
+
+            hang_up(&h, &ch, disconnect).await;
+
             // Gone means reaped, by the session.
-            let ended = wait_for(Duration::from_secs(10), || unsafe { libc::kill(pids[0], 0) != 0 }).await;
+            let ended = wait_for(Duration::from_secs(10), || is_gone(pids[0])).await;
             assert!(ended, "{script:?} (disconnect: {disconnect}): shell still running");
             if let Some(m) = marker {
                 assert!(wait_for(Duration::from_secs(10), || m.exists()).await, "{script:?}: no hangup for the job");
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Runs a PTY command that writes `size` bytes and exits, for a client
+    /// that takes nothing until a second after.
+    #[cfg(unix)]
+    async fn slow_pty_output(size: usize) -> (usize, Output) {
+        let config = client::Config { window_size: 2048, channel_buffer_size: 1, ..Default::default() };
+        let script = format!("head -c {size} /dev/zero | tr '\\0' x; echo END");
+        let h = login_with(sh(&script), config).await;
+        let ch = open_session(&h).await;
+        request_pty(&ch).await;
+        ch.exec(true, "x").await.unwrap();
+        // Take nothing while the command writes and exits.
+        sleep(Duration::from_secs(1)).await;
+        let o = timeout(Duration::from_secs(10), collect(ch)).await.unwrap();
+        (size, o)
     }
 
     /// Output still in the PTY when the command exits reaches a client
@@ -1049,19 +1122,10 @@ mod tests {
         }
         // How much of the output is still on its way when the command
         // exits depends on the platform's PTY buffering, so try a few sizes.
-        let one = async |size: usize| {
-            let config = client::Config { window_size: 2048, channel_buffer_size: 1, ..Default::default() };
-            let script = format!("head -c {size} /dev/zero | tr '\\0' x; echo END");
-            let h = login_with(sh(&script), config).await;
-            let ch = h.channel_open_session().await.unwrap();
-            ch.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
-            ch.exec(true, "x").await.unwrap();
-            // Take nothing while the command writes and exits.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let o = tokio::time::timeout(std::time::Duration::from_secs(10), collect(ch)).await.unwrap();
-            (size, o)
-        };
-        let runs = futures::future::join_all([500, 1000, 2000, 3000, 4000, 6000, 8000].map(one)).await;
+        let sizes = [500, 1000, 2000, 3000, 4000, 6000, 8000];
+
+        let runs = join_all(sizes.map(slow_pty_output)).await;
+
         for (size, o) in runs {
             let tail = &o.out[o.out.len().saturating_sub(20)..];
             assert_eq!(o.out.len(), size + "END\r\n".len(), "{size} bytes, got {} ending {tail:?}", o.out.len());
@@ -1072,38 +1136,36 @@ mod tests {
 
     #[tokio::test]
     async fn forced_command_gets_original_command() {
-        let exec = ["/bin/sh", "-c", "echo \"$SSH_ORIGINAL_COMMAND|$TAILCAT_REMOTE_ADDR\"; cat"];
-        let h = login(SshOptions {
-            exec: exec.map(String::from).to_vec(),
+        let opts = SshOptions {
             // Both are overridden by the forced command.
             shell: true,
             files: Some(FileService { dir: "/".into(), mode: FileServeMode::ReadOnly }),
-            ..Default::default()
-        })
-        .await;
-        let o = run(h.channel_open_session().await.unwrap(), "ls -la /", b"piped\n").await;
+            ..sh("echo \"$SSH_ORIGINAL_COMMAND|$TAILCAT_REMOTE_ADDR\"; cat")
+        };
+        let h = login(opts).await;
+
+        let o = run(open_session(&h).await, "ls -la /", b"piped\n").await;
         assert_eq!(o.out, "ls -la /|[fd7a:115c:a1e0::2]:4242\npiped\n");
         assert_eq!(o.code, Some(0));
 
-        let mut ch = h.channel_open_session().await.unwrap();
-        ch.request_subsystem(true, "sftp").await.unwrap();
-        assert!(matches!(ch.wait().await, Some(ChannelMsg::Failure)));
+        let mut sftp = open_subsystem(&h, "sftp").await;
+        assert!(matches!(sftp.wait().await, Some(ChannelMsg::Failure)));
     }
 
     #[tokio::test]
     async fn file_service_refuses_shells_but_serves_sftp() {
-        let files = FileService { dir: std::env::temp_dir(), mode: FileServeMode::ReadOnly };
+        let files = FileService { dir: temp_dir(), mode: FileServeMode::ReadOnly };
         let h = login(SshOptions { files: Some(files), ..Default::default() }).await;
-        let o = run(h.channel_open_session().await.unwrap(), "id", b"").await;
+
+        let o = run(open_session(&h).await, "id", b"").await;
         assert!(o.err.contains("only offers file transfer"), "{o:?}");
         assert_eq!(o.code, Some(1));
 
-        let mut ch = h.channel_open_session().await.unwrap();
-        ch.request_subsystem(true, "nope").await.unwrap();
-        assert!(matches!(ch.wait().await, Some(ChannelMsg::Failure)));
-        let ch = h.channel_open_session().await.unwrap();
-        ch.request_subsystem(true, "sftp").await.unwrap();
-        let sftp = russh_sftp::client::SftpSession::new(ch.into_stream()).await.unwrap();
+        let mut unknown = open_subsystem(&h, "nope").await;
+        assert!(matches!(unknown.wait().await, Some(ChannelMsg::Failure)));
+
+        let ch = open_subsystem(&h, "sftp").await;
+        let sftp = SftpSession::new(ch.into_stream()).await.unwrap();
         assert!(sftp.metadata(".").await.unwrap().is_dir());
         assert_eq!(sftp.canonicalize("../..").await.unwrap(), "/");
     }
@@ -1111,14 +1173,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_codes() {
-        use std::process::Command;
-        assert_eq!(exit_code(Command::new("/bin/sh").args(["-c", "exit 7"]).status()), 7);
-        assert_eq!(exit_code(Err(std::io::Error::other("x"))), 1);
+        let exit_7 = Command::new("/bin/sh").args(["-c", "exit 7"]).status();
+        assert_eq!(exit_code(exit_7), 7);
+        assert_eq!(exit_code(Err(io::Error::other("x"))), 1);
     }
 
     #[test]
     fn accepted_env() {
-        assert!(accept_env("TERM") && accept_env("LANG") && accept_env("LC_ALL"));
-        assert!(!accept_env("PATH") && !accept_env("LD_PRELOAD") && !accept_env("LANGUAGE"));
+        for accepted in ["TERM", "LANG", "LC_ALL"] {
+            assert!(accept_env(accepted), "{accepted}");
+        }
+        for refused in ["PATH", "LD_PRELOAD", "LANGUAGE"] {
+            assert!(!accept_env(refused), "{refused}");
+        }
     }
 }

@@ -342,26 +342,65 @@ pub fn utc_civil(secs: i64) -> [i64; 6] {
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Barrier;
+    use std::thread;
+
+    use hegel::generators as gs;
+    use russh::keys::{Algorithm, decode_secret_key};
+
     use super::*;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE comment";
 
+    fn key_count(texts: &[String]) -> usize {
+        parse_authorized_keys(texts).unwrap().len()
+    }
+
     #[test]
     fn authorized_keys_parsing() {
-        assert_eq!(parse_authorized_keys(&[format!("# c\r\n\n  {KEY}\r\n")]).unwrap().len(), 1);
-        assert_eq!(parse_authorized_keys(&[KEY.into(), KEY.into()]).unwrap().len(), 1);
+        assert_eq!(key_count(&[format!("# c\r\n\n  {KEY}\r\n")]), 1);
+        assert_eq!(key_count(&[KEY.into(), KEY.into()]), 1);
         assert!(parse_authorized_keys(&["".into()]).is_err());
         assert!(parse_authorized_keys(&[]).is_err());
-        let e = parse_authorized_keys(&[KEY.into(), format!("\ncommand=\"x\" {KEY}")]).unwrap_err();
-        assert_eq!(e.to_string(), "authorized keys entry 2, line 2: options are not supported");
         assert!(parse_authorized_keys(&["not a key".into()]).is_err());
+
+        let with_options = [KEY.into(), format!("\ncommand=\"x\" {KEY}")];
+        let e = parse_authorized_keys(&with_options).unwrap_err();
+        assert_eq!(e.to_string(), "authorized keys entry 2, line 2: options are not supported");
     }
 
     #[test]
     fn pkcs8_round_trips() {
         let pem = pkcs8_ed25519_pem(&[7u8; 32]);
-        let k = russh::keys::decode_secret_key(&pem, None).unwrap();
-        assert_eq!(k.algorithm(), russh::keys::Algorithm::Ed25519);
+        let k = decode_secret_key(&pem, None).unwrap();
+        assert_eq!(k.algorithm(), Algorithm::Ed25519);
+    }
+
+    fn fresh_temp_dir() -> PathBuf {
+        let dir = temp_dir().join(format!("tailcat-hostkey-{}", hex::encode(rand::random::<[u8; 8]>())));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn openssh_public(k: &PrivateKey) -> String {
+        k.public_key().to_openssh().unwrap()
+    }
+
+    /// Runs `n` `load_or_create_key`s at once and returns each one's
+    /// public key.
+    fn start_concurrently(n: usize, path: &Path) -> Vec<Result<String>> {
+        let barrier = Barrier::new(n);
+        let start = || {
+            barrier.wait();
+            load_or_create_key(path).map(|k| openssh_public(&k))
+        };
+        thread::scope(|s| {
+            let starts: Vec<_> = (0..n).map(|_| s.spawn(start)).collect();
+            starts.into_iter().map(|t| t.join().unwrap()).collect()
+        })
     }
 
     /// Processes starting at once (threads here, below any in-process
@@ -370,40 +409,28 @@ mod tests {
     #[cfg(unix)] // Elsewhere, replacing an empty file races.
     #[hegel::test(test_cases = 50)]
     fn concurrent_starts_share_one_host_key(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let dir = std::env::temp_dir().join(format!("tailcat-hostkey-{}", hex::encode(rand::random::<[u8; 8]>())));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = fresh_temp_dir();
         let path = dir.join("ssh_host_ed25519_key");
         let existing = pkcs8_ed25519_pem(&[7; 32]);
         let initial =
             tc.draw(gs::sampled_from(vec![None, Some(""), Some("\n"), Some(existing.as_str()), Some("junk")]));
         if let Some(text) = initial {
-            std::fs::write(&path, text).unwrap();
+            fs::write(&path, text).unwrap();
         }
         let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
-        let barrier = std::sync::Barrier::new(n);
-        let keys: Vec<_> = std::thread::scope(|s| {
-            let starts: Vec<_> = (0..n)
-                .map(|_| {
-                    s.spawn(|| {
-                        barrier.wait();
-                        load_or_create_key(&path).map(|k| k.public_key().to_openssh().unwrap())
-                    })
-                })
-                .collect();
-            starts.into_iter().map(|t| t.join().unwrap()).collect()
-        });
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        let leftovers: Vec<_> =
-            std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-        let _ = std::fs::remove_dir_all(&dir);
+
+        let keys = start_concurrently(n, &path);
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        let _ = fs::remove_dir_all(&dir);
         if initial == Some("junk") {
             assert!(keys.iter().all(|k| k.is_err()), "{keys:?}");
             assert_eq!(on_disk, "junk");
             return;
         }
         let keys: Vec<_> = keys.into_iter().map(|k| k.unwrap()).collect();
-        let disk_key = russh::keys::decode_secret_key(&on_disk, None).unwrap().public_key().to_openssh().unwrap();
+        let disk_key = openssh_public(&decode_secret_key(&on_disk, None).unwrap());
         assert!(keys.iter().all(|k| *k == disk_key), "{keys:?} vs {disk_key}");
         if initial == Some(existing.as_str()) {
             assert_eq!(on_disk, existing);
