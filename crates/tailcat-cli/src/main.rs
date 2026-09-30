@@ -29,8 +29,8 @@ pub struct Global {
     /// 'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server
     /// mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a
     /// *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json
-    #[arg(long, global = true, value_name = "KEY")]
-    pub key: Option<String>,
+    #[arg(long, global = true, value_name = "KEY", default_value = "", hide_default_value = true)]
+    pub key: args::KeyArg,
     /// Be verbose.
     #[arg(long, global = true)]
     pub verbose: bool,

@@ -438,7 +438,7 @@ mod tests {
     }
 
     pub(super) fn global() -> Global {
-        Global { key: None, verbose: false, json: false, derpmap_url: String::new() }
+        Global { key: Default::default(), verbose: false, json: false, derpmap_url: String::new() }
     }
 
     /// Echoes a UDP flow's datagrams back to it.

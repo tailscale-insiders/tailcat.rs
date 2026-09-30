@@ -14,6 +14,7 @@ use tailcat::{
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
+use crate::args::KeyArg;
 use crate::perf::PORT as PERF_PORT;
 use crate::{Global, ServeFlags};
 
@@ -277,19 +278,26 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         None
     };
 
-    let key_name = crate::keys::key_name(g, "default")?;
-    let new_key = key_name == "new";
-    let (private, mut ci) = if new_key {
-        let k = PrivateKey::generate();
-        (k.private, ConnInfo { region_id: -1, ..k.public })
-    } else {
-        let k = crate::keys::load(&key_name)?;
-        (k.private, k.public)
+    let key = crate::keys::chosen(g, "default")?;
+    let key_file = crate::keys::key_file(&key)?;
+    let new_key = key_file.is_none();
+    let (private, mut ci) = match &key_file {
+        None => {
+            let k = PrivateKey::generate();
+            (k.private, ConnInfo { region_id: -1, ..k.public })
+        }
+        Some(path) => {
+            let k = crate::keys::load(path)?;
+            (k.private, k.public)
+        }
     };
     // Saved keys remember whether they use a PSK.
     let use_psk = flags.psk.unwrap_or(new_key || !ci.preshared_key.is_zero());
-    if use_psk && ci.preshared_key.is_zero() {
-        bail!("key file {} has no WireGuard pre-shared key", crate::keys::key_path(&key_name)?.display());
+    if use_psk
+        && ci.preshared_key.is_zero()
+        && let Some(path) = &key_file
+    {
+        bail!("key file {} has no WireGuard pre-shared key", path.display());
     }
     let psk = if use_psk { ci.preshared_key } else { PresharedKey::default() };
 
@@ -453,7 +461,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         if new_key {
             eprintln!("# ⚠️ WARNING: serving without a WireGuard PSK");
         } else {
-            eprintln!("# ⚠️ WARNING: saved key {key_name:?} is not using a WireGuard PSK");
+            eprintln!("# ⚠️ WARNING: saved key {:?} is not using a WireGuard PSK", key.to_string());
         }
     }
     if ssh_noauth && flags.allow.is_none() {
@@ -467,7 +475,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     {
         bail!("timeout waiting for connection to local dev DERP");
     }
-    announce(g, &key_name, &conn_str).await?;
+    announce(g, &key, &conn_str).await?;
 
     if std::env::var("TAILCAT_STATUS_LOOP").as_deref() == Ok("1") {
         tokio::spawn(async move {
@@ -495,11 +503,11 @@ fn after_start(ready: tokio::sync::watch::Receiver<bool>, h: TcpHandler) -> TcpH
     })
 }
 
-async fn announce(g: &Global, key_name: &str, conn_str: &Addr) -> Result<()> {
-    if key_name == "new" {
+async fn announce(g: &Global, key: &KeyArg, conn_str: &Addr) -> Result<()> {
+    if *key == KeyArg::New {
         eprintln!("# 🐈 Server listening with new address: {conn_str}");
     } else {
-        eprintln!("# 🐈 Server listening with saved key {key_name:?}: {conn_str}");
+        eprintln!("# 🐈 Server listening with saved key {:?}: {conn_str}", key.to_string());
     }
     if g.json {
         println!("{}", serde_json::json!({ "listenAddr": conn_str.as_str() }));

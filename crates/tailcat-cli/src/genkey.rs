@@ -7,6 +7,8 @@ use clap::{ArgAction, Args};
 use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, PresharedKey, PrivateKey, RegionChoice};
 use tailcat_args::RegionArg;
 
+use crate::args::KeyArg;
+
 use crate::{Global, usagef};
 
 #[derive(Args, Debug)]
@@ -41,7 +43,7 @@ pub struct GenkeyArgs {
 }
 
 pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
-    let key = g.key.as_deref().unwrap_or("");
+    let key = &g.key;
     let region_set = a.region.is_some();
     let region = a.region.unwrap_or(RegionArg::Choice(RegionChoice::Nearest));
     let listing = region == RegionArg::List;
@@ -62,19 +64,23 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         }
         return Ok(());
     }
+    if *key == KeyArg::New {
+        return Err(usagef!("genkey can't save a key named \"new\": --key=new means a fresh ephemeral key"));
+    }
+    let path = crate::keys::key_file(key)?;
     if a.delete {
-        if key.is_empty() {
-            return Err(usagef!(
-                "genkey --delete requires saying which key to delete with --key=<name> (see genkey --list)"
-            ));
+        match (key, &path) {
+            (KeyArg::Named(_), Some(path)) => std::fs::remove_file(path)?,
+            (KeyArg::Path(_), _) => return Err(usagef!("can't delete key {:?}; it's a path", key.to_string())),
+            _ => {
+                return Err(usagef!(
+                    "genkey --delete requires saying which key to delete with --key=<name> (see genkey --list)"
+                ));
+            }
         }
-        if crate::keys::is_path(key) {
-            return Err(usagef!("can't delete key {key:?}; it's a path"));
-        }
-        std::fs::remove_file(crate::keys::key_path(key)?)?;
         return Ok(());
     }
-    if key.is_empty() && !listing {
+    if *key == KeyArg::Default && !listing {
         let (modes, default) = if a.client {
             ("client modes automatically load", "client-default")
         } else {
@@ -93,7 +99,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         if a.psk.is_some() {
             return Err(usagef!("genkey --client does not take --psk; pre-shared keys belong to server addresses"));
         }
-        if key == "default" {
+        if *key == KeyArg::Named("default".into()) {
             return Err(usagef!(
                 "genkey --client with --key=default is probably a mistake: \"default\" is the name server mode loads automatically, and client modes load \"client-default\", so you likely want --key=client-default"
             ));
@@ -120,14 +126,13 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
             pick_now = true;
         }
     }
-    let path = crate::keys::key_path(if key.is_empty() { "unused" } else { key })?;
-    if !key.is_empty() {
+    if let Some(path) = &path {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         // Fail early, before any network work; writing checks again.
         if path.exists() && !a.force && !listing {
-            return Err(exists(&path));
+            return Err(exists(path));
         }
     }
 
@@ -136,16 +141,18 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         priv_key.public.preshared_key = PresharedKey::default();
     }
     let write = |k: &PrivateKey| -> Result<()> {
+        // Without a --key, genkey has only listed the regions by now.
+        let path = path.as_deref().ok_or_else(|| anyhow!("genkey requires a --key=<name>"))?;
         let json = k.to_json_pretty();
         // Atomically, so racing runs can't clobber each other's key and a
         // crash can't leave a truncated one.
         let written = if a.force {
-            crate::util::replace_private(&path, json.as_bytes())
+            crate::util::replace_private(path, json.as_bytes())
         } else {
-            crate::util::create_private(&path, json.as_bytes())
+            crate::util::create_private(path, json.as_bytes())
         };
         written.map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => exists(&path),
+            std::io::ErrorKind::AlreadyExists => exists(path),
             _ => anyhow!("writing {}: {e}", path.display()),
         })?;
         eprintln!("# wrote file to {}", path.display());

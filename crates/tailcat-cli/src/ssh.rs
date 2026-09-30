@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use tailcat::ssh::parse_authorized_keys;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::args::KeyArg;
 use crate::{Global, usagef};
 
 const MAX_AUTHORIZED_KEYS_SIZE: usize = 1 << 20;
@@ -156,8 +157,8 @@ fn proxy_command_join_windows(args: &[String]) -> Result<String> {
 /// authenticates the server) and connect through `tailcat <addr> <port>`.
 fn ssh_opts(g: &Global, addr: &str, port: &str) -> Result<Vec<String>> {
     let mut proxy = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
-    if let Some(k) = g.key.as_deref().filter(|k| !k.is_empty()) {
-        proxy.push(format!("--key={k}"));
+    if g.key != KeyArg::Default {
+        proxy.push(format!("--key={}", g.key));
     }
     if g.derpmap_url != tailcat::DEFAULT_DERP_MAP_URL {
         proxy.push(format!("--derpmap-url={}", g.derpmap_url));

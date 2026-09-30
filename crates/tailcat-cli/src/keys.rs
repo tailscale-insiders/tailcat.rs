@@ -1,12 +1,13 @@
 //! Saved keys, in `$CONFIG/tailcat/keys/<name>.private.json` (the same
 //! location and format as the Go implementation, so keys are shared).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tailcat::{NodePrivate, PrivateKey};
 
 use crate::Global;
+use crate::args::KeyArg;
 
 /// Reports whether a key name is a path rather than a name.
 pub fn is_path(name: &str) -> bool {
@@ -18,54 +19,51 @@ pub fn keys_dir() -> Result<PathBuf> {
     Ok(crate::util::user_config_dir().context("no user config directory")?.join("tailcat").join("keys"))
 }
 
-/// The path of a key given by name or path.
-pub fn key_path(name: &str) -> Result<PathBuf> {
-    if is_path(name) {
-        return Ok(PathBuf::from(name));
-    }
-    Ok(keys_dir()?.join(format!("{name}.private.json")))
+/// The file a key is saved in, if `k` names one.
+pub fn key_file(k: &KeyArg) -> Result<Option<PathBuf>> {
+    Ok(match k {
+        KeyArg::Named(name) => Some(keys_dir()?.join(format!("{name}.private.json"))),
+        KeyArg::Path(p) => Some(p.clone()),
+        KeyArg::Default | KeyArg::New => None,
+    })
 }
 
 /// Loads a key file.
-pub fn load(name: &str) -> Result<PrivateKey> {
-    let path = key_path(name)?;
-    let j = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+pub fn load(path: &Path) -> Result<PrivateKey> {
+    let j = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&j).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-/// The key named by --key, where "new" means a fresh ephemeral key. No
-/// --key means the saved key `default` if it exists, else "new".
-pub fn key_name(g: &Global, default: &str) -> Result<String> {
-    Ok(match g.key.as_deref() {
-        None | Some("") if key_path(default)?.exists() => default.to_string(),
-        None | Some("") => "new".to_string(),
-        Some(k) => k.to_string(),
+/// The key --key chooses: with none given, the saved key `default` if it
+/// exists, else a fresh ephemeral key.
+pub fn chosen(g: &Global, default: &str) -> Result<KeyArg> {
+    Ok(match &g.key {
+        KeyArg::Default => {
+            let saved = KeyArg::Named(default.into());
+            if key_file(&saved)?.is_some_and(|p| p.exists()) { saved } else { KeyArg::New }
+        }
+        k => k.clone(),
     })
 }
 
 /// The client identity per --key, defaulting to the saved
 /// "client-default" key.
 pub fn client_key(g: &Global) -> Result<NodePrivate> {
-    match key_name(g, "client-default")?.as_str() {
-        "new" => Ok(NodePrivate::generate()),
-        name => Ok(load(name)?.private),
+    match key_file(&chosen(g, "client-default")?)? {
+        None => Ok(NodePrivate::generate()),
+        Some(path) => Ok(load(&path)?.private),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use super::*;
 
     fn global(key: Option<&str>) -> Global {
-        Global { key: key.map(String::from), verbose: false, json: false, derpmap_url: String::new() }
-    }
-
-    /// The key name `--key <key>` selects, with a default of "default".
-    fn named(key: &str) -> String {
-        key_name(&global(Some(key)), "default").unwrap()
+        let key = key.map_or(KeyArg::Default, |k| k.parse().unwrap());
+        Global { key, verbose: false, json: false, derpmap_url: String::new() }
     }
 
     /// The client key per `--key <path>`.
@@ -78,10 +76,11 @@ mod tests {
         assert!(is_path("a/b.private.json"));
         assert!(is_path(r"a\b"));
         assert!(!is_path("default"));
-        assert_eq!(key_path("./k.json").unwrap(), PathBuf::from("./k.json"));
-        assert!(key_path("foo").unwrap().ends_with("tailcat/keys/foo.private.json"));
-        assert_eq!(named("new"), "new");
-        assert_eq!(named("foo"), "foo");
+        assert_eq!(key_file(&"./k.json".parse().unwrap()).unwrap(), Some(PathBuf::from("./k.json")));
+        let named = key_file(&"foo".parse().unwrap()).unwrap().unwrap();
+        assert!(named.ends_with("tailcat/keys/foo.private.json"));
+        assert_eq!(chosen(&global(Some("new")), "default").unwrap(), KeyArg::New);
+        assert_eq!(chosen(&global(Some("foo")), "default").unwrap(), KeyArg::Named("foo".into()));
     }
 
     #[test]
