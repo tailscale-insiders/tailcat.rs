@@ -119,7 +119,7 @@ struct UpArgs {
     #[arg(long)]
     nodes: Option<usize>,
     /// How long to wait for all --nodes records.
-    #[arg(long, default_value = "5m", value_parser = parse_duration)]
+    #[arg(long, default_value = "5m", value_parser = tailcat_args::parse_duration)]
     wait: Duration,
     /// The TUN interface name (on macOS, utunN or omitted).
     #[arg(long)]
@@ -142,21 +142,8 @@ struct UpArgs {
     #[arg(long)]
     ready_file: Option<PathBuf>,
     /// How often to log peer status.
-    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    #[arg(long, default_value = "30s", value_parser = tailcat_args::parse_duration)]
     status_interval: Duration,
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len()));
-    let n: f64 = num.parse().map_err(|_| format!("invalid duration {s:?}"))?;
-    let mult = match unit {
-        "ms" => 0.001,
-        "s" | "" => 1.0,
-        "m" => 60.0,
-        "h" => 3600.0,
-        _ => return Err(format!("invalid duration unit in {s:?}")),
-    };
-    Duration::try_from_secs_f64(n * mult).map_err(|_| format!("invalid duration {s:?}"))
 }
 
 fn main() -> ExitCode {
@@ -512,19 +499,6 @@ mod tests {
     /// Parses `tailcat-device <args>`.
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(["tailcat-device"].iter().chain(args))
-    }
-
-    #[test]
-    fn durations() {
-        let d = |s| parse_duration(s);
-        assert_eq!(d("250ms"), Ok(Duration::from_millis(250)));
-        assert_eq!(d("30"), Ok(Duration::from_secs(30)));
-        assert_eq!(d("1.5s"), Ok(Duration::from_millis(1500)));
-        assert_eq!(d("5m"), Ok(Duration::from_secs(300)));
-        assert_eq!(d("2h"), Ok(Duration::from_secs(7200)));
-        for bad in ["", "s", "5d", "-1s", "1e999s"] {
-            assert!(d(bad).is_err(), "{bad:?}");
-        }
     }
 
     #[test]
