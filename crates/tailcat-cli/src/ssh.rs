@@ -1,12 +1,14 @@
 //! `tailcat ssh`, `tailcat cp`, `tailcat ls`, and loading the `ssh`
 //! service's authorized keys.
 
+use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::FileAttributes;
 use sha2::{Digest, Sha256};
 use tailcat::ssh::parse_authorized_keys;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -338,7 +340,7 @@ pub async fn ls_mode(g: &Global, long: bool, target: &str) -> Result<ExitCode> {
     let (_h, sf) = open_sftp(conn, local_username(), SFTP_OPEN_TIMEOUT).await?;
     let md = sf.metadata(path).await.map_err(|e| anyhow!("{path}: {e}"))?;
     if !md.is_dir() {
-        print_entry(long, &md, path.trim_start_matches("./"));
+        print_listing(long, [(path.trim_start_matches("./"), &md)]).or_else(reader_gone)?;
         return Ok(ExitCode::SUCCESS);
     }
     let mut entries: Vec<_> = sf
@@ -349,18 +351,32 @@ pub async fn ls_mode(g: &Global, long: bool, target: &str) -> Result<ExitCode> {
         .filter(|(n, _)| n != "." && n != "..")
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, md) in entries {
-        print_entry(long, &md, &name);
-    }
+    print_listing(long, entries.iter().map(|(name, md)| (name.as_str(), md))).or_else(reader_gone)?;
     let _ = sf.close().await;
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_entry(long: bool, md: &russh_sftp::protocol::FileAttributes, name: &str) {
+/// Prints `entries`, a name and its attributes each, one per line.
+fn print_listing<'a>(long: bool, entries: impl IntoIterator<Item = (&'a str, &'a FileAttributes)>) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    for (name, md) in entries {
+        writeln!(out, "{}", entry_line(long, md, name))?;
+    }
+    out.flush()
+}
+
+/// Ends a listing quietly once its reader has gone, as `head` or
+/// `grep -q` do when they have what they want.
+fn reader_gone(e: io::Error) -> io::Result<()> {
+    if e.kind() == io::ErrorKind::BrokenPipe { Ok(()) } else { Err(e) }
+}
+
+/// An entry's line in a listing: its name, and in the long form its
+/// mode, size and modification time first.
+fn entry_line(long: bool, md: &FileAttributes, name: &str) -> String {
     let slash = if md.is_dir() { "/" } else { "" };
     if !long {
-        println!("{name}{slash}");
-        return;
+        return format!("{name}{slash}");
     }
     let mode = md.permissions.unwrap_or(0);
     let kind = if md.is_dir() {
@@ -373,7 +389,7 @@ fn print_entry(long: bool, md: &russh_sftp::protocol::FileAttributes, name: &str
     let perms = tailcat::ssh::permission_string(mode);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let mtime = fmt_mtime(md.mtime.unwrap_or(0).into(), now);
-    println!("{kind}{perms} {:>12} {mtime} {name}{slash}", md.size.unwrap_or(0));
+    format!("{kind}{perms} {:>12} {mtime} {name}{slash}", md.size.unwrap_or(0))
 }
 
 /// Formats a modification time like Go's "Jan _2 15:04", or with the
