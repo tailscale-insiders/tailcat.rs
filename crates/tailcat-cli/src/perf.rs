@@ -964,6 +964,14 @@ pub struct Server {
 }
 
 impl Server {
+    /// Registers `t` under `id`, unless another test is running.
+    fn register(&self, id: [u8; 8], t: &Arc<Test>) -> bool {
+        let mut tests = self.tests.lock().unwrap();
+        let registered = tests.is_empty() && tests.insert(id, t.clone()).is_none();
+        drop(tests);
+        registered
+    }
+
     fn lookup(&self, id: [u8; 8], index: usize) -> Result<Arc<Test>, String> {
         let t = self.tests.lock().unwrap().get(&id).cloned().ok_or("unknown test")?;
         if index >= t.streams.len() {
@@ -1034,11 +1042,7 @@ impl Server {
         let mut id = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
         let t = Test::new(p, id, true, ctrl, None);
-        let registered = {
-            let mut tests = self.tests.lock().unwrap();
-            tests.is_empty() && tests.insert(id, t.clone()).is_none()
-        };
-        if !registered {
+        if !self.register(id, &t) {
             let _ = t.ctrl.send(&Message::error("the server is busy with another test")).await;
             return;
         }
