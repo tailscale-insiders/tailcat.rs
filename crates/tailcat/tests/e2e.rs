@@ -223,6 +223,27 @@ async fn client_rejoins_a_restarted_server() {
     server.close();
 }
 
+/// Dials that pile up behind a rejoin the gone server never answers share
+/// its failure: each waited its turn and then waited out the server
+/// again, so the last of n dials failed after n rejoins.
+#[tokio::test]
+async fn dials_share_an_unanswered_rejoin() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let server = echo(builder(&dev)).start().await.unwrap();
+    let client = Client::new(server.tailcat_addr());
+    assert_eq!(request(client.dial_tcp_port(80).await.unwrap(), b"hi").await, "port 80: hi");
+    server.close();
+
+    // A dial waits 5 seconds before rejoining, and a rejoin 10.
+    let dials = futures::future::join_all((0..3).map(|_| client.dial_tcp_port(80)));
+    let results = within(25, dials).await;
+
+    for r in results {
+        assert_eq!(r.unwrap_err().kind(), ErrorKind::TimedOut);
+    }
+}
+
 #[tokio::test]
 async fn ping_needs_a_live_server() {
     init();

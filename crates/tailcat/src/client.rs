@@ -90,13 +90,27 @@ struct Running {
     meowed: watch::Receiver<u64>,
     /// Set once the server has acknowledged us.
     joined: AtomicBool,
-    /// When the client last joined again, to share one rejoin between
-    /// everyone who wants it.
-    rejoined: tokio::sync::Mutex<Option<Instant>>,
+    /// How the client's last try at joining again went, to share one
+    /// rejoin between everyone who wants it.
+    rejoined: tokio::sync::Mutex<Option<Rejoined>>,
     /// The server's peer configuration, to reset its paths and session.
     server_ms: magicsock::PeerConfig,
     server_wg: wg::PeerConfig,
     tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+/// How a try at joining again went.
+#[derive(Clone, Copy)]
+struct Rejoined {
+    /// When it ended.
+    at: Instant,
+    /// Whether the server answered.
+    answered: bool,
+}
+
+/// The error for a server that didn't answer a join.
+fn no_answer() -> Error {
+    Error::Timeout("no answer from the tailcat server".into())
 }
 
 impl Running {
@@ -128,9 +142,7 @@ impl Running {
                     self.joined.store(true, Ordering::Relaxed);
                     return Ok(t0.elapsed());
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(Error::Timeout("no answer from the tailcat server".into()));
-                }
+                _ = tokio::time::sleep_until(deadline) => return Err(no_answer()),
             }
         }
     }
@@ -141,22 +153,31 @@ impl Running {
     /// WireGuard session and may listen on a new port, so the server's
     /// session and paths are reset too: the next packet starts a fresh
     /// handshake, over DERP until a direct path is found again.
-    /// Concurrent callers share one rejoin.
+    /// Concurrent callers share one rejoin, whether the server answers
+    /// it or not.
     async fn rejoin(&self) -> Result<()> {
         let asked = Instant::now();
         let mut rejoined = self.rejoined.lock().await;
-        if rejoined.is_some_and(|t| t >= asked) {
-            return Ok(());
+        // A try that ended since we asked is ours too.
+        if let Some(r) = rejoined.filter(|r| r.at >= asked) {
+            return if r.answered { Ok(()) } else { Err(no_answer()) };
         }
         debug!("tailcat: no answer from the server; announcing the client again");
-        self.meow().await?;
+        if let Err(e) = self.meow().await {
+            // Otherwise each caller waiting its turn would wait out the
+            // server again. A closed client fails fast, and isn't kept.
+            if matches!(e, Error::Timeout(_)) {
+                *rejoined = Some(Rejoined { at: Instant::now(), answered: false });
+            }
+            return Err(e);
+        }
         let server = self.ci.server_public;
         self.ms.remove_peer(&server);
         self.ms.upsert_peer(self.server_ms.clone());
         self.engine.remove_peer(&server);
         self.engine.upsert_peer(server, self.server_wg.clone());
         self.ms.send_call_me_maybe(&server);
-        *rejoined = Some(Instant::now());
+        *rejoined = Some(Rejoined { at: Instant::now(), answered: true });
         Ok(())
     }
 }
