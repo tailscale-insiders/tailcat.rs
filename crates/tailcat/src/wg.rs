@@ -361,9 +361,19 @@ impl Engine {
     }
 
     async fn handle(&self, pkt: WireguardPacket) {
+        if let Some(p) = self.open(pkt) {
+            let _ = self.inbound.send(p).await;
+        }
+    }
+
+    /// Decrypts a packet from the tunnel and sends any replies it calls
+    /// for (handshake messages, and packets queued behind a handshake).
+    /// It returns the IP packet inside, if its peer may send from its
+    /// source.
+    fn open(&self, pkt: WireguardPacket) -> Option<InboundPacket> {
         let Some(peer) = self.identify(&pkt) else {
             trace!(src = %pkt.src, "wg: packet from unknown peer");
-            return;
+            return None;
         };
         let key = peer.key;
         let src_ip = match pkt.src {
@@ -374,40 +384,39 @@ impl Engine {
         // Decrypted data goes at the start of `buf`, which then becomes
         // the packet.
         let mut buf = vec![0u8; pkt.data.len().max(256) + 64];
-        let inbound = {
-            let mut tunn = peer.tunn.lock().unwrap();
-            match tunn.decapsulate(src_ip, &pkt.data, &mut buf) {
-                TunnResult::WriteToNetwork(b) => {
+        let mut tunn = peer.tunn.lock().unwrap();
+        let inbound = match tunn.decapsulate(src_ip, &pkt.data, &mut buf) {
+            TunnResult::WriteToNetwork(b) => {
+                out.push(b.to_vec());
+                // Flush packets queued while the handshake completed.
+                let mut buf = vec![0u8; 65536];
+                while let TunnResult::WriteToNetwork(b) = tunn.decapsulate(None, &[], &mut buf) {
                     out.push(b.to_vec());
-                    // Flush packets queued while the handshake completed.
-                    let mut buf = vec![0u8; 65536];
-                    while let TunnResult::WriteToNetwork(b) = tunn.decapsulate(None, &[], &mut buf) {
-                        out.push(b.to_vec());
-                    }
-                    None
                 }
-                TunnResult::WriteToTunnelV4(b, src) => Some((b.len(), IpAddr::V4(src))),
-                TunnResult::WriteToTunnelV6(b, src) => Some((b.len(), IpAddr::V6(src))),
-                TunnResult::Err(e) => {
-                    trace!(peer = %key.short_string(), "wg: decapsulate: {e:?}");
-                    None
-                }
-                TunnResult::Done => None,
+                None
             }
+            TunnResult::WriteToTunnelV4(b, src) => Some((b.len(), IpAddr::V4(src))),
+            TunnResult::WriteToTunnelV6(b, src) => Some((b.len(), IpAddr::V6(src))),
+            TunnResult::Err(e) => {
+                trace!(peer = %key.short_string(), "wg: decapsulate: {e:?}");
+                None
+            }
+            TunnResult::Done => None,
         };
+        drop(tunn);
         for b in out {
             self.send(&key, &b);
         }
-        match inbound {
-            Some((_, src)) if !self.owns(&peer, &src) => {
-                trace!(peer = %key.short_string(), "wg: dropping packet from disallowed source {src}");
-            }
-            Some((n, _)) if n > 0 => {
-                buf.truncate(n);
-                let _ = self.inbound.send(InboundPacket { peer: key, data: buf }).await;
-            }
-            _ => {}
+        let (n, src) = inbound?;
+        if !self.owns(&peer, &src) {
+            trace!(peer = %key.short_string(), "wg: dropping packet from disallowed source {src}");
+            return None;
         }
+        if n == 0 {
+            return None;
+        }
+        buf.truncate(n);
+        Some(InboundPacket { peer: key, data: buf })
     }
 
     fn tick(&self) {
