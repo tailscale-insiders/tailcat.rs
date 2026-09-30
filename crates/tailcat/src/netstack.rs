@@ -700,8 +700,10 @@ impl TcpStream {
         self.remote
     }
 
+    /// Runs `f` on the socket, with the stack locked.
     fn with<R>(&self, f: impl FnOnce(&mut tcp::Socket<'static>) -> R) -> R {
-        f(self.shared.lock().sockets.get_mut::<tcp::Socket>(self.handle))
+        let mut st = self.shared.lock();
+        f(st.sockets.get_mut::<tcp::Socket>(self.handle))
     }
 
     /// Runs `f` on the socket and how its connection ended, if it has.
