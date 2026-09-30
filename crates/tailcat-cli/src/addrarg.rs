@@ -11,23 +11,25 @@ pub enum AddrArg {
     Dns(String),
 }
 
-/// Classifies `arg` without any lookup. It refuses DNS-looking input
-/// that contains a valid tailcat address as a label, so that pasting an
-/// address with a stray dot can't leak it in a DNS query.
-pub fn classify(arg: &str) -> Result<AddrArg> {
-    let a = Addr::new(arg);
-    if a.parse().is_ok() {
-        return Ok(AddrArg::Addr(a));
+impl AddrArg {
+    /// Classifies `arg` without any lookup. It refuses DNS-looking input
+    /// that contains a valid tailcat address as a label, so that pasting an
+    /// address with a stray dot can't leak it in a DNS query.
+    pub fn classify(arg: &str) -> Result<Self> {
+        let a = Addr::new(arg);
+        if a.parse().is_ok() {
+            return Ok(AddrArg::Addr(a));
+        }
+        if !arg.contains('.') {
+            bail!("argument {arg:?} is neither a valid tailcat address nor a DNS name");
+        }
+        let name = arg.trim_end_matches('.');
+        if name.split('.').any(|l| Addr::new(l).parse().is_ok()) {
+            bail!("argument contains a valid tailcat address as a DNS label; refusing DNS lookup");
+        }
+        validate_dns_name(name).map_err(|e| anyhow!("invalid DNS name {arg:?}: {e}"))?;
+        Ok(AddrArg::Dns(arg.to_string()))
     }
-    if !arg.contains('.') {
-        bail!("argument {arg:?} is neither a valid tailcat address nor a DNS name");
-    }
-    let name = arg.trim_end_matches('.');
-    if name.split('.').any(|l| Addr::new(l).parse().is_ok()) {
-        bail!("argument contains a valid tailcat address as a DNS label; refusing DNS lookup");
-    }
-    validate_dns_name(name).map_err(|e| anyhow!("invalid DNS name {arg:?}: {e}"))?;
-    Ok(AddrArg::Dns(arg.to_string()))
 }
 
 /// Validates the conservative ASCII hostname syntax accepted for lookups.
@@ -77,7 +79,7 @@ pub async fn lookup_txt(name: &str) -> Result<Addr> {
 /// Resolves a destination argument to an address, looking up TXT
 /// records for DNS names.
 pub async fn tailcat_addr_arg(arg: &str) -> Result<Addr> {
-    match classify(arg)? {
+    match AddrArg::classify(arg)? {
         AddrArg::Addr(a) => Ok(a),
         AddrArg::Dns(n) => lookup_txt(&n).await,
     }
@@ -100,15 +102,15 @@ mod tests {
 
     #[test]
     fn classifies() {
-        assert!(matches!(classify(ADDR).unwrap(), AddrArg::Addr(_)));
-        assert_eq!(classify("example.com").unwrap(), AddrArg::Dns("example.com".into()));
+        assert!(matches!(AddrArg::classify(ADDR).unwrap(), AddrArg::Addr(_)));
+        assert_eq!(AddrArg::classify("example.com").unwrap(), AddrArg::Dns("example.com".into()));
         // A fully qualified name keeps its dot for the lookup.
-        assert_eq!(classify("example.com.").unwrap(), AddrArg::Dns("example.com.".into()));
+        assert_eq!(AddrArg::classify("example.com.").unwrap(), AddrArg::Dns("example.com.".into()));
 
         let addr_dot = format!("{ADDR}.");
         let addr_label = format!("{ADDR}.example.com");
         for bad in ["nonsense", &addr_dot, &addr_label, "bad_name.com", "-x.com", "a..b"] {
-            assert!(classify(bad).is_err(), "{bad:?} classified");
+            assert!(AddrArg::classify(bad).is_err(), "{bad:?} classified");
         }
     }
 
