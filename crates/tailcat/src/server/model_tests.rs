@@ -18,7 +18,6 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::derp::server::DevDerp;
-use crate::key::DiscoPrivate;
 use crate::netstack::build_udp;
 
 /// Served, with a handler.
@@ -40,7 +39,7 @@ struct World {
 impl World {
     /// Client `k` joins, or refreshes, and is acked.
     fn meow(&self, k: NodePublic) {
-        assert!(self.rt.block_on(self.server.on_meow(k, DiscoPrivate::generate().public())));
+        assert!(self.rt.block_on(self.server.meow(k)));
     }
 }
 

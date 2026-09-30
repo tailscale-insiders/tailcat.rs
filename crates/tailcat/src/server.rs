@@ -411,17 +411,9 @@ impl Server {
             if meow::is_meowed(pkt) {
                 return true; // servers ignore acks
             }
-            if let Some((_, disco)) = meow::parse_ping(pkt)
-                && let Some(s) = hook_server()
-            {
-                tokio::spawn(async move {
-                    // Ack only once the client is fully added: "meowed"
-                    // tells it to start dialing. Disallowed clients get
-                    // no reply.
-                    if s.on_meow(src, disco).await {
-                        s.inner.ms.send_derp(&src, region_id, &meow::encode_meowed());
-                    }
-                });
+            let Some((_, disco)) = meow::parse_ping(pkt) else { return true };
+            if let Some(s) = hook_server() {
+                tokio::spawn(s.on_meow(src, disco, region_id));
             }
             true
         });
@@ -616,31 +608,47 @@ impl Server {
         self.inner.close();
     }
 
-    async fn on_meow(&self, src: NodePublic, disco: DiscoPublic) -> bool {
+    /// Answers a meow from `src` that came through DERP region `region`:
+    /// adds it as a client, if the allow hook lets it, and acks it once
+    /// it's fully added, since "meowed" tells it to start dialing. It
+    /// reports whether it acked.
+    async fn on_meow(self, src: NodePublic, disco: DiscoPublic, region: i32) -> bool {
         debug!("tailcat: got meow from {src}");
         if self.inner.closed.load(Ordering::Relaxed) {
             return false;
         }
         let (known, disconnects) = self.client_state(&src);
-        if !known && let Some(allow) = self.inner.cfg.allow_client.clone() {
-            if !self.inner.pending_allow.lock().unwrap().insert(src) {
-                // An earlier meow is still waiting on the hook; the client retries.
-                return false;
-            }
-            let allowed = tokio::task::spawn_blocking(move || allow(src)).await.unwrap_or(false);
-            self.inner.pending_allow.lock().unwrap().remove(&src);
-            if !allowed {
-                debug!("tailcat: ignoring meow from {src}: rejected by the allow hook");
-                return false;
-            }
-        }
-        if !self.admit(src, disco, disconnects) {
+        let Some(s) = self.vet(src, known).await else { return false };
+        if !s.admit(src, disco, disconnects) {
             return false;
         }
         // Tell the client our UDP endpoints so both sides can try a
         // direct path.
-        self.inner.ms.send_call_me_maybe(&src);
+        s.inner.ms.send_call_me_maybe(&src);
+        s.inner.ms.send_derp(&src, region, &meow::encode_meowed());
         true
+    }
+
+    /// Asks the allow hook about `src`, unless it's `known` as a client
+    /// already, returning the server if the hook allows it. The hook may
+    /// take a while, and the server isn't kept up for it: dropped
+    /// meanwhile, it closes, and this returns `None`.
+    async fn vet(self, src: NodePublic, known: bool) -> Option<Server> {
+        let Some(allow) = self.inner.cfg.allow_client.clone().filter(|_| !known) else { return Some(self) };
+        if !self.inner.pending_allow.lock().unwrap().insert(src) {
+            // An earlier meow is still waiting on the hook; the client retries.
+            return None;
+        }
+        let server = Arc::downgrade(&self.inner);
+        drop(self);
+        let allowed = tokio::task::spawn_blocking(move || allow(src)).await.unwrap_or(false);
+        let inner = server.upgrade()?;
+        inner.pending_allow.lock().unwrap().remove(&src);
+        if !allowed {
+            debug!("tailcat: ignoring meow from {src}: rejected by the allow hook");
+            return None;
+        }
+        Some(Server { inner })
     }
 
     /// Whether `src` is a client, and how many clients were disconnected
@@ -813,6 +821,17 @@ impl<T> Drop for Listener<T> {
 }
 
 #[cfg(test)]
+impl Server {
+    /// Answers a meow from client `k`, with a fresh disco key, as if it
+    /// came through the server's region.
+    fn meow(&self, k: NodePublic) -> impl Future<Output = bool> + use<> {
+        use crate::key::DiscoPrivate;
+
+        self.clone().on_meow(k, DiscoPrivate::generate().public(), self.inner.region.region_id)
+    }
+}
+
+#[cfg(test)]
 mod model_tests;
 
 #[cfg(test)]
@@ -829,7 +848,6 @@ mod tests {
 
     use super::*;
     use crate::derp::server::DevDerp;
-    use crate::key::DiscoPrivate;
     use crate::{Client, ClientOptions, KeySet};
 
     /// Whether `k` is a connected client, a WireGuard peer, and a
@@ -867,10 +885,7 @@ mod tests {
             ok
         };
         let server = Server::builder().region(dev.region.clone()).allow_client(slow_hook).start().await.unwrap();
-        let meow = tokio::spawn({
-            let s = server.clone();
-            async move { s.on_meow(k, DiscoPrivate::generate().public()).await }
-        });
+        let meow = tokio::spawn(server.meow(k));
         wait_at(&asked).await;
 
         // The documented revocation, while the hook's stale answer is
@@ -883,6 +898,43 @@ mod tests {
         assert!(!acked, "revoked client was acked");
         assert_eq!(membership(&server, &k), (false, false, false));
         server.close();
+    }
+
+    /// Whether `f` holds within five seconds.
+    async fn soon(f: impl Fn() -> bool) -> bool {
+        for _ in 0..50 {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        f()
+    }
+
+    /// A server dropped while the allow hook decides on a client closes
+    /// at once, rather than when the hook returns, and acks nobody.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_server_beats_a_pending_allow() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (hook_asked, hook_resume) = (asked.clone(), resume.clone());
+        let slow_hook = move |_| {
+            hook_asked.wait();
+            hook_resume.wait();
+            true
+        };
+        let server = Server::builder().region(dev.region.clone()).allow_client(slow_hook).start().await.unwrap();
+        let key = server.public_key();
+        assert!(soon(|| dev.server.is_client_connected(&key)).await, "the server never reached the relay");
+        let meow = tokio::spawn(server.meow(NodePrivate::generate().public()));
+        wait_at(&asked).await;
+
+        drop(server);
+        let closed = soon(|| !dev.server.is_client_connected(&key)).await;
+        wait_at(&resume).await;
+
+        assert!(closed, "the dropped server stayed up for the hook");
+        assert!(!meow.await.unwrap(), "the dropped server acked a client");
     }
 
     /// Asserts that `c` is aborted soon rather than left open.
@@ -939,7 +991,7 @@ mod tests {
         }
 
         fn meow(&self, k: NodePublic) -> bool {
-            self.rt.block_on(self.server.on_meow(k, DiscoPrivate::generate().public()))
+            self.rt.block_on(self.server.meow(k))
         }
     }
 
