@@ -144,10 +144,10 @@ impl Server {
                 match FrameType::from_u8(t) {
                     Some(FrameType::SendPacket) => {
                         let Some((dst, pkt)) = split_key(&payload) else { continue };
-                        let clients = self.clients.lock().unwrap();
+                        let to = self.clients.lock().unwrap().get(&dst).map(|d| d.tx.clone());
                         // Frames are dropped if the recipient is slow.
-                        let _ = match clients.get(&dst) {
-                            Some(d) => d.tx.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
+                        let _ = match to {
+                            Some(to) => to.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
                             None => tx.try_send(frame(FrameType::PeerGone, &[dst.as_bytes(), &[PEER_GONE_NOT_HERE]])),
                         };
                     }
