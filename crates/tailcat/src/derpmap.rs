@@ -505,15 +505,11 @@ pub async fn fetch_derp_map(opts: FetchOptions<'_>) -> Result<DerpMap> {
 /// Fetches `url`, revalidating `stale` if given, and caches the result.
 async fn fetch_fresh(url: &str, mode: FetchMode, cache: &dyn DerpMapCache, stale: Option<&Stale>) -> Result<DerpMap> {
     let mut req = crate::http::client().get(url).header("Tailcat-Mode", mode.header()).timeout(Duration::from_secs(10));
-    if let Some((_, _, etag)) = stale
-        && !etag.is_empty()
-    {
+    if let Some((_, _, etag)) = stale.filter(|(_, _, etag)| !etag.is_empty()) {
         req = req.header("If-None-Match", etag.as_str());
     }
     let res = req.send().await.map_err(|e| Error::other(format!("fetching {url}: {e}")))?;
-    if res.status() == reqwest::StatusCode::NOT_MODIFIED
-        && let Some((dm, data, etag)) = stale
-    {
+    if let Some((dm, data, etag)) = stale.filter(|_| res.status() == reqwest::StatusCode::NOT_MODIFIED) {
         cache.put(url, data, etag);
         return Ok(dm.clone());
     }
