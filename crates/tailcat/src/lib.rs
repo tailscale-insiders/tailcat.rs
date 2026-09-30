@@ -65,6 +65,7 @@ pub mod ssh;
 mod tls;
 
 use std::io::{self, ErrorKind};
+use std::net::SocketAddr;
 #[cfg(feature = "ssh")]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -106,6 +107,8 @@ pub enum Error {
     Timeout(String),
     #[error("{0}")]
     Other(String),
+    #[error("connect to {remote}: {error}")]
+    Connect { remote: SocketAddr, error: smoltcp::socket::tcp::ConnectError },
     #[error("DERP: invalid DERP hostname {host:?}: {error}")]
     BadHostname { host: String, error: rustls::pki_types::InvalidDnsNameError },
     #[error("DERP: TLS handshake with {host}: {error}")]
@@ -189,6 +192,7 @@ impl From<Error> for io::Error {
         match e {
             Error::Io(e) => e,
             Error::Timeout(s) => io::Error::new(ErrorKind::TimedOut, s),
+            e @ Error::Connect { .. } => io::Error::new(ErrorKind::InvalidInput, e.to_string()),
             e => io::Error::other(e.to_string()),
         }
     }
@@ -221,5 +225,14 @@ mod tests {
         let e = Error::from(base64::DecodeError::InvalidLength(3));
         assert_eq!(e.to_string(), "base64 decode: Invalid input length: 3");
         assert!(e.source().is_none(), "a cause chain would print it again");
+    }
+
+    #[test]
+    fn a_refused_connect_is_invalid_input() {
+        let remote = "192.0.2.1:80".parse().unwrap();
+        let e = Error::Connect { remote, error: smoltcp::socket::tcp::ConnectError::Unaddressable };
+        let io = io::Error::from(e);
+        assert_eq!(io.kind(), ErrorKind::InvalidInput);
+        assert_eq!(io.to_string(), "connect to 192.0.2.1:80: unaddressable destination");
     }
 }

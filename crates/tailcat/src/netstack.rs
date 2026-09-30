@@ -30,6 +30,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 use tracing::trace;
 
+use crate::{Error, Result};
+
 const TCP_BUFFER: usize = 512 << 10;
 const UDP_QUEUE: usize = 512;
 /// How long an accepted connection may take to complete its handshake.
@@ -569,15 +571,14 @@ impl Stack {
 
     /// Adds a socket connecting from `local_ip` to `remote`, for
     /// [`Stack::dial_tcp`] to wait on.
-    fn open_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> io::Result<TcpStream> {
+    fn open_tcp(&self, local_ip: IpAddr, remote: SocketAddr) -> Result<TcpStream> {
         let mut st = self.shared.lock();
         if st.closed {
-            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed"));
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed").into());
         }
         let local = SocketAddr::new(local_ip, st.alloc_port(local_ip)?);
         let mut sock = new_tcp_socket();
-        sock.connect(st.iface.context(), remote, local)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
+        sock.connect(st.iface.context(), remote, local).map_err(|error| Error::Connect { remote, error })?;
         let h = st.sockets.add(sock);
         st.tuples.insert((local, remote), h);
         drop(st);
