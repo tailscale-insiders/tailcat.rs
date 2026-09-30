@@ -87,12 +87,20 @@ text_id! {
     Attempt
 }
 
+text_id! {
+    /// A GitHub repository's ID, which outlives renames.
+    RepositoryId
+}
+
+/// The repository a job or token is for, if it says.
+pub type Repository = Option<RepositoryId>;
+
 /// The job's GitHub context, from the runner's environment.
 #[derive(Debug, Clone)]
 pub struct GithubEnv {
     pub api_url: String,
     pub repository: String,
-    pub repository_id: String,
+    pub repository_id: Repository,
     pub run_id: RunId,
     pub run_attempt: Attempt,
     pub git_ref: String,
@@ -109,7 +117,7 @@ impl GithubEnv {
         let e = GithubEnv {
             api_url: std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
             repository: env("GITHUB_REPOSITORY"),
-            repository_id: env("GITHUB_REPOSITORY_ID"),
+            repository_id: RepositoryId::given(&env("GITHUB_REPOSITORY_ID")),
             run_id: env("GITHUB_RUN_ID").into(),
             run_attempt: env("GITHUB_RUN_ATTEMPT").into(),
             git_ref: env("GITHUB_REF"),
@@ -272,7 +280,8 @@ pub async fn mint_oidc(audience: &str) -> Result<Jwt> {
 pub struct Claims {
     pub iss: String,
     pub exp: u64,
-    pub repository_id: String,
+    #[serde(deserialize_with = "nonempty")]
+    pub repository_id: Repository,
     #[serde(rename = "ref")]
     pub git_ref: String,
     #[serde(deserialize_with = "nonempty")]
@@ -363,8 +372,8 @@ pub fn admit(
     let v = verifier.ok_or_else(|| anyhow!("no OIDC verifier"))?;
     let c = v.verify(jwt.as_str(), &audience_for(audience_prefix, &r.nodekey), published)?;
     ensure!(
-        e.repository_id.is_empty() || c.repository_id == e.repository_id,
-        "token is for repository {}, not ours",
+        e.repository_id.is_none() || c.repository_id == e.repository_id,
+        "token is for repository {:?}, not ours",
         c.repository_id
     );
     match scope {
@@ -419,7 +428,7 @@ pub(crate) mod tests {
         GithubEnv {
             api_url: "https://api.github.com".into(),
             repository: "o/r".into(),
-            repository_id: "42".into(),
+            repository_id: RepositoryId::given("42"),
             run_id: "100".into(),
             run_attempt: "1".into(),
             git_ref: "refs/heads/main".into(),
