@@ -8,14 +8,15 @@
 //! nothing by existing, so they must carry an OIDC token whose audience
 //! is the record's node key and whose claims match ours.
 
+use std::fmt;
 use std::io::Read;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::{IntoUrl, RequestBuilder, Response, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::record::{Jwt, NodeRecord, audience_for};
+use crate::record::{Jwt, NodeRecord, Run, RunAttempt, audience_for, nonempty};
 
 /// GitHub's OIDC issuer.
 pub const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -31,14 +32,69 @@ pub enum Scope {
     Pr,
 }
 
+/// Defines a newtype over the text GitHub gives an identifier as.
+macro_rules! text_id {
+    ($(#[$m:meta])* $t:ident) => {
+        $(#[$m])*
+        #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $t(pub String);
+
+        impl $t {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// `s`, unless it's empty.
+            pub fn given(s: &str) -> Option<$t> {
+                (!s.is_empty()).then(|| $t(s.into()))
+            }
+        }
+
+        impl From<&str> for $t {
+            fn from(s: &str) -> Self {
+                $t(s.into())
+            }
+        }
+
+        impl From<String> for $t {
+            fn from(s: String) -> Self {
+                $t(s)
+            }
+        }
+
+        impl fmt::Display for $t {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl fmt::Debug for $t {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{:?}", self.0)
+            }
+        }
+    };
+}
+
+text_id! {
+    /// A GitHub Actions workflow run's ID.
+    RunId
+}
+
+text_id! {
+    /// Which attempt at its run a job is, counting from 1.
+    Attempt
+}
+
 /// The job's GitHub context, from the runner's environment.
 #[derive(Debug, Clone)]
 pub struct GithubEnv {
     pub api_url: String,
     pub repository: String,
     pub repository_id: String,
-    pub run_id: String,
-    pub run_attempt: String,
+    pub run_id: RunId,
+    pub run_attempt: Attempt,
     pub git_ref: String,
     pub ref_name: String,
     pub head_ref: String,
@@ -54,8 +110,8 @@ impl GithubEnv {
             api_url: std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
             repository: env("GITHUB_REPOSITORY"),
             repository_id: env("GITHUB_REPOSITORY_ID"),
-            run_id: env("GITHUB_RUN_ID"),
-            run_attempt: env("GITHUB_RUN_ATTEMPT"),
+            run_id: env("GITHUB_RUN_ID").into(),
+            run_attempt: env("GITHUB_RUN_ATTEMPT").into(),
             git_ref: env("GITHUB_REF"),
             ref_name: env("GITHUB_REF_NAME"),
             head_ref: env("GITHUB_HEAD_REF"),
@@ -63,7 +119,7 @@ impl GithubEnv {
             token: env("GITHUB_TOKEN"),
         };
         ensure!(
-            !e.repository.is_empty() && !e.run_id.is_empty(),
+            !e.repository.is_empty() && !e.run_id.as_str().is_empty(),
             "not running in GitHub Actions (GITHUB_REPOSITORY and GITHUB_RUN_ID are unset)"
         );
         ensure!(
@@ -118,7 +174,7 @@ pub struct ArtifactRun {
 }
 
 /// Lists a run's artifacts.
-pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>> {
+pub async fn list_artifacts(e: &GithubEnv, run_id: &RunId) -> Result<Vec<Artifact>> {
     #[derive(Deserialize)]
     struct List {
         artifacts: Vec<Artifact>,
@@ -144,7 +200,7 @@ pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>
 /// Lists the in-progress runs of this workflow sharing our branch (or,
 /// for a pull request, its head branch), each with the attempt it's on:
 /// `(run ID, attempt)`. Our own run is always there, on our attempt.
-pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<(String, String)>> {
+pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<(RunId, Attempt)>> {
     #[derive(Deserialize)]
     struct List {
         workflow_runs: Vec<Run>,
@@ -168,10 +224,10 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<(String, St
     )?;
     let l: List =
         send(e.get(url), || "listing workflow runs".into()).await?.json().await.context("decoding the run list")?;
-    let mut runs: Vec<(String, String)> = l
+    let mut runs: Vec<(RunId, Attempt)> = l
         .workflow_runs
         .into_iter()
-        .map(|r| (r.id.to_string(), r.run_attempt.to_string()))
+        .map(|r| (RunId(r.id.to_string()), Attempt(r.run_attempt.to_string())))
         .filter(|(id, _)| *id != e.run_id)
         .collect();
     runs.push((e.run_id.clone(), e.run_attempt.clone()));
@@ -219,8 +275,10 @@ pub struct Claims {
     pub repository_id: String,
     #[serde(rename = "ref")]
     pub git_ref: String,
-    pub run_id: String,
-    pub run_attempt: String,
+    #[serde(deserialize_with = "nonempty")]
+    pub run_id: Run,
+    #[serde(deserialize_with = "nonempty")]
+    pub run_attempt: RunAttempt,
     pub sha: String,
     pub job_workflow_ref: String,
     pub actor: String,
@@ -277,19 +335,23 @@ impl Verifier {
 /// only jobs of the run could publish then.
 pub fn admit(
     r: &NodeRecord,
-    from_run: &str,
+    from_run: &RunId,
     e: &GithubEnv,
     scope: Scope,
     verifier: Option<&Verifier>,
     audience_prefix: &str,
     published: u64,
 ) -> Result<()> {
-    ensure!(r.run_id == from_run, "record says it's from run {:?}, but came from run {from_run}", r.run_id);
+    ensure!(
+        r.run_id.as_ref() == Some(from_run),
+        "record says it's from run {:?}, but came from run {from_run}",
+        r.run_id
+    );
     if scope == Scope::Run {
-        ensure!(from_run == e.run_id, "record from run {from_run}, not ours");
+        ensure!(*from_run == e.run_id, "record from run {from_run}, not ours");
         ensure!(
-            r.run_attempt.is_empty() || r.run_attempt == e.run_attempt,
-            "record from attempt {}, not ours ({})",
+            r.run_attempt.as_ref().is_none_or(|a| *a == e.run_attempt),
+            "record from attempt {:?}, not ours ({})",
             r.run_attempt,
             e.run_attempt
         );
@@ -306,8 +368,8 @@ pub fn admit(
         c.repository_id
     );
     match scope {
-        Scope::Run if c.run_id != e.run_id || c.run_attempt != e.run_attempt => {
-            bail!("token is for run {} attempt {}, not ours", c.run_id, c.run_attempt)
+        Scope::Run if c.run_id.as_ref() != Some(&e.run_id) || c.run_attempt.as_ref() != Some(&e.run_attempt) => {
+            bail!("token is for run {:?} attempt {:?}, not ours", c.run_id, c.run_attempt)
         }
         Scope::Branch if c.git_ref != e.git_ref => bail!("token is for ref {}, not {}", c.git_ref, e.git_ref),
         Scope::Pr
@@ -317,10 +379,14 @@ pub fn admit(
         }
         _ => {}
     }
-    ensure!(c.run_id == from_run, "token is for run {}, but the record came from run {from_run}", c.run_id);
+    ensure!(
+        c.run_id.as_ref() == Some(from_run),
+        "token is for run {:?}, but the record came from run {from_run}",
+        c.run_id
+    );
     ensure!(
         c.run_attempt == r.run_attempt,
-        "token is for attempt {}, but the record says it's from attempt {:?}",
+        "token is for attempt {:?}, but the record says it's from attempt {:?}",
         c.run_attempt,
         r.run_attempt
     );
@@ -367,8 +433,8 @@ pub(crate) mod tests {
     pub fn rec(attempt: &str) -> NodeRecord {
         NodeRecord {
             derp_region: 1,
-            run_id: "100".into(),
-            run_attempt: attempt.into(),
+            run_id: RunId::given("100"),
+            run_attempt: Attempt::given(attempt),
             ..NodeRecord::new(0, &NodePrivate::generate(), "100.64.1.0".parse().unwrap())
         }
     }
@@ -391,12 +457,12 @@ pub(crate) mod tests {
     #[test]
     fn run_scope_admission() {
         let e = genv();
-        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, None, "p:", 0);
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, &from_run.into(), &e, scope, None, "p:", 0);
         assert!(admit(&rec("1"), "100", Scope::Run).is_ok());
         assert!(admit(&rec(""), "100", Scope::Run).is_ok(), "no attempt recorded");
         assert!(admit(&rec("2"), "100", Scope::Run).is_err(), "stale attempt");
         assert!(admit(&rec("1"), "99", Scope::Run).is_err(), "another run");
-        let claims_another = NodeRecord { run_id: "99".into(), ..rec("1") };
+        let claims_another = NodeRecord { run_id: RunId::given("99"), ..rec("1") };
         assert!(admit(&claims_another, "100", Scope::Run).is_err(), "says it's from another run");
         assert!(admit(&rec("1"), "100", Scope::Branch).is_err(), "no token outside run scope");
         assert!(admit(&rec("1"), "100", Scope::Pr).is_err(), "no token outside run scope");
@@ -447,7 +513,8 @@ pub(crate) mod tests {
             let r = rec("1");
             let claims = merged(json!({ "aud": audience_for(P, &r.nodekey) }), claims);
             let claim = |name: &str, default: &str| claims[name].as_str().unwrap_or(default).to_string();
-            let (run_id, run_attempt) = (claim("run_id", &r.run_id), claim("run_attempt", &r.run_attempt));
+            let run_id = RunId::given(&claim("run_id", "100"));
+            let run_attempt = Attempt::given(&claim("run_attempt", "1"));
             NodeRecord { run_id, run_attempt, jwt: self.sign(Some("k1"), claims), ..r }
         }
     }
@@ -457,7 +524,7 @@ pub(crate) mod tests {
         let s = Signer::new();
         let v = s.verifier();
         let e = genv();
-        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, Some(&v), P, s.now);
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, &from_run.into(), &e, scope, Some(&v), P, s.now);
 
         let r = s.rec(json!({}));
         admit(&r, "100", Scope::Run).unwrap();
@@ -474,9 +541,9 @@ pub(crate) mod tests {
         let sib = s.rec(json!({"run_id": "99"}));
         admit(&sib, "99", Scope::Branch).unwrap();
         assert!(admit(&sib, "100", Scope::Branch).is_err(), "token run != artifact run");
-        let posing = NodeRecord { run_id: "100".into(), ..sib.clone() };
+        let posing = NodeRecord { run_id: RunId::given("100"), ..sib.clone() };
         assert!(admit(&posing, "99", Scope::Branch).is_err(), "says it's from our run");
-        let retried = NodeRecord { run_attempt: "2".into(), ..sib.clone() };
+        let retried = NodeRecord { run_attempt: Attempt::given("2"), ..sib.clone() };
         assert!(admit(&retried, "99", Scope::Branch).is_err(), "says it's from another attempt");
         let other_ref = s.rec(json!({"run_id": "99", "ref": "refs/heads/evil"}));
         assert!(admit(&other_ref, "99", Scope::Branch).is_err(), "other ref");
@@ -491,7 +558,7 @@ pub(crate) mod tests {
         let expired = s.rec(json!({"exp": s.now - 3600}));
         assert!(admit(&expired, "100", Scope::Run).is_err(), "expired");
         // What counts is whether it had when the record was published.
-        let published = |at| super::admit(&expired, "100", &e, Scope::Run, Some(&v), P, at);
+        let published = |at| super::admit(&expired, &"100".into(), &e, Scope::Run, Some(&v), P, at);
         published(s.now - 3700).unwrap();
         assert!(published(s.now - 3500).is_err(), "published after it expired");
         let misissued = s.rec(json!({"iss": "https://evil.example"}));
@@ -521,13 +588,13 @@ pub(crate) mod tests {
             Some((run, attempt)) => s.rec(json!({"run_id": run, "run_attempt": attempt})),
             None => rec("1"),
         };
-        r.run_id = tc.draw(runs()).into();
-        r.run_attempt = tc.draw(attempts()).into();
+        r.run_id = RunId::given(tc.draw(runs()));
+        r.run_attempt = Attempt::given(tc.draw(attempts()));
 
-        let Ok(()) = admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P, s.now) else { return };
-        assert_eq!(r.run_id, from_run);
+        let Ok(()) = admit(&r, &from_run.into(), &genv(), scope, Some(&s.verifier()), P, s.now) else { return };
+        assert_eq!(r.run_id, RunId::given(from_run));
         if let Some((run, attempt)) = token {
-            assert_eq!((r.run_id.as_str(), r.run_attempt.as_str()), (run, attempt));
+            assert_eq!((&r.run_id, &r.run_attempt), (&RunId::given(run), &Attempt::given(attempt)));
         }
     }
 
@@ -536,7 +603,7 @@ pub(crate) mod tests {
         let s = Signer::new();
         let v = s.verifier();
         let pr = GithubEnv { git_ref: "refs/pull/5/merge".into(), head_ref: "feature".into(), ..genv() };
-        let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, "99", e, Scope::Pr, Some(&v), P, s.now);
+        let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, &"99".into(), e, Scope::Pr, Some(&v), P, s.now);
 
         let same_pr = s.rec(json!({"run_id": "99", "ref": "refs/pull/5/merge"}));
         admit(&same_pr, &pr).unwrap();

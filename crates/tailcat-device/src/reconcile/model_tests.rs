@@ -29,6 +29,7 @@ use hegel::generators as gs;
 use tailcat::DiscoPublic;
 
 use super::*;
+use crate::github::{Attempt, RunId};
 
 /// Run attempts a record can come from: ours, an earlier attempt of our
 /// run, another run, and none at all (a record made outside GitHub
@@ -81,8 +82,8 @@ fn record(k: u8, ip: u8, run: usize, index: u32, routes: &[&str]) -> NodeRecord 
         endpoints: Vec::new(),
         os: String::new(),
         arch: String::new(),
-        run_id: RUNS[run].0.into(),
-        run_attempt: RUNS[run].1.into(),
+        run_id: RunId::given(RUNS[run].0),
+        run_attempt: Attempt::given(RUNS[run].1),
         jwt: None,
     }
 }
@@ -182,7 +183,7 @@ impl Model<'_> {
     /// Whether `r` is from our own run attempt: an earlier attempt's
     /// nodes are gone.
     fn ours(&self, r: &NodeRecord) -> bool {
-        !self.me.run_id.is_empty() && (&r.run_id, &r.run_attempt) == (&self.me.run_id, &self.me.run_attempt)
+        self.me.run_id.is_some() && (&r.run_id, &r.run_attempt) == (&self.me.run_id, &self.me.run_attempt)
     }
 
     /// Orders records best first.
@@ -336,8 +337,7 @@ fn our_runs_nodes_agree(tc: TestCase) {
 #[hegel::test(test_cases = 1000)]
 fn contested_claims_are_routed_elsewhere(tc: TestCase) {
     let no_run = tc.draw(gs::booleans());
-    let run =
-        |r: NodeRecord| if no_run { NodeRecord { run_id: String::new(), run_attempt: String::new(), ..r } } else { r };
+    let run = |r: NodeRecord| if no_run { NodeRecord { run_id: None, run_attempt: None, ..r } } else { r };
     // A key in the middle, so that records of our run can outrank us.
     let me = run(NodeRecord { routes: draw_me(&tc).routes, ..record(3, 0, 0, 0, &[]) });
     let viewer = run(record(6, 4, 0, 4, &[]));

@@ -195,7 +195,7 @@ fn offer<'a, K: Eq + Hash>(me: &NodeRecord, m: &mut HashMap<K, &'a NodeRecord>, 
 /// nodes, which are gone, don't displace this one's; then by node key.
 /// The record's content breaks ties between records with the same key.
 pub fn rank(me: &NodeRecord, a: &NodeRecord, b: &NodeRecord) -> Ordering {
-    let foreign = |r: &NodeRecord| me.run_id.is_empty() || (&r.run_id, &r.run_attempt) != (&me.run_id, &me.run_attempt);
+    let foreign = |r: &NodeRecord| me.run_id.is_none() || (&r.run_id, &r.run_attempt) != (&me.run_id, &me.run_attempt);
     let json = |r: &NodeRecord| serde_json::to_vec(r).unwrap_or_default();
     foreign(a).cmp(&foreign(b)).then(a.nodekey.cmp(&b.nodekey)).then_with(|| json(a).cmp(&json(b)))
 }
@@ -224,6 +224,7 @@ mod tests {
     use tailcat::DiscoPublic;
 
     use super::*;
+    use crate::github::{Attempt, RunId};
 
     type Peers = HashMap<NodePublic, Peer>;
 
@@ -248,8 +249,8 @@ mod tests {
             endpoints: Vec::new(),
             os: String::new(),
             arch: String::new(),
-            run_id: format!("{}", 100 + run),
-            run_attempt: "1".into(),
+            run_id: RunId::given(&format!("{}", 100 + run)),
+            run_attempt: Attempt::given("1"),
             jwt: None,
         }
     }
@@ -315,7 +316,7 @@ mod tests {
     #[test]
     fn our_own_attempt_wins_an_address() {
         let ours = record(5, 1, OURS);
-        let earlier = NodeRecord { run_attempt: "0".into(), ..record(1, 1, OURS) };
+        let earlier = NodeRecord { run_attempt: Attempt::given("0"), ..record(1, 1, OURS) };
         let peers = from_scratch(&[earlier, ours.clone()]);
         assert_eq!(peers, [peer(&ours, &["100.64.1.1"])]);
     }
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!(contested(&me, &with_squatter), [(net("100.64.1.0/32"), &squatter), (net("10.42.9.0/24"), &lower)]);
 
         // Outside GitHub Actions, the lower key wins.
-        let me = NodeRecord { run_id: String::new(), run_attempt: String::new(), ..me };
+        let me = NodeRecord { run_id: None, run_attempt: None, ..me };
         assert_eq!(contested(&me, slice::from_ref(&foreign)), [(net("100.64.1.0/32"), &foreign)]);
     }
 

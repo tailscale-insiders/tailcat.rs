@@ -10,6 +10,7 @@ use tailcat::derp::server::DevDerp;
 use tailcat::netstack::build_udp;
 use tailcat::wg::IpNet;
 use tailcat::{DerpMap, DerpNode, DerpRegion, NodePrivate};
+use tailcat_device::github::RunId;
 use tailcat_device::overlay::EMBEDDED_REGION_BASE;
 use tailcat_device::{ChannelDevice, DeviceKey, NodeRecord, Overlay, OverlayConfig, PacketDevice};
 use tokio::sync::mpsc;
@@ -212,7 +213,7 @@ async fn peer_updates() {
 
 /// `key`, saying it's from run `id`.
 fn in_run(id: &str, mut key: DeviceKey) -> DeviceKey {
-    key.record.run_id = id.into();
+    key.record.run_id = RunId::given(id);
     key
 }
 
@@ -251,7 +252,7 @@ async fn a_lost_address_is_reported() {
     let dm = DerpMap::default();
     // Node 0 of run `id`, for `private`, routing nothing.
     let node_0 = |id: &str, private: NodePrivate| {
-        let record = NodeRecord { run_id: id.into(), routes: Vec::new(), ..record(0, &private, &dev) };
+        let record = NodeRecord { run_id: RunId::given(id), routes: Vec::new(), ..record(0, &private, &dev) };
         DeviceKey { record, private }
     };
     let me = start(node_0("7", NodePrivate::generate())).await.overlay;

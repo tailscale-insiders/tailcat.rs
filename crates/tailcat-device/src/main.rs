@@ -217,8 +217,8 @@ async fn init(derpmap_url: &str, a: InitArgs) -> Result<()> {
         routes: a.routes,
         os: env("RUNNER_OS", std::env::consts::OS),
         arch: env("RUNNER_ARCH", std::env::consts::ARCH),
-        run_id: env("GITHUB_RUN_ID", ""),
-        run_attempt: env("GITHUB_RUN_ATTEMPT", ""),
+        run_id: github::RunId::given(&env("GITHUB_RUN_ID", "")),
+        run_attempt: github::Attempt::given(&env("GITHUB_RUN_ATTEMPT", "")),
         ..NodeRecord::new(a.index, &private, overlay_ip)
     };
     if a.oidc {

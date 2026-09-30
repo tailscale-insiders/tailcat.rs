@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use tracing::{debug, warn};
 
-use crate::github::{self, GithubEnv, Scope, Verifier};
+use crate::github::{self, GithubEnv, RunId, Scope, Verifier};
 use crate::record::NodeRecord;
 
 /// A source of node records, polled repeatedly as nodes come up.
@@ -36,7 +36,7 @@ pub struct GithubSource {
     verifier: Option<Verifier>,
     /// Artifacts already fetched, by ID, so oldest first: their run, and
     /// their admitted record, if any.
-    seen: BTreeMap<u64, (String, Option<NodeRecord>)>,
+    seen: BTreeMap<u64, (RunId, Option<NodeRecord>)>,
 }
 
 impl GithubSource {
@@ -93,9 +93,9 @@ impl GithubSource {
         // attempt, as `admit` does. Oldest artifact first, so the result
         // doesn't depend on the order artifacts were listed in.
         let scope = self.scope;
-        let current = move |run: &str, r: &NodeRecord| {
+        let current = move |run: &RunId, r: &NodeRecord| {
             runs.iter().any(|(id, attempt)| {
-                id == run && (r.run_attempt == *attempt || scope == Scope::Run && r.run_attempt.is_empty())
+                id == run && (r.run_attempt.as_ref() == Some(attempt) || scope == Scope::Run && r.run_attempt.is_none())
             })
         };
         Ok(self.seen.values().filter_map(move |(run, r)| r.as_ref().filter(|r| current(run, r))))

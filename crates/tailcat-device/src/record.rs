@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use tailcat::wg::IpNet;
 use tailcat::{DerpRegion, DiscoPublic, NodePrivate, NodePublic};
 
+use crate::github::{Attempt, RunId};
+
 /// A GitHub OIDC token, as its compact JWT text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -24,12 +26,24 @@ impl Jwt {
     }
 }
 
+impl From<String> for Jwt {
+    fn from(s: String) -> Self {
+        Jwt(s)
+    }
+}
+
 /// A record's OIDC token, if it carries one.
 pub type Token = Option<Jwt>;
 
-/// Reads a [`Token`], taking an empty one for none.
-fn token<'de, D: Deserializer<'de>>(d: D) -> Result<Token, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()).map(Jwt))
+/// The run a record is from, if it's from GitHub Actions.
+pub type Run = Option<RunId>;
+
+/// The attempt at its run a record is from, if it says.
+pub type RunAttempt = Option<Attempt>;
+
+/// Reads an optional value from text, taking the empty string for none.
+pub(crate) fn nonempty<'de, D: Deserializer<'de>, T: From<String>>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()).map(T::from))
 }
 
 /// A mesh node's public record.
@@ -62,13 +76,13 @@ pub struct NodeRecord {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arch: String,
     /// The GitHub Actions run and attempt that published the record.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub run_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub run_attempt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nonempty")]
+    pub run_id: Run,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nonempty")]
+    pub run_attempt: RunAttempt,
     /// A GitHub OIDC token binding `nodekey` to the repository, ref and
     /// run: its audience is [`audience_for`] of the node key.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "token")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nonempty")]
     pub jwt: Token,
 }
 
@@ -90,8 +104,8 @@ impl NodeRecord {
             endpoints: Vec::new(),
             os: String::new(),
             arch: String::new(),
-            run_id: String::new(),
-            run_attempt: String::new(),
+            run_id: None,
+            run_attempt: None,
             jwt: None,
         }
     }
@@ -275,8 +289,8 @@ mod tests {
             routes: vec!["10.42.3.0/24".parse().unwrap()],
             os: "Linux".into(),
             arch: "X64".into(),
-            run_id: "123".into(),
-            run_attempt: "1".into(),
+            run_id: RunId::given("123"),
+            run_attempt: Attempt::given("1"),
             ..NodeRecord::new(3, &k, "100.64.1.3".parse().unwrap())
         };
         let json = serde_json::to_vec(&r).unwrap();

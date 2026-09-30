@@ -9,6 +9,7 @@ use std::sync::Arc;
 use hegel::TestCase;
 use hegel::generators as gs;
 use tailcat::{DerpMap, DerpNode, DerpRegion, DiscoPublic, NodePrivate, NodePublic};
+use tailcat_device::github::RunId;
 use tailcat_device::{DeviceKey, NodeRecord, Overlay, OverlayConfig};
 use tokio::runtime::{Builder, Runtime};
 
@@ -77,8 +78,8 @@ impl Mesh {
             endpoints: Vec::new(),
             os: String::new(),
             arch: String::new(),
-            run_id: tc.draw(gs::sampled_from(vec!["", "7", "8"])).into(),
-            run_attempt: String::new(),
+            run_id: RunId::given(tc.draw(gs::sampled_from(vec!["", "7", "8"]))),
+            run_attempt: None,
             jwt: None,
         }
     }
