@@ -806,14 +806,7 @@ impl MagicSock {
         local.sort();
         local.dedup();
 
-        let (region, round) = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.local_endpoints = local;
-            inner.stun_pending.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(5));
-            inner.stun_round += 1;
-            self.recompute_endpoints_locked(&mut inner);
-            (inner.derp_map.regions.get(&self.home_region).cloned(), inner.stun_round)
-        };
+        let (region, round) = self.begin_stun_round(local);
         let Some(region) = region else { return };
         for n in region.nodes.iter().take(2) {
             let Some(port) = n.stun_port() else { continue };
@@ -823,6 +816,20 @@ impl MagicSock {
                 self.send_udp(a, &stun::request(tx));
             }
         }
+    }
+
+    /// Records our local endpoints and starts a new STUN round,
+    /// returning the home region to send it to and the round's number.
+    fn begin_stun_round(&self, local: Vec<SocketAddr>) -> (Option<DerpRegion>, u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.local_endpoints = local;
+        inner.stun_pending.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(5));
+        inner.stun_round += 1;
+        self.recompute_endpoints_locked(&mut inner);
+        let region = inner.derp_map.regions.get(&self.home_region).cloned();
+        let round = inner.stun_round;
+        drop(inner);
+        (region, round)
     }
 
     fn on_timer(&self) {
