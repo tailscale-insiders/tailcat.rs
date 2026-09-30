@@ -255,11 +255,16 @@ impl Engine {
     /// route hook picks.
     fn peer_for_dst(&self, dst: &IpAddr) -> Option<Arc<WgPeer>> {
         let peers = self.peers.lock().unwrap();
-        match peers.owner(dst) {
-            Some(p) => Some(p.clone()),
-            None if peers.local_match(dst).is_some() => None,
-            None => peers.by_key.get(&self.route.as_ref()?(dst)?).cloned(),
+        if let Some(p) = peers.owner(dst) {
+            return Some(p.clone());
         }
+        if peers.local_match(dst).is_some() {
+            return None;
+        }
+        drop(peers);
+        // The hook runs unlocked, like `peer_config`.
+        let k = self.route.as_ref()?(dst)?;
+        self.peer(&k)
     }
 
     /// Reports whether `peer` owns `src`, so that a packet from it routes
