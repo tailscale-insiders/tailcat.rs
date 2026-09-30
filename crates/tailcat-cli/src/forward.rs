@@ -2,6 +2,8 @@
 //! to a tailcat server.
 
 use std::net::SocketAddr;
+use std::process::Command;
+use std::thread;
 
 use anyhow::{Result, anyhow};
 use tailcat::Client;
@@ -23,7 +25,7 @@ fn remote_name(d: Dest) -> String {
 pub fn open_browser(url: &str) {
     eprintln!("# Opening {url}");
     let url = url.to_string();
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         if let Err(e) = browser_command(&url).status() {
             eprintln!("# opening browser failed: {e}");
         }
@@ -32,24 +34,24 @@ pub fn open_browser(url: &str) {
 
 /// The command that opens `url` in the default browser.
 #[cfg(target_os = "macos")]
-fn browser_command(url: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new("open");
+fn browser_command(url: &str) -> Command {
+    let mut cmd = Command::new("open");
     cmd.arg(url);
     cmd
 }
 
 /// The command that opens `url` in the default browser.
 #[cfg(windows)]
-fn browser_command(url: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new("cmd");
+fn browser_command(url: &str) -> Command {
+    let mut cmd = Command::new("cmd");
     cmd.args(["/c", "start", "", url]);
     cmd
 }
 
 /// The command that opens `url` in the default browser.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn browser_command(url: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new("xdg-open");
+fn browser_command(url: &str) -> Command {
+    let mut cmd = Command::new("xdg-open");
     cmd.arg(url);
     cmd
 }
