@@ -50,7 +50,7 @@ impl GithubSource {
         self
     }
 
-    async fn poll(&mut self) -> Result<Vec<NodeRecord>> {
+    async fn poll(&mut self) -> Result<impl Iterator<Item = &NodeRecord>> {
         let runs = match self.scope {
             Scope::Run => vec![(self.env.run_id.clone(), self.env.run_attempt.clone())],
             s => github::sibling_runs(&self.env, s).await?,
@@ -102,7 +102,7 @@ impl GithubSource {
             .map(|(id, _, r)| (id, r))
             .collect();
         live.sort_by_key(|(id, _)| *id);
-        Ok(live.into_iter().map(|(_, r)| r.clone()).collect())
+        Ok(live.into_iter().map(|(_, r)| r))
     }
 }
 
@@ -156,8 +156,9 @@ impl Source {
             };
             found.extend(r.map(|r| (p, r)));
         }
-        self.last = found.iter().cloned().collect();
-        Ok(dedup(found.into_iter().map(|(_, r)| r).collect()))
+        let records = dedup(found.iter().map(|(_, r)| r));
+        self.last = found.into_iter().collect();
+        Ok(records)
     }
 }
 
@@ -170,10 +171,10 @@ fn read(p: &Path) -> Result<Option<NodeRecord>> {
     }
 }
 
-/// Keeps one record per node key.
-fn dedup(v: Vec<NodeRecord>) -> Vec<NodeRecord> {
+/// Keeps one record per node key, the first.
+fn dedup<'a>(rs: impl IntoIterator<Item = &'a NodeRecord>) -> Vec<NodeRecord> {
     let mut seen = HashSet::new();
-    v.into_iter().filter(|r| seen.insert(r.nodekey)).collect()
+    rs.into_iter().filter(|r| seen.insert(r.nodekey)).cloned().collect()
 }
 
 #[cfg(test)]
