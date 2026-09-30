@@ -40,7 +40,13 @@ pub struct GithubSource {
 }
 
 impl GithubSource {
-    pub fn new(env: GithubEnv, scope: Scope, name_prefix: String, audience_prefix: String) -> Self {
+    pub fn new(
+        env: GithubEnv,
+        scope: Scope,
+        name_prefix: impl Into<String>,
+        audience_prefix: impl Into<String>,
+    ) -> Self {
+        let (name_prefix, audience_prefix) = (name_prefix.into(), audience_prefix.into());
         GithubSource { env, scope, name_prefix, audience_prefix, verifier: None, seen: BTreeMap::new() }
     }
 
@@ -278,7 +284,7 @@ mod tests {
     }
 
     fn github(base: String, scope: Scope, prefix: &str) -> GithubSource {
-        GithubSource::new(GithubEnv { api_url: base, ..genv() }, scope, prefix.into(), P.into())
+        GithubSource::new(GithubEnv { api_url: base, ..genv() }, scope, prefix, P)
     }
 
     fn keys<'a>(v: impl IntoIterator<Item = &'a NodeRecord>) -> HashSet<NodePublic> {
@@ -380,7 +386,7 @@ mod tests {
         }))
         .await;
         let env = GithubEnv { api_url: base, run_attempt: "2".into(), ..genv() };
-        let g = GithubSource::new(env, Scope::Branch, "node-".into(), P.into()).with_verifier(s.verifier());
+        let g = GithubSource::new(env, Scope::Branch, "node-", P).with_verifier(s.verifier());
         let mut src = Source::github(g);
 
         let first = poll(&mut src).await;
