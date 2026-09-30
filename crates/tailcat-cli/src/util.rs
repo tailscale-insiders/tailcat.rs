@@ -1,39 +1,9 @@
-//! Small helpers: Go-style durations, platform directories, loopback
+//! Small helpers: Go-style duration text, platform directories, loopback
 //! dials, atomic private files, accept loops.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Parses a Go-style duration like "10s", "1m30s", "250ms" or "1.5h".
-pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    match s {
-        "0" => return Ok(Duration::ZERO),
-        "" => return Err("empty duration".into()),
-        _ => {}
-    }
-    let is_num = |c: char| c.is_ascii_digit() || c == '.';
-    let mut total = 0f64;
-    let mut rest = s;
-    while !rest.is_empty() {
-        let (num, r) = rest.split_at(rest.find(|c| !is_num(c)).unwrap_or(rest.len()));
-        let n: f64 = num.parse().map_err(|_| format!("invalid duration {s:?}"))?;
-        let (unit, r) = r.split_at(r.find(is_num).unwrap_or(r.len()));
-        rest = r;
-        total += n * match unit {
-            "ns" => 1e-9,
-            "us" | "µs" => 1e-6,
-            "ms" => 1e-3,
-            "s" => 1.0,
-            "m" => 60.0,
-            "h" => 3600.0,
-            "" => return Err(format!("missing unit in duration {s:?}")),
-            _ => return Err(format!("unknown unit {unit:?} in duration {s:?}")),
-        };
-    }
-    Duration::try_from_secs_f64(total).map_err(|_| format!("duration {s:?} is out of range"))
-}
 
 /// Formats a duration roughly the way Go prints it, rounded sensibly.
 pub fn fmt_duration(d: Duration) -> String {
@@ -222,29 +192,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
-        assert_eq!(parse_duration(" 0 ").unwrap(), Duration::ZERO);
-        assert_eq!(parse_duration("1h2m3.5s").unwrap(), Duration::from_millis(3_723_500));
-        assert_eq!(parse_duration("5us").unwrap(), parse_duration("5µs").unwrap());
-        assert_eq!(parse_duration("100ns").unwrap(), Duration::from_nanos(100));
-        let huge = format!("{}h", "9".repeat(30));
-        for bad in ["10", "x", "", "s", ".s", "1.2.3s", "5d", "-1s", "1s 2s", &huge] {
-            assert!(parse_duration(bad).is_err(), "{bad:?} parsed");
-        }
-    }
-
-    #[hegel::test]
-    fn parse_duration_never_panics(tc: TestCase) {
-        // Mostly digits, to reach huge values, among the units.
-        let s = tc.draw(gs::text().alphabet("0123456789.nuµmsh ").max_size(60));
-        let _ = parse_duration(&s);
-    }
-
     /// How far `fmt_duration` rounds `d`: to whole µs, 0.01ms, or 1ms.
     fn rounding(d: Duration) -> Duration {
         if d < Duration::from_millis(1) {
@@ -262,7 +209,7 @@ mod tests {
         let nanos = tc.draw(gs::integers::<u64>().max_value(1_000_000_000_000_000_000));
         let d = Duration::from_nanos(nanos);
         let s = fmt_duration(d);
-        let parsed = parse_duration(&s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        let parsed = tailcat_args::parse_duration(&s).unwrap_or_else(|e| panic!("{s}: {e}"));
         assert!(parsed.abs_diff(d) <= rounding(d), "{d:?} formatted as {s} parsed as {parsed:?}");
     }
 

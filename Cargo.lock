@@ -4088,6 +4088,7 @@ dependencies = [
 name = "tailcat-args"
 version = "0.1.0"
 dependencies = [
+ "hegeltest",
  "tailcat",
 ]
 

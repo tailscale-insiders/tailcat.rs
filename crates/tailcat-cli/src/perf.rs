@@ -1161,7 +1161,7 @@ pub struct PerfArgs {
     #[arg(long)]
     bidir: bool,
     /// How long to send.
-    #[arg(long = "time", default_value = "10s", value_parser = crate::util::parse_duration)]
+    #[arg(long = "time", default_value = "10s", value_parser = tailcat_args::parse_duration)]
     duration: Duration,
     /// Send this many bytes per stream instead of sending for --time, with an optional K, M, or G suffix
     /// (powers of 1000).
@@ -1178,10 +1178,10 @@ pub struct PerfArgs {
     #[arg(long)]
     bitrate: Option<crate::args::Bitrate>,
     /// How often to print progress; 0 disables progress lines.
-    #[arg(long, default_value = "1s", value_parser = crate::util::parse_duration)]
+    #[arg(long, default_value = "1s", value_parser = tailcat_args::parse_duration)]
     interval: Duration,
     /// How long to wait for a direct path before giving up (or, with --via-derp, running relayed).
-    #[arg(long, default_value = "10s", value_parser = crate::util::parse_duration)]
+    #[arg(long, default_value = "10s", value_parser = tailcat_args::parse_duration)]
     timeout: Duration,
     /// Run the test even if the path stays relayed through a DERP server, unless the relay is one of
     /// Tailscale's shared ones.

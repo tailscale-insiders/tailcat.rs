@@ -128,7 +128,7 @@ enum Cmd {
         #[arg(long)]
         until_direct: bool,
         /// Give up after this long.
-        #[arg(long, default_value = "10s", value_parser = util::parse_duration)]
+        #[arg(long, default_value = "10s", value_parser = tailcat_args::parse_duration)]
         timeout: std::time::Duration,
         addr: String,
     },

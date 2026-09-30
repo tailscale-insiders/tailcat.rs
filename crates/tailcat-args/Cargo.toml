@@ -9,3 +9,6 @@ repository.workspace = true
 
 [dependencies]
 tailcat.workspace = true
+
+[dev-dependencies]
+hegeltest = { version = "0.48", features = ["static-engine"] }
