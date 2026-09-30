@@ -4,13 +4,18 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{io, iter};
 
 use tailcat::derp::server::DevDerp;
+use tailcat::netstack::build_udp;
 use tailcat::wg::IpNet;
 use tailcat::{DerpMap, DerpNode, DerpRegion, NodePrivate};
 use tailcat_device::overlay::EMBEDDED_REGION_BASE;
 use tailcat_device::{ChannelDevice, DeviceKey, NodeRecord, Overlay, OverlayConfig, PacketDevice};
 use tokio::sync::mpsc;
+use tokio::task::yield_now;
+use tokio::time::error::Elapsed;
+use tokio::time::timeout;
 
 struct Node {
     overlay: Arc<Overlay>,
@@ -28,23 +33,37 @@ fn record(i: u32, private: &NodePrivate, dev: &DevDerp) -> NodeRecord {
     }
 }
 
-async fn node(i: u32, dev: &DevDerp) -> Node {
+/// A fresh key for node `i`, with its record.
+fn key(i: u32, dev: &DevDerp) -> DeviceKey {
     let private = NodePrivate::generate();
-    let record = record(i, &private, dev);
-    start(private, record).await
+    DeviceKey { record: record(i, &private, dev), private }
 }
 
-async fn start(private: NodePrivate, record: NodeRecord) -> Node {
-    let ip = record.overlay_ip;
-    let overlay = Overlay::start(OverlayConfig {
-        key: DeviceKey { private, record },
+/// Node `i`'s record, for a fresh key.
+fn fresh(i: u32, dev: &DevDerp) -> NodeRecord {
+    key(i, dev).record
+}
+
+/// An overlay for `key`, with no packet loop yet.
+async fn overlay(key: DeviceKey) -> Arc<Overlay> {
+    let config = OverlayConfig {
+        key,
         derp_map: DerpMap::default(),
         listen_port: 0,
         overlay_prefix: "100.64.0.0/16".parse().unwrap(),
         enable_udp: true,
-    })
-    .await
-    .unwrap();
+    };
+    Overlay::start(config).await.unwrap()
+}
+
+async fn node(i: u32, dev: &DevDerp) -> Node {
+    start(key(i, dev)).await
+}
+
+/// A node for `key`, connected to its relay and running its packet loop.
+async fn start(key: DeviceKey) -> Node {
+    let ip = key.record.overlay_ip;
+    let overlay = overlay(key).await;
     assert!(overlay.wait_derp(Duration::from_secs(10)).await);
     let (d, inject, delivered) = ChannelDevice::new();
     tokio::spawn(overlay.clone().run(d));
@@ -52,7 +71,36 @@ async fn start(private: NodePrivate, record: NodeRecord) -> Node {
 }
 
 fn udp(src: IpAddr, dst: IpAddr, payload: &[u8]) -> Vec<u8> {
-    tailcat::netstack::build_udp(SocketAddr::new(src, 4000), SocketAddr::new(dst, 5000), payload).unwrap()
+    build_udp(SocketAddr::new(src, 4000), SocketAddr::new(dst, 5000), payload).unwrap()
+}
+
+/// The next packet delivered to `to` within `ms`: `Err` if none came.
+async fn recv(to: &mut mpsc::Receiver<Vec<u8>>, ms: u64) -> Result<Option<Vec<u8>>, Elapsed> {
+    timeout(Duration::from_millis(ms), to.recv()).await
+}
+
+/// Sends `pkt` into `from` until a packet arrives at `to`, and returns
+/// it; `None` if none does.
+async fn deliver(from: &mpsc::Sender<Vec<u8>>, to: &mut mpsc::Receiver<Vec<u8>>, pkt: &[u8]) -> Option<Vec<u8>> {
+    for _ in 0..20 {
+        from.send(pkt.to_vec()).await.unwrap();
+        if let Ok(Some(p)) = recv(to, 500).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Sends packets from `a` to `b` until one arrives, and says whether it
+/// arrived intact.
+async fn exchange(a: &Node, b: &mut Node) -> bool {
+    let pkt = udp(a.ip, b.ip, b"hello");
+    deliver(&a.inject, &mut b.delivered, &pkt).await == Some(pkt)
+}
+
+/// The packets already waiting at `to`.
+fn drain(to: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+    iter::from_fn(|| to.try_recv().ok()).collect()
 }
 
 #[tokio::test]
@@ -73,31 +121,24 @@ async fn three_node_mesh_routes_ipv4() {
     // routed prefix; each packet must arrive intact at exactly its
     // destination.
     for (a, b, dst) in [(0, 1, nodes[1].ip), (1, 2, nodes[2].ip), (2, 0, nodes[0].ip), (0, 2, [10, 42, 2, 7].into())] {
-        let msg = format!("hello {a}->{b}");
-        let pkt = udp(nodes[a].ip, dst, msg.as_bytes());
-        let mut got = None;
-        for _ in 0..20 {
-            nodes[a].inject.send(pkt.clone()).await.unwrap();
-            if let Ok(Some(p)) = tokio::time::timeout(Duration::from_millis(500), nodes[b].delivered.recv()).await {
-                got = Some(p);
-                break;
-            }
-        }
-        let got = got.unwrap_or_else(|| panic!("no packet {a}->{b}"));
+        let pkt = udp(nodes[a].ip, dst, format!("hello {a}->{b}").as_bytes());
+        let from = nodes[a].inject.clone();
+        let Some(got) = deliver(&from, &mut nodes[b].delivered, &pkt).await else { panic!("no packet {a}->{b}") };
         assert_eq!(got, pkt, "packet {a}->{b} altered");
-        while let Ok(extra) = nodes[b].delivered.try_recv() {
-            assert_eq!(extra, pkt, "unexpected extra packet at {b}");
-        }
+        let extras = drain(&mut nodes[b].delivered);
+        assert!(extras.iter().all(|p| *p == pkt), "unexpected extra packet at {b}");
     }
     // A packet for an address outside the mesh goes nowhere.
-    nodes[0].inject.send(udp(nodes[0].ip, "100.64.9.9".parse().unwrap(), b"lost")).await.unwrap();
+    let lost = udp(nodes[0].ip, "100.64.9.9".parse().unwrap(), b"lost");
+    nodes[0].inject.send(lost).await.unwrap();
     for n in nodes.iter_mut().skip(1) {
-        assert!(tokio::time::timeout(Duration::from_millis(300), n.delivered.recv()).await.is_err());
+        assert!(recv(&mut n.delivered, 300).await.is_err());
     }
     let st = nodes[0].overlay.status();
     assert_eq!(st.len(), 2);
     assert!(st.iter().all(|p| p.handshake_age_secs.is_some()), "{st:?}");
-    assert_eq!(st.iter().map(|p| p.index).collect::<Vec<_>>(), [1, 2], "ordered by index");
+    let indexes: Vec<u32> = st.iter().map(|p| p.index).collect();
+    assert_eq!(indexes, [1, 2], "ordered by index");
 }
 
 /// A peer routed the whole overlay can send from its addresses, but not
@@ -105,30 +146,25 @@ async fn three_node_mesh_routes_ipv4() {
 #[tokio::test]
 async fn a_peer_cannot_send_from_our_prefixes() {
     let dev = DevDerp::start_local().await.unwrap();
-    let mut me = node(0, &dev).await;
-    let private = NodePrivate::generate();
-    let greedy =
-        NodeRecord { routes: vec!["100.64.0.0/16".into(), "10.42.0.0/16".into()], ..record(1, &private, &dev) };
-    let peer = start(private, greedy.clone()).await;
     let dm = DerpMap::default();
-    me.overlay.sync(&[greedy], &dm);
+    let mut me = node(0, &dev).await;
+    let mut greedy = key(1, &dev);
+    greedy.record.routes = vec!["100.64.0.0/16".into(), "10.42.0.0/16".into()];
+    let greedy_record = greedy.record.clone();
+    let peer = start(greedy).await;
+    me.overlay.sync(&[greedy_record], &dm);
     peer.overlay.sync(&[me.overlay.record().clone()], &dm);
     let from = |src: [u8; 4], payload: &[u8]| udp(src.into(), me.ip, payload);
+
     let ok = from([100, 64, 9, 9], b"from the overlay");
-    let mut got = None;
-    for _ in 0..20 {
-        peer.inject.send(ok.clone()).await.unwrap();
-        if let Ok(Some(p)) = tokio::time::timeout(Duration::from_millis(500), me.delivered.recv()).await {
-            got = Some(p);
-            break;
-        }
-    }
+    let got = deliver(&peer.inject, &mut me.delivered, &ok).await;
     assert_eq!(got, Some(ok), "the peer's own prefix");
-    while me.delivered.try_recv().is_ok() {}
+    drain(&mut me.delivered);
+
     for src in [[100, 64, 1, 0], [10, 42, 0, 7]] {
         peer.inject.send(from(src, b"spoofed")).await.unwrap();
     }
-    let after = tokio::time::timeout(Duration::from_millis(500), me.delivered.recv()).await;
+    let after = recv(&mut me.delivered, 500).await;
     assert!(after.is_err(), "took {after:?}");
 }
 
@@ -140,7 +176,7 @@ async fn peer_updates() {
     assert!(!o.add_peer(o.record(), &dm).unwrap(), "our own record is ignored");
     assert_eq!(o.peer_count(), 0);
 
-    let a = record(1, &NodePrivate::generate(), &dev);
+    let a = fresh(1, &dev);
     assert!(o.add_peer(&a, &dm).unwrap(), "new");
     assert!(!o.add_peer(&a, &dm).unwrap(), "unchanged");
     let rerouted = NodeRecord { routes: vec![], ..a.clone() };
@@ -148,7 +184,7 @@ async fn peer_updates() {
     assert_eq!(o.peer_count(), 1);
 
     // A new key at a's address takes it over.
-    let b = NodeRecord { index: 2, ..record(1, &NodePrivate::generate(), &dev) };
+    let b = NodeRecord { index: 2, ..fresh(1, &dev) };
     assert!(o.add_peer(&b, &dm).unwrap());
     assert_eq!(o.peer_count(), 1);
     assert!(o.magicsock().peer_path(&a.nodekey).is_none());
@@ -156,9 +192,9 @@ async fn peer_updates() {
 
     // A peer whose home region isn't known is refused, as is one at our
     // address.
-    let lost = NodeRecord { derp: None, derp_region: 5, ..record(3, &NodePrivate::generate(), &dev) };
+    let lost = NodeRecord { derp: None, derp_region: 5, ..fresh(3, &dev) };
     assert!(o.add_peer(&lost, &dm).is_err());
-    let squatter = record(0, &NodePrivate::generate(), &dev);
+    let squatter = fresh(0, &dev);
     assert!(o.add_peer(&squatter, &dm).is_err());
     assert_eq!(o.peer_count(), 1);
 
@@ -168,10 +204,16 @@ async fn peer_updates() {
     assert!(o.magicsock().peer_path(&b.nodekey).is_none());
 
     // The packet loop is already running.
-    tokio::task::yield_now().await;
+    yield_now().await;
     let (d, _, _) = ChannelDevice::new();
     let err = o.clone().run(d).await.unwrap_err();
     assert!(err.to_string().contains("called twice"), "{err:#}");
+}
+
+/// `key`, saying it's from run `id`.
+fn in_run(id: &str, mut key: DeviceKey) -> DeviceKey {
+    key.record.run_id = id.into();
+    key
 }
 
 /// Repeated polls of records that share an address settle on one peer,
@@ -179,22 +221,23 @@ async fn peer_updates() {
 #[tokio::test]
 async fn duplicate_addresses_settle() {
     let dev = DevDerp::start_local().await.unwrap();
+    let dm = DerpMap::default();
     // Node 1 of our run, and of another run: they collide at 100.64.1.1.
-    let run = |r: NodeRecord, id: &str| NodeRecord { run_id: id.into(), ..r };
-    let private = NodePrivate::generate();
-    let me = start(private.clone(), run(record(0, &private, &dev), "7")).await;
-    let private = NodePrivate::generate();
-    let mut peer = start(private.clone(), run(record(1, &private, &dev), "7")).await;
-    let theirs = run(record(1, &NodePrivate::generate(), &dev), "8");
-    let squatter = run(record(0, &NodePrivate::generate(), &dev), "8");
-    let (ours, dm) = (peer.overlay.record().clone(), DerpMap::default());
+    let me = start(in_run("7", key(0, &dev))).await;
+    let mut peer = start(in_run("7", key(1, &dev))).await;
+    let theirs = in_run("8", key(1, &dev)).record;
+    let squatter = in_run("8", key(0, &dev)).record;
+    let ours = peer.overlay.record().clone();
+
     me.overlay.sync(&[theirs.clone(), ours.clone(), squatter.clone()], &dm);
     peer.overlay.sync(&[me.overlay.record().clone()], &dm);
     assert!(exchange(&me, &mut peer).await, "no packet from node 0 to node 1");
+
     for recs in [[ours.clone(), theirs.clone(), squatter.clone()], [squatter.clone(), theirs.clone(), ours.clone()]] {
         me.overlay.sync(&recs, &dm);
         let st = me.overlay.status();
-        assert_eq!(st.iter().map(|p| p.nodekey).collect::<Vec<_>>(), [ours.nodekey], "our own run's node wins");
+        let peers: Vec<_> = st.iter().map(|p| p.nodekey).collect();
+        assert_eq!(peers, [ours.nodekey], "our own run's node wins");
         assert!(st[0].handshake_age_secs.is_some(), "the session was torn down");
     }
 }
@@ -205,35 +248,28 @@ async fn duplicate_addresses_settle() {
 #[tokio::test]
 async fn a_lost_address_is_reported() {
     let dev = DevDerp::start_local().await.unwrap();
-    let run = |r: NodeRecord, id: &str| NodeRecord { run_id: id.into(), routes: Vec::new(), ..r };
-    let private = NodePrivate::generate();
-    let me = start(private.clone(), run(record(0, &private, &dev), "7")).await.overlay;
-    let mine = me.record().clone();
-    let lower = || std::iter::repeat_with(NodePrivate::generate).find(|k| k.public() < mine.nodekey).unwrap();
-    let squatter = run(record(0, &lower(), &dev), "7");
-    let foreign = run(record(0, &lower(), &dev), "8");
     let dm = DerpMap::default();
+    // Node 0 of run `id`, for `private`, routing nothing.
+    let node_0 = |id: &str, private: NodePrivate| {
+        let record = NodeRecord { run_id: id.into(), routes: Vec::new(), ..record(0, &private, &dev) };
+        DeviceKey { record, private }
+    };
+    let me = start(node_0("7", NodePrivate::generate())).await.overlay;
+    let mine = me.record().clone();
+    let lower = || iter::repeat_with(NodePrivate::generate).find(|k| k.public() < mine.nodekey).unwrap();
+    let squatter = node_0("7", lower()).record;
+    let foreign = node_0("8", lower()).record;
+
     me.sync(&[mine.clone(), foreign.clone()], &dm);
-    assert_eq!(me.contested(), []);
+    assert_eq!(me.contested(), [], "another run's node took our address");
+
     me.sync(&[mine.clone(), squatter.clone(), foreign.clone()], &dm);
     assert_eq!(me.contested(), [(IpNet::host(mine.overlay_ip), squatter.nodekey)]);
     assert_eq!(me.peer_count(), 0, "neither is a peer");
+
     me.sync(&[mine.clone(), foreign], &dm);
-    assert_eq!(me.contested(), []);
+    assert_eq!(me.contested(), [], "a gone record still has our address");
 }
-
-/// Sends packets from `a` to `b` until one arrives.
-async fn exchange(a: &Node, b: &mut Node) -> bool {
-    let pkt = udp(a.ip, b.ip, b"hello");
-    for _ in 0..20 {
-        a.inject.send(pkt.clone()).await.unwrap();
-        if let Ok(Some(p)) = tokio::time::timeout(Duration::from_millis(500), b.delivered.recv()).await {
-            return p == pkt;
-        }
-    }
-    false
-}
-
 /// Relays embedded in records are told apart by content, not by the IDs
 /// they carry, which collide.
 #[tokio::test]
@@ -252,37 +288,36 @@ async fn embedded_regions_get_their_own_ids() {
     let public = DerpRegion { region_id: 1, region_code: "public".into(), ..custom("127.0.0.4") };
     let dm = DerpMap { regions: [(1, public)].into(), ..Default::default() };
     let peers = [
-        NodeRecord { derp: Some(custom("127.0.0.2")), ..record(1, &NodePrivate::generate(), &dev) },
-        NodeRecord { derp: Some(custom("127.0.0.3")), ..record(2, &NodePrivate::generate(), &dev) },
-        NodeRecord { derp: None, derp_region: 1, ..record(3, &NodePrivate::generate(), &dev) },
-        record(4, &NodePrivate::generate(), &dev),
+        NodeRecord { derp: Some(custom("127.0.0.2")), ..fresh(1, &dev) },
+        NodeRecord { derp: Some(custom("127.0.0.3")), ..fresh(2, &dev) },
+        NodeRecord { derp: None, derp_region: 1, ..fresh(3, &dev) },
+        fresh(4, &dev),
     ];
+
     o.sync(&peers, &dm);
+
     let region = |i: usize| o.magicsock().peer_path(&peers[i].nodekey).unwrap().home_region;
     let (a, b, public, same_as_ours) = (region(0), region(1), region(2), region(3));
     assert_eq!(public, 1);
     assert_eq!(same_as_ours, home, "a peer embedding our relay is reached through our connection");
-    assert!(a != b && a != home && b != home && a >= EMBEDDED_REGION_BASE && b >= EMBEDDED_REGION_BASE);
+    assert_ne!(a, b);
+    assert_ne!(a, home);
+    assert_ne!(b, home);
+    assert!(a >= EMBEDDED_REGION_BASE, "{a}");
+    assert!(b >= EMBEDDED_REGION_BASE, "{b}");
 }
 
 #[tokio::test]
 async fn close_stops_the_packet_loop() {
     let dev = DevDerp::start_local().await.unwrap();
-    let private = NodePrivate::generate();
-    let o = Overlay::start(OverlayConfig {
-        key: DeviceKey { record: record(0, &private, &dev), private },
-        derp_map: DerpMap::default(),
-        listen_port: 0,
-        overlay_prefix: "100.64.0.0/16".parse().unwrap(),
-        enable_udp: true,
-    })
-    .await
-    .unwrap();
+    let o = overlay(key(0, &dev)).await;
     let (d, _inject, _delivered) = ChannelDevice::new();
     let run = tokio::spawn(o.clone().run(d));
-    tokio::task::yield_now().await;
+    yield_now().await;
+
     o.close();
-    let res = tokio::time::timeout(Duration::from_secs(2), run).await.expect("the packet loop kept running");
+
+    let res = timeout(Duration::from_secs(2), run).await.expect("the packet loop kept running");
     assert!(res.unwrap().is_ok());
     let weak = Arc::downgrade(&o);
     drop(o);
@@ -293,10 +328,10 @@ async fn close_stops_the_packet_loop() {
 struct Closed;
 
 impl PacketDevice for Closed {
-    async fn recv(&self, _: &mut [u8]) -> std::io::Result<usize> {
+    async fn recv(&self, _: &mut [u8]) -> io::Result<usize> {
         Ok(0)
     }
-    async fn send(&self, pkt: &[u8]) -> std::io::Result<usize> {
+    async fn send(&self, pkt: &[u8]) -> io::Result<usize> {
         Ok(pkt.len())
     }
 }
@@ -304,16 +339,7 @@ impl PacketDevice for Closed {
 #[tokio::test]
 async fn a_closed_device_ends_the_packet_loop() {
     let dev = DevDerp::start_local().await.unwrap();
-    let private = NodePrivate::generate();
-    let o = Overlay::start(OverlayConfig {
-        key: DeviceKey { record: record(0, &private, &dev), private },
-        derp_map: DerpMap::default(),
-        listen_port: 0,
-        overlay_prefix: "100.64.0.0/16".parse().unwrap(),
-        enable_udp: true,
-    })
-    .await
-    .unwrap();
-    let res = tokio::time::timeout(Duration::from_secs(2), o.run(Arc::new(Closed))).await.expect("spinning");
+    let o = overlay(key(0, &dev)).await;
+    let res = timeout(Duration::from_secs(2), o.run(Arc::new(Closed))).await.expect("spinning");
     assert!(format!("{:#}", res.unwrap_err()).contains("closed"));
 }

@@ -10,6 +10,7 @@ use hegel::TestCase;
 use hegel::generators as gs;
 use tailcat::{DerpMap, DerpNode, DerpRegion, DiscoPublic, NodePrivate, NodePublic};
 use tailcat_device::{DeviceKey, NodeRecord, Overlay, OverlayConfig};
+use tokio::runtime::{Builder, Runtime};
 
 const KEYS: u8 = 6;
 
@@ -28,14 +29,14 @@ fn key(k: u8) -> NodePublic {
 }
 
 struct Mesh {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     overlay: Arc<Overlay>,
     dm: DerpMap,
 }
 
 impl Mesh {
     fn new() -> Mesh {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let private = NodePrivate::generate();
         let record =
             NodeRecord { derp: Some(region("127.0.0.1")), ..NodeRecord::new(0, &private, [100, 64, 1, 0].into()) };
@@ -48,8 +49,8 @@ impl Mesh {
                 enable_udp: false,
             }))
             .unwrap();
-        let dm =
-            DerpMap { regions: [(1, DerpRegion { region_id: 1, ..region("127.0.0.1") })].into(), ..Default::default() };
+        let in_map = DerpRegion { region_id: 1, ..region("127.0.0.1") };
+        let dm = DerpMap { regions: [(1, in_map)].into(), ..Default::default() };
         Mesh { rt, overlay, dm }
     }
 
@@ -82,6 +83,13 @@ impl Mesh {
         }
     }
 
+    /// A poll's worth of records, one per key.
+    fn draw_poll(&self, tc: &TestCase) -> Vec<NodeRecord> {
+        let n = tc.draw(gs::integers::<usize>().max_value(6));
+        let mut keys = HashSet::new();
+        (0..n).map(|_| self.draw_record(tc)).filter(|r| keys.insert(r.nodekey)).collect()
+    }
+
     fn peers(&self) -> Vec<(NodePublic, IpAddr, u32)> {
         self.overlay.status().into_iter().map(|p| (p.nodekey, p.overlay_ip, p.index)).collect()
     }
@@ -94,17 +102,17 @@ impl Mesh {
     /// nothing.
     #[rule]
     fn poll(&mut self, tc: TestCase) {
-        let n = tc.draw(gs::integers::<usize>().max_value(6));
-        let mut keys = HashSet::new();
-        let recs: Vec<NodeRecord> = (0..n).map(|_| self.draw_record(&tc)).filter(|r| keys.insert(r.nodekey)).collect();
+        let recs = self.draw_poll(&tc);
+        let polled: HashSet<NodePublic> = recs.iter().map(|r| r.nodekey).collect();
         let _rt = self.rt.enter();
+
         self.overlay.sync(&recs, &self.dm);
         let before = self.peers();
         for (k, ..) in &before {
-            assert!(keys.contains(k), "{k} is still a peer, but wasn't polled");
+            assert!(polled.contains(k), "{k} is still a peer, but wasn't polled");
         }
-        let mut reversed = recs.clone();
-        reversed.reverse();
+
+        let reversed: Vec<NodeRecord> = recs.iter().rev().cloned().collect();
         self.overlay.sync(&reversed, &self.dm);
         assert_eq!(self.peers(), before, "polling {recs:?} again changed the peers");
     }
@@ -128,12 +136,10 @@ impl Mesh {
         let peers: HashSet<NodePublic> = self.overlay.status().iter().map(|p| p.nodekey).collect();
         assert_eq!(peers.len(), self.overlay.peer_count());
         for k in (0..KEYS).map(key) {
-            let (overlay, engine, ms) = (
-                peers.contains(&k),
-                self.overlay.engine().peer_stats(&k).is_some(),
-                self.overlay.magicsock().peer_path(&k).is_some(),
-            );
-            assert!(overlay == engine && engine == ms, "{k}: overlay {overlay}, engine {engine}, magicsock {ms}");
+            let overlay = peers.contains(&k);
+            let engine = self.overlay.engine().peer_stats(&k).is_some();
+            let ms = self.overlay.magicsock().peer_path(&k).is_some();
+            assert_eq!((engine, ms), (overlay, overlay), "{k}: overlay {overlay}, engine {engine}, magicsock {ms}");
         }
     }
 
