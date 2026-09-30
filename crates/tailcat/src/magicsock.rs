@@ -13,9 +13,10 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+use std::{fmt, iter, mem};
 
 use rand::Rng;
 use tokio::net::UdpSocket;
@@ -54,8 +55,8 @@ pub enum PathAddr {
     Derp(i32),
 }
 
-impl std::fmt::Display for PathAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PathAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PathAddr::Udp(a) => write!(f, "{a}"),
             PathAddr::Derp(r) => write!(f, "DERP({r})"),
@@ -382,7 +383,7 @@ impl MagicSock {
         for ep in &cfg.endpoints {
             p.candidates.entry(*ep).or_default();
         }
-        let old = std::mem::replace(&mut p.cfg, cfg);
+        let old = mem::replace(&mut p.cfg, cfg);
         for ep in &old.endpoints {
             p.forget_candidate(ep);
         }
@@ -508,7 +509,7 @@ impl MagicSock {
         inner.closed = true;
         inner.derp.clear();
         drop(inner);
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        let tasks = mem::take(&mut *self.tasks.lock().unwrap());
         for t in tasks {
             t.abort();
         }
@@ -710,7 +711,7 @@ impl MagicSock {
                 // candidates, and a pong from one maps it to the peer.
                 endpoints.retain(|e| !matches!(e.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()));
                 let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                for e in std::mem::replace(&mut p.advertised, endpoints.clone()) {
+                for e in mem::replace(&mut p.advertised, endpoints.clone()) {
                     p.forget_candidate(&e);
                 }
                 for e in &endpoints {
@@ -906,7 +907,7 @@ impl MagicSock {
     }
 }
 
-fn is_tailscale_ula(v6: &std::net::Ipv6Addr) -> bool {
+fn is_tailscale_ula(v6: &Ipv6Addr) -> bool {
     let o = v6.octets();
     o[..6] == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
 }
@@ -977,7 +978,7 @@ async fn timer_loop(ms: Weak<MagicSock>) {
 async fn endpoint_loop(ms: Weak<MagicSock>) {
     // STUN right away, twice more soon after (in case the first round
     // was lost while the relay connection came up), then every 20–26s.
-    let later = std::iter::repeat_with(|| rand::thread_rng().gen_range(20_000..26_000));
+    let later = iter::repeat_with(|| rand::thread_rng().gen_range(20_000..26_000));
     for delay_ms in [300, 2000].into_iter().chain(later) {
         {
             let Some(ms) = ms.upgrade() else { return };
