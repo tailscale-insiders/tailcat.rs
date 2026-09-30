@@ -78,10 +78,12 @@ impl ConnHandler {
         let opts = &self.shared.opts;
         let peer = (self.shared.peer_lookup)(self.remote);
         if !opts.exec.is_empty() {
-            let mut env: Vec<_> = std::env::vars().collect();
-            env.extend(crate::exec::peer_env(self.local, self.remote, peer));
-            env.extend(client_env);
-            env.extend(raw_cmd.map(|c| ("SSH_ORIGINAL_COMMAND".into(), c)));
+            // On top of our own environment, which the command inherits.
+            let env = crate::exec::peer_env(self.local, self.remote, peer)
+                .into_iter()
+                .chain(client_env)
+                .chain(raw_cmd.map(|c| ("SSH_ORIGINAL_COMMAND".into(), c)))
+                .collect();
             return Some(Plan { argv: opts.exec.clone(), env, dir: None, motd: false });
         }
         if !opts.shell {
