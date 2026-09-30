@@ -1,5 +1,6 @@
 //! Running a command per connection, inetd-style.
 
+use std::io;
 use std::net::SocketAddr;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -53,13 +54,13 @@ impl Server {
     }
 }
 
-async fn run_conn_command(s: &Server, c: TcpStream, argv: &[String]) -> std::io::Result<()> {
+async fn run_conn_command(s: &Server, c: TcpStream, argv: &[String]) -> io::Result<()> {
     let env = peer_env(c.local_addr(), c.peer_addr(), s.peer_key(c.peer_addr()));
     let (mut rd, mut wr) = tokio::io::split(c);
     let status = run_command(argv, env, &mut rd, &mut wr).await?;
     rd.unsplit(wr).drain(Duration::from_secs(5)).await;
     if !status.success() {
-        return Err(std::io::Error::other(format!("{} exited: {status}", argv[0])));
+        return Err(io::Error::other(format!("{} exited: {status}", argv[0])));
     }
     Ok(())
 }
@@ -71,7 +72,7 @@ async fn run_command<R, W>(
     env: impl IntoIterator<Item = (String, String)>,
     rd: &mut R,
     wr: &mut W,
-) -> std::io::Result<ExitStatus>
+) -> io::Result<ExitStatus>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
