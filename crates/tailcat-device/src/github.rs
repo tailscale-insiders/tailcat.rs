@@ -247,7 +247,9 @@ impl Verifier {
 }
 
 /// Decides whether a record may join, per the scope. `from_run` is the
-/// run whose artifacts held it.
+/// run whose artifacts held it. A record must say it's from that run,
+/// and if it carries a token, from the attempt the token was minted in:
+/// peers are ranked by the run and attempt a record says it's from.
 pub fn admit(
     r: &NodeRecord,
     from_run: &str,
@@ -256,6 +258,7 @@ pub fn admit(
     verifier: Option<&Verifier>,
     audience_prefix: &str,
 ) -> Result<()> {
+    ensure!(r.run_id == from_run, "record says it's from run {:?}, but came from run {from_run}", r.run_id);
     if scope == Scope::Run {
         ensure!(from_run == e.run_id, "record from run {from_run}, not ours");
         ensure!(
@@ -289,6 +292,12 @@ pub fn admit(
         _ => {}
     }
     ensure!(c.run_id == from_run, "token is for run {}, but the record came from run {from_run}", c.run_id);
+    ensure!(
+        c.run_attempt == r.run_attempt,
+        "token is for attempt {}, but the record says it's from attempt {:?}",
+        c.run_attempt,
+        r.run_attempt
+    );
     Ok(())
 }
 
@@ -328,6 +337,8 @@ pub(crate) mod tests {
         assert!(admit(&rec(""), "100", &e, Scope::Run, None, "p:").is_ok(), "no attempt recorded");
         assert!(admit(&rec("2"), "100", &e, Scope::Run, None, "p:").is_err(), "stale attempt");
         assert!(admit(&rec("1"), "99", &e, Scope::Run, None, "p:").is_err(), "another run");
+        let claims_another = NodeRecord { run_id: "99".into(), ..rec("1") };
+        assert!(admit(&claims_another, "100", &e, Scope::Run, None, "p:").is_err(), "says it's from another run");
         assert!(admit(&rec("1"), "100", &e, Scope::Branch, None, "p:").is_err(), "no token outside run scope");
         assert!(admit(&rec("1"), "100", &e, Scope::Pr, None, "p:").is_err(), "no token outside run scope");
         let mut r = rec("1");
@@ -380,10 +391,16 @@ pub(crate) mod tests {
         }
 
         /// A record for a fresh key with a token for it, plus `claims`.
+        /// The record says it's from the token's run and attempt.
         pub fn rec(&self, claims: serde_json::Value) -> NodeRecord {
             let mut r = rec("1");
             let mut c = serde_json::json!({ "aud": audience_for(P, &r.nodekey) });
             c.as_object_mut().unwrap().extend(claims.as_object().unwrap().clone());
+            for (field, claim) in [(&mut r.run_id, "run_id"), (&mut r.run_attempt, "run_attempt")] {
+                if let Some(v) = c[claim].as_str() {
+                    *field = v.into();
+                }
+            }
             r.jwt = self.sign(Some("k1"), c);
             r
         }
@@ -415,6 +432,10 @@ pub(crate) mod tests {
         let sib = s.rec(json!({"run_id": "99"}));
         admit(&sib, "99", Scope::Branch).unwrap();
         assert!(admit(&sib, "100", Scope::Branch).is_err(), "token run != artifact run");
+        let posing = NodeRecord { run_id: "100".into(), ..sib.clone() };
+        assert!(admit(&posing, "99", Scope::Branch).is_err(), "says it's from our run");
+        let retried = NodeRecord { run_attempt: "2".into(), ..sib.clone() };
+        assert!(admit(&retried, "99", Scope::Branch).is_err(), "says it's from another attempt");
         assert!(admit(&s.rec(json!({"run_id": "99", "ref": "refs/heads/evil"})), "99", Scope::Branch).is_err());
 
         // Another repository's token fails in every scope.
@@ -438,6 +459,33 @@ pub(crate) mod tests {
         let mut unknown = r.clone();
         unknown.jwt = s.sign(Some("k2"), json!({"aud": audience_for(P, &r.nodekey)}));
         assert!(admit(&unknown, "100", Scope::Run).is_err(), "unknown key ID");
+    }
+
+    /// Ranking trusts the run and attempt a record says it's from, so an
+    /// admitted record's must be true: the run whose artifacts held it,
+    /// and the run and attempt its token was minted in.
+    #[hegel::test(test_cases = 300)]
+    fn admitted_records_are_from_the_run_they_say(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        static SIGNER: std::sync::OnceLock<Signer> = std::sync::OnceLock::new();
+        let s = SIGNER.get_or_init(Signer::new);
+        let runs = || gs::sampled_from(vec!["100", "99", ""]);
+        let attempts = || gs::sampled_from(vec!["1", "2", ""]);
+        let scope = if tc.draw(gs::booleans()) { Scope::Run } else { Scope::Branch };
+        let from_run = tc.draw(gs::sampled_from(vec!["100", "99"]));
+        let token = tc.draw(gs::booleans()).then(|| (tc.draw(runs()), tc.draw(attempts())));
+        let mut r = match token {
+            Some((run, attempt)) => s.rec(serde_json::json!({"run_id": run, "run_attempt": attempt})),
+            None => rec("1"),
+        };
+        r.run_id = tc.draw(runs()).into();
+        r.run_attempt = tc.draw(attempts()).into();
+        if admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P).is_ok() {
+            assert_eq!(r.run_id, from_run);
+            if let Some((run, attempt)) = token {
+                assert_eq!((r.run_id.as_str(), r.run_attempt.as_str()), (run, attempt));
+            }
+        }
     }
 
     #[test]
