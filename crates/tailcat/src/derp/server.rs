@@ -184,6 +184,7 @@ impl Server {
         if clients.get(&client).is_some_and(|c| c.tx.same_channel(&tx)) {
             clients.remove(&client);
         }
+        drop(clients);
         debug!("derp server: {} disconnected", client.short_string());
         res
     }
