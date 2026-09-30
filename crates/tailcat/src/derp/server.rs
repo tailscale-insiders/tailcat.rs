@@ -179,14 +179,19 @@ impl Server {
             r = writer => r,
             _ = close.notified() => Err(Error::Derp("replaced by a newer connection".into())),
         };
-        // A newer connection with the same key may have replaced ours.
-        let mut clients = self.clients.lock().unwrap();
-        if clients.get(&client).is_some_and(|c| c.tx.same_channel(&tx)) {
-            clients.remove(&client);
-        }
-        drop(clients);
+        self.forget(&client, &tx);
         debug!("derp server: {} disconnected", client.short_string());
         res
+    }
+
+    /// Removes `client`, unless a newer connection with its key, which
+    /// has another queue than `tx`, replaced it.
+    fn forget(&self, client: &NodePublic, tx: &mpsc::Sender<Vec<u8>>) {
+        let mut clients = self.clients.lock().unwrap();
+        if clients.get(client).is_some_and(|c| c.tx.same_channel(tx)) {
+            clients.remove(client);
+        }
+        drop(clients);
     }
 }
 
