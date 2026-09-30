@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 tailcat.workspace = true
+tailcat-args.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

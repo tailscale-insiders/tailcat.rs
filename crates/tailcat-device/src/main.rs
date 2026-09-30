@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use tailcat::wg::IpNet;
-use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, NodePrivate, RegionArg};
+use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, FetchOptions, NodePrivate, RegionChoice};
+use tailcat_args::RegionArg;
 use tailcat_device::github::{self, GithubEnv, Scope};
 use tailcat_device::record::{self, DeviceKey, NodeRecord};
 use tailcat_device::source::{GithubSource, Source};
@@ -474,24 +475,25 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>> {
 
 /// Picks the home region for `init`.
 async fn pick_region(url: &str, region: &RegionArg) -> Result<(i32, Option<DerpRegion>)> {
-    if let RegionArg::Hosts(hosts) = region {
-        let nodes = hosts.iter().map(|h| DerpNode {
-            name: h.as_str().into(),
-            host_name: h.as_str().into(),
-            ..Default::default()
-        });
+    if let RegionArg::Choice(RegionChoice::Custom(hosts)) = region {
+        let nodes =
+            hosts.iter().map(|h| DerpNode { name: h.to_string().into(), host_name: h.clone(), ..Default::default() });
         let custom =
             DerpRegion { region_id: 900, region_code: "custom".into(), nodes: nodes.collect(), ..Default::default() };
         return Ok((0, Some(custom)));
     }
     let dm = fetch_map(url).await?;
     let id = match region {
-        RegionArg::Auto => tailcat::netcheck::pick_best_region(&dm)
+        RegionArg::Choice(RegionChoice::Nearest) => tailcat::netcheck::pick_best_region(&dm)
             .await?
             .ok_or_else(|| anyhow!("couldn't find the nearest DERP region; pass --region"))?,
-        RegionArg::Id(id) => region.find(&dm).ok_or_else(|| anyhow!("no DERP region {id} in the DERP map"))?,
-        RegionArg::Name(n) => region.find(&dm).ok_or_else(|| anyhow!("no DERP region matching {n:?}"))?,
-        RegionArg::List | RegionArg::Hosts(_) => {
+        RegionArg::Choice(c @ RegionChoice::Id(id)) => {
+            c.find(&dm).ok_or_else(|| anyhow!("no DERP region {id} in the DERP map"))?
+        }
+        RegionArg::Choice(c @ RegionChoice::Named(n)) => {
+            c.find(&dm).ok_or_else(|| anyhow!("no DERP region matching {n:?}"))?
+        }
+        RegionArg::List | RegionArg::Choice(RegionChoice::Custom(_)) => {
             for r in dm.regions.values() {
                 eprintln!("  {:3} {} {}", r.region_id, r.region_code, r.region_name);
             }
