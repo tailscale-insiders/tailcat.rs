@@ -523,7 +523,7 @@ async fn fetch_fresh(url: &str, mode: FetchMode, cache: &dyn DerpMapCache, stale
     if body.len() > 8 << 20 {
         return Err(Error::other(format!("DERP map from {url} is too large")));
     }
-    let dm = serde_json::from_slice(&body).map_err(|_| Error::other(format!("invalid DERP map JSON from {url}")))?;
+    let dm = serde_json::from_slice(&body).map_err(|error| Error::DerpMapJson { url: url.into(), error })?;
     cache.put(url, &body, &etag);
     Ok(dm)
 }
