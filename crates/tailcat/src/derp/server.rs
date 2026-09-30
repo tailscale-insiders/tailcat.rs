@@ -119,7 +119,7 @@ impl Server {
             .ok_or_else(|| Error::Derp("bad client info frame".into()))?;
         let msg =
             self.key.open_from(&client, sealed).ok_or_else(|| Error::Derp("cannot open client info box".into()))?;
-        let info: ClientInfo = serde_json::from_slice(&msg).map_err(|e| Error::Derp(format!("client info: {e}")))?;
+        let info: ClientInfo = serde_json::from_slice(&msg).map_err(|error| Error::BadClientInfo { error })?;
         if !info.app_name.is_valid() {
             return Err(Error::Derp("invalid app name".into()));
         }

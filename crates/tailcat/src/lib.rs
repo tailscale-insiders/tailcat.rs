@@ -108,6 +108,8 @@ pub enum Error {
     BadHostname { host: String, error: rustls::pki_types::InvalidDnsNameError },
     #[error("DERP: TLS handshake with {host}: {error}")]
     Handshake { host: String, error: io::Error },
+    #[error("DERP: client info: {error}")]
+    BadClientInfo { error: serde_json::Error },
     #[error("TLS: {0}")]
     Tls(rustls::Error),
     #[error("TLS verifier: {0}")]
