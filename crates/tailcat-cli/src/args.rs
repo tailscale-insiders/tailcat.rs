@@ -2,9 +2,10 @@
 //! types. Grammars `tailcat-device` shares are in `tailcat-args`.
 
 use std::fmt;
+use std::io;
 #[cfg(feature = "ssh")]
 use std::net::IpAddr;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -80,7 +81,7 @@ pub enum Dest {
 
 impl Dest {
     /// Dials it through `cl`.
-    pub async fn dial(self, cl: &tailcat::Client) -> std::io::Result<tailcat::TcpStream> {
+    pub async fn dial(self, cl: &tailcat::Client) -> io::Result<tailcat::TcpStream> {
         match self {
             Dest::Port(p) => cl.dial_tcp_port(p).await,
             Dest::Via(a) => cl.dial_tcp(a).await,
@@ -130,7 +131,7 @@ impl FromStr for ListenArg {
             return listen("127.0.0.1", p);
         }
         // Before the ":port" check, which "::1" would otherwise match.
-        if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        if s.parse::<Ipv6Addr>().is_ok() {
             return listen(s, 0);
         }
         if let Some(p) = s.strip_prefix(':') {
@@ -196,7 +197,7 @@ pub struct SshTarget(Dest);
 #[cfg(feature = "ssh")]
 impl SshTarget {
     /// Dials it through `cl`.
-    pub async fn dial(self, cl: &tailcat::Client) -> std::io::Result<tailcat::TcpStream> {
+    pub async fn dial(self, cl: &tailcat::Client) -> io::Result<tailcat::TcpStream> {
         self.0.dial(cl).await
     }
 }
