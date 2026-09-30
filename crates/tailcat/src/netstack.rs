@@ -349,7 +349,13 @@ fn tcp_flow(pkt: &[u8]) -> Option<(FlowKey, bool, Option<TcpSeqNumber>)> {
     let tcp = TcpPacket::new_checked(body).ok()?;
     let key = (SocketAddr::new(dst, tcp.dst_port()), SocketAddr::new(src, tcp.src_port()));
     let fin_end = tcp.fin().then(|| tcp.seq_number() + tcp.segment_len());
-    Some((key, tcp.syn() && !tcp.ack() && !tcp.rst(), fin_end))
+    Some((key, opens(&tcp) && !tcp.rst(), fin_end))
+}
+
+/// Whether a segment is a SYN that opens a connection, not a SYN-ACK
+/// answering one.
+fn opens<T: AsRef<[u8]>>(tcp: &TcpPacket<T>) -> bool {
+    tcp.syn() && !tcp.ack()
 }
 
 /// Whether a socket in `state` has had the peer's FIN.
@@ -463,11 +469,7 @@ impl Stack {
             // doesn't negotiate them.) The socket would swallow a new SYN,
             // so it's aborted: the peer ignores its RST, which has the old
             // connection's numbers.
-            if let Some(&h) = st.tuples.get(&(d, s))
-                && tcp.syn()
-                && !tcp.ack()
-                && !st.accepting.contains_key(&h)
-            {
+            if let Some(&h) = st.tuples.get(&(d, s)).filter(|h| opens(&tcp) && !st.accepting.contains_key(*h)) {
                 let over = match st.sockets.get::<tcp::Socket>(h).state() {
                     tcp::State::Closed => true,
                     tcp::State::TimeWait => st.fins.get(&h).is_some_and(|&end| tcp.seq_number() > end),
@@ -479,7 +481,7 @@ impl Stack {
                 }
             }
             if !st.tuples.contains_key(&(d, s)) {
-                if !tcp.syn() || tcp.ack() {
+                if !opens(&tcp) {
                     // Not part of any connection we know; let smoltcp RST it
                     // unless it's itself a RST.
                     if tcp.rst() {
