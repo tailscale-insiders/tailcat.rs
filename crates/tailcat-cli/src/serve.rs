@@ -62,7 +62,7 @@ fn known_names() -> String {
 }
 
 /// A parsed serve spec.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PortSet {
     pub all: bool,
     pub ports: BTreeSet<u16>,
@@ -78,6 +78,30 @@ impl PortSet {
 
     pub fn is_empty(&self) -> bool {
         !self.all && self.ports.is_empty()
+    }
+
+    /// Serves `port` by proxying it to `target`, unless it's already
+    /// mapped elsewhere.
+    fn map_port(&mut self, port: u16, target: String) -> Result<()> {
+        if let Some(prev) = self.targets.get(&port)
+            && *prev != target
+        {
+            bail!("port {port} is mapped to both {prev} and {target}");
+        }
+        self.ports.insert(port);
+        self.targets.insert(port, target);
+        Ok(())
+    }
+
+    /// Adds what `other` serves, as a spec listing both would.
+    pub fn merge(&mut self, other: PortSet) -> Result<()> {
+        self.all |= other.all;
+        self.ports.extend(other.ports);
+        self.services.extend(other.services);
+        for (port, target) in other.targets {
+            self.map_port(port, target)?;
+        }
+        Ok(())
     }
 
     /// The TCP ports to admit: those served, plus `extra`. "all" covers
@@ -117,13 +141,7 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
             _ => {
                 if let Some((port, target)) = r.split_once(':') {
                     let (port, target) = parse_port_target(port, target)?;
-                    if let Some(prev) = ps.targets.get(&port)
-                        && *prev != target
-                    {
-                        bail!("port {port} is mapped to both {prev} and {target}");
-                    }
-                    ps.ports.insert(port);
-                    ps.targets.insert(port, target);
+                    ps.map_port(port, target)?;
                     continue;
                 }
                 let (a, b) = match r.split_once('-') {
@@ -138,6 +156,14 @@ pub fn parse_port_set(s: &str) -> Result<PortSet> {
         }
     }
     Ok(ps)
+}
+
+impl std::str::FromStr for PortSet {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        parse_port_set(s)
+    }
 }
 
 /// Parses the halves of a "port:target" mapping.
@@ -219,8 +245,7 @@ async fn udp_forward_to(dst: SocketAddr, c: UdpConn) {
 }
 
 /// Runs a server until killed.
-pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Option<Vec<String>>) -> Result<()> {
-    let ps = parse_port_set(&spec).map_err(|e| anyhow!("invalid port or service to serve: {e}"))?;
+pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Option<Vec<String>>) -> Result<()> {
     let mut services = ps.services.clone();
     let exec_args = match exec_args {
         Some(a) if a.is_empty() => bail!("no command given after --"),
@@ -678,6 +703,12 @@ mod tests {
         let ps = parse_port_set("exec,exit-node").unwrap();
         assert!(ps.is_empty());
         assert_eq!(ps.services.len(), 2);
+
+        // Specs merge as one listing both would.
+        let mut merged = parse_port_set("22,80:8080").unwrap();
+        merged.merge(parse_port_set("perf,80:8080,443").unwrap()).unwrap();
+        assert_eq!(merged, parse_port_set("22,80:8080,perf,443").unwrap());
+        assert!(merged.merge(parse_port_set("80:9090").unwrap()).is_err(), "80 mapped twice");
 
         // The same mapping twice is fine; mapping a port also serves it.
         let ps = parse_port_set("80:8080,80:8080").unwrap();

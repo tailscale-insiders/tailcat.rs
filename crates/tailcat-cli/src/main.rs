@@ -83,7 +83,7 @@ struct Cli {
     /// Comma-separated list of port numbers, port ranges, or service names to serve (see "tailcat serve
     /// --help"). If empty, it accepts a single connection on any port, writes it to stdout, and exits.
     #[arg(long, value_name = "SPEC")]
-    serve: Option<String>,
+    serve: Option<serve::PortSet>,
     #[command(flatten)]
     serve_flags: ServeFlags,
     /// Print the version.
@@ -107,7 +107,7 @@ enum Cmd {
         #[command(flatten)]
         flags: ServeFlags,
         /// Ports, port ranges, port mappings, and service names.
-        specs: Vec<String>,
+        specs: Vec<serve::PortSet>,
         #[arg(last = true)]
         exec: Vec<String>,
     },
@@ -327,7 +327,13 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
                     return Err(usagef!("use either --serve or positional port/service arguments, not both"));
                 }
                 (serve, true) => serve.unwrap_or_default(),
-                (None, false) => specs.join(","),
+                (None, false) => {
+                    let mut all = serve::PortSet::default();
+                    for s in specs {
+                        all.merge(s).map_err(|e| anyhow::anyhow!("invalid port or service to serve: {e}"))?;
+                    }
+                    all
+                }
             };
             serve::server(g, &flags, spec, exec(ex)).await?;
         }
@@ -340,7 +346,7 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             }
             let dir = dir.as_deref().unwrap_or(".");
             flags.files = Some(format!("{dir}{}", if accept_dirs { ":wo+" } else { ":wo" }));
-            serve::server(g, &flags, String::new(), None).await?;
+            serve::server(g, &flags, serve::PortSet::default(), None).await?;
         }
         #[cfg(feature = "ssh")]
         Some(Cmd::Ssh { port, skip_dns_safety_check, args }) => {
