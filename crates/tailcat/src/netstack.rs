@@ -7,7 +7,7 @@
 //! Inbound TCP connections and UDP flows are offered to policy callbacks
 //! that decide, per flow, whether to accept, reset or drop them.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -179,16 +179,23 @@ impl State {
         smoltcp::time::Instant::from_micros(self.epoch.elapsed().as_micros() as i64)
     }
 
-    /// Picks the next free ephemeral port on `local_ip`.
-    fn alloc_port(&mut self, local_ip: IpAddr) -> u16 {
-        loop {
+    /// Picks the next free ephemeral port on `local_ip`, if any is free.
+    fn alloc_port(&mut self, local_ip: IpAddr) -> io::Result<u16> {
+        let used: HashSet<u16> = self
+            .tuples
+            .keys()
+            .chain(self.udp.keys())
+            .filter(|(l, _)| l.ip() == local_ip)
+            .map(|(l, _)| l.port())
+            .collect();
+        for _ in EPHEMERAL {
             let p = self.next_port;
             self.next_port = if p >= *EPHEMERAL.end() { *EPHEMERAL.start() } else { p + 1 };
-            let local = SocketAddr::new(local_ip, p);
-            if !self.tuples.keys().chain(self.udp.keys()).any(|(l, _)| *l == local) {
-                return p;
+            if !used.contains(&p) {
+                return Ok(p);
             }
         }
+        Err(io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no free ephemeral port on {local_ip}")))
     }
 
     fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
@@ -454,7 +461,7 @@ impl Stack {
             if st.closed {
                 return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stack closed"));
             }
-            let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
+            let local = SocketAddr::new(local_ip, st.alloc_port(local_ip)?);
             let mut sock = new_tcp_socket();
             sock.connect(st.iface.context(), remote, local)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("connect: {e}")))?;
@@ -474,7 +481,7 @@ impl Stack {
         if st.closed {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "stack closed"));
         }
-        let local = SocketAddr::new(local_ip, st.alloc_port(local_ip));
+        let local = SocketAddr::new(local_ip, st.alloc_port(local_ip)?);
         let (tx, rx) = mpsc::channel(UDP_QUEUE);
         let conn = UdpConn::new(self.shared.clone(), local, remote, &tx, rx);
         st.udp.insert((local, remote), tx);
@@ -1064,6 +1071,41 @@ mod tests {
 
         let mixed = a.dial_udp(a_ip, "[::1]:7".parse().unwrap()).unwrap();
         assert_eq!(mixed.send(b"x").await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// With every ephemeral port on the address taken, dials fail instead
+    /// of looking for a free port forever with the stack locked; a port
+    /// that's freed is used again.
+    #[test]
+    fn dials_fail_when_ports_run_out() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+        let ip: IpAddr = "100.64.0.1".parse().unwrap();
+        let remote: SocketAddr = "100.64.0.2:7".parse().unwrap();
+        let stack = Stack::new(StackConfig { addrs: vec![ip], any_ip: false, mtu: 1280 }, Arc::new(|_| {}), None, None);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut st = stack.shared.lock();
+        for p in EPHEMERAL {
+            st.udp.insert((SocketAddr::new(ip, p), remote), tx.clone());
+        }
+        drop(st);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let s = stack.clone();
+        std::thread::spawn(move || {
+            let udp = s.dial_udp(ip, remote).map(drop).map_err(|e| e.kind());
+            let mut dial = std::pin::pin!(s.dial_tcp(ip, remote));
+            let tcp = match dial.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(r) => r.map(drop).map_err(|e| e.kind()),
+                Poll::Pending => Ok(()),
+            };
+            let _ = done_tx.send((udp, tcp));
+        });
+        let got = done_rx.recv_timeout(Duration::from_secs(10)).expect("dials hang with every port taken");
+        let unavailable = Err(io::ErrorKind::AddrNotAvailable);
+        assert_eq!(got, (unavailable, unavailable));
+
+        stack.shared.lock().udp.remove(&(SocketAddr::new(ip, 40000), remote));
+        assert_eq!(stack.dial_udp(ip, remote).unwrap().local_addr().port(), 40000);
     }
 
     #[test]
