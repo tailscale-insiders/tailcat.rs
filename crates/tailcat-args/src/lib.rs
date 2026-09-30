@@ -3,6 +3,7 @@
 //! library type it chooses; the library's types know nothing of how a
 //! command spells them.
 
+use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -57,7 +58,7 @@ impl fmt::Display for ListsRegions {
     }
 }
 
-impl std::error::Error for ListsRegions {}
+impl Error for ListsRegions {}
 
 impl TryFrom<RegionArg> for RegionChoice {
     type Error = ListsRegions;
