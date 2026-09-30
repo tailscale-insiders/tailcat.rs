@@ -9,9 +9,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use hegel::TestCase;
-use hegel::generators as gs;
-use tokio::io::{DuplexStream, ReadBuf};
+use hegel::generators::{self as gs, Generator};
+use tokio::io::{DuplexStream, ReadBuf, duplex, split};
+use tokio::runtime;
+use tokio::time::{sleep, timeout};
 
+use super::tests::DIRECTIONS;
 use super::*;
 
 const PIPE: usize = 64 << 10;
@@ -78,7 +81,7 @@ async fn pump(mut r: impl AsyncRead + Unpin, mut w: impl AsyncWrite + Unpin, lef
 /// cut once the budget runs out.
 async fn relay(a: DuplexStream, b: DuplexStream, cut: Flag, budget: Option<Arc<AtomicUsize>>) {
     let left = budget.unwrap_or_else(|| Arc::new(AtomicUsize::new(usize::MAX)));
-    let ((ar, aw), (br, bw)) = (tokio::io::split(a), tokio::io::split(b));
+    let ((ar, aw), (br, bw)) = (split(a), split(b));
     tokio::select! {
         _ = async { tokio::join!(pump(ar, bw, &left, &cut), pump(br, aw, &left, &cut)) } => {}
         _ = cut.wait() => {}
@@ -87,18 +90,23 @@ async fn relay(a: DuplexStream, b: DuplexStream, cut: Flag, budget: Option<Arc<A
 
 /// A link between the client and the server, severed when `cut` fires.
 fn link(cut: Flag, budget: Option<Arc<AtomicUsize>>) -> (End, End) {
-    let ((c, rc), (s, rs)) = (tokio::io::duplex(PIPE), tokio::io::duplex(PIPE));
+    let ((c, rc), (s, rs)) = (duplex(PIPE), duplex(PIPE));
     tokio::spawn(relay(rc, rs, cut.clone(), budget));
     (End { pipe: c, cut: cut.clone() }, End { pipe: s, cut })
 }
 
+/// A link that is never cut.
+fn intact_link() -> (End, End) {
+    link(Flag::default(), None)
+}
+
 fn ctrl(e: End) -> Ctrl {
-    let (rd, wr) = tokio::io::split(e);
+    let (rd, wr) = split(e);
     Ctrl::new(BufReader::new(Box::new(rd)), Box::new(wr))
 }
 
 fn attach(t: &Test, i: usize, e: End) {
-    let (rd, wr) = tokio::io::split(e);
+    let (rd, wr) = split(e);
     assert!(t.attach(i, tcp_stream(Box::new(rd), Box::new(wr))));
 }
 
@@ -114,6 +122,31 @@ enum Scenario {
     Crash {
         server: bool,
     },
+}
+
+impl Scenario {
+    /// A scenario for a test with `streams` streams.
+    fn draw(tc: &TestCase, streams: usize) -> Scenario {
+        match tc.draw(gs::integers::<u8>().max_value(3)) {
+            0 => Scenario::Nothing,
+            1 => Scenario::Link(tc.draw(gs::integers::<usize>().max_value(streams))),
+            n => Scenario::Crash { server: n == 3 },
+        }
+    }
+
+    /// Whether link `i` (0 for control) is cut once the budget runs out.
+    fn cuts(self, i: usize) -> bool {
+        match self {
+            Scenario::Nothing => false,
+            Scenario::Link(k) => k == i,
+            Scenario::Crash { .. } => true,
+        }
+    }
+
+    /// Whether the server, or else the client, crashes.
+    fn crashes(self, server: bool) -> bool {
+        matches!(self, Scenario::Crash { server: s } if s == server)
+    }
 }
 
 struct Outcome {
@@ -133,23 +166,46 @@ async fn side(t: Arc<Test>, crash: Option<Flag>) -> Outcome {
         },
         None => Some(t.clone().run().await),
     };
-    if let Some(Ok(_)) = result {
+    if matches!(result, Some(Ok(_))) {
         assert_eq!(t.err.lock().unwrap().clone(), None, "the test failed after it succeeded");
     }
     let elapsed = start.elapsed();
     t.done.set();
     let released = async {
         while Arc::strong_count(&t) > 1 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            sleep(Duration::from_millis(1)).await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(1), released).await.expect("the test's tasks outlived it");
+    timeout(Duration::from_secs(1), released).await.expect("the test's tasks outlived it");
     Outcome { result, elapsed }
 }
 
+/// Runs a client and a server test against each other, over links that
+/// `scenario` cuts once `budget` bytes have crossed them, and returns
+/// how each side came out.
+async fn run_pair(p: &Params, scenario: Scenario, cut: &Flag, budget: usize) -> (Outcome, Outcome) {
+    let budget = Arc::new(AtomicUsize::new(budget));
+    let links: Vec<_> = (0..=p.streams)
+        .map(|i| if scenario.cuts(i) { link(cut.clone(), Some(budget.clone())) } else { intact_link() })
+        .collect();
+    let mut links = links.into_iter();
+    let (cc, sc) = links.next().unwrap();
+    let id = [7; 8];
+    let client = Test::new(p.clone(), id, false, ctrl(cc), None);
+    let server = Test::new(p.clone(), id, true, ctrl(sc), None);
+    for (i, (c, s)) in links.enumerate() {
+        attach(&client, i, c);
+        attach(&server, i, s);
+    }
+    let crash = |server: bool| scenario.crashes(server).then(|| cut.clone());
+    let both =
+        async { tokio::join!(tokio::spawn(side(client, crash(false))), tokio::spawn(side(server, crash(true)))) };
+    let (c, s) = timeout(p.duration + Duration::from_secs(30), both).await.expect("the test hung");
+    (c.unwrap(), s.unwrap())
+}
+
 fn draw_params(tc: &TestCase) -> Params {
-    let direction = [Direction::Upload, Direction::Download, Direction::Bidirectional]
-        [tc.draw(gs::integers::<usize>().max_value(2))];
+    let direction = tc.draw(gs::sampled_from(&DIRECTIONS).print_as_debug());
     let (bytes, duration) = if tc.draw(gs::booleans()) {
         (tc.draw(gs::integers::<i64>().min_value(1).max_value(256 << 10)), Duration::ZERO)
     } else {
@@ -167,95 +223,69 @@ fn draw_params(tc: &TestCase) -> Params {
     }
 }
 
+/// A byte budget spread over orders of magnitude, from a few bytes of the
+/// control link to past a test's whole transfer.
+fn draw_budget(tc: &TestCase) -> usize {
+    let magnitude = tc.draw(gs::integers::<u32>().max_value(21));
+    tc.draw(gs::integers::<usize>().max_value(1 << magnitude))
+}
+
 fn bytes(s: &Option<Stats>) -> Option<i64> {
     s.as_ref().map(|s| s.bytes)
+}
+
+/// Checks one direction's transfer: the bytes sent and received as the
+/// client reports them (`ours`), and as the server does (`theirs`).
+fn check_transfer(p: &Params, ours: [&Option<Stats>; 2], theirs: [&Option<Stats>; 2], cut: bool) {
+    let [Some(sent), Some(received)] = ours.map(bytes) else {
+        panic!("missing stats: {ours:?}");
+    };
+    assert_eq!(theirs.map(bytes), [Some(sent), Some(received)], "sides disagree");
+    if p.bytes > 0 {
+        assert_eq!(sent, p.bytes * p.streams as i64, "sent the wrong amount");
+    }
+    // A link cut after its data was sent can lose some in flight, which
+    // the receiver reports rather than failing.
+    if cut {
+        assert!(received <= sent, "received {received} of {sent} bytes");
+    } else {
+        assert_eq!(received, sent, "lost data with nothing cut");
+    }
 }
 
 #[hegel::test(test_cases = 100)]
 fn tests_finish_and_agree(tc: TestCase) {
     let p = draw_params(&tc);
-    let scenario = match tc.draw(gs::integers::<u8>().max_value(3)) {
-        0 => Scenario::Nothing,
-        1 => Scenario::Link(tc.draw(gs::integers::<usize>().max_value(p.streams))),
-        n => Scenario::Crash { server: n == 3 },
-    };
-    // Spread over orders of magnitude, from a few bytes of the control
-    // link to past a test's whole transfer.
-    let budget = tc.draw(gs::integers::<usize>().max_value(1 << tc.draw(gs::integers::<u32>().max_value(21))));
+    let scenario = Scenario::draw(&tc, p.streams);
+    let budget = draw_budget(&tc);
     tc.note(&format!("{p:?}, cutting {scenario:?} after {budget} bytes"));
+    let rt = runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let cut = Flag::default();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-    rt.block_on(async {
-        let cut = Flag::default();
-        let budget = Arc::new(AtomicUsize::new(budget));
-        let links: Vec<_> = (0..=p.streams)
-            .map(|i| match scenario {
-                Scenario::Nothing => link(Flag::default(), None),
-                Scenario::Link(k) if k == i => link(cut.clone(), Some(budget.clone())),
-                Scenario::Link(_) => link(Flag::default(), None),
-                Scenario::Crash { .. } => link(cut.clone(), Some(budget.clone())),
-            })
-            .collect();
-        let mut links = links.into_iter();
-        let (cc, sc) = links.next().unwrap();
-        let id = [7; 8];
-        let client = Test::new(p.clone(), id, false, ctrl(cc), None);
-        let server = Test::new(p.clone(), id, true, ctrl(sc), None);
-        for (i, (c, s)) in links.enumerate() {
-            attach(&client, i, c);
-            attach(&server, i, s);
-        }
-        let crash = |server: bool| match scenario {
-            Scenario::Crash { server: s } if s == server => Some(cut.clone()),
-            _ => None,
-        };
-        let limit = p.duration + Duration::from_secs(30);
-        let (c, s) = tokio::time::timeout(limit, async {
-            tokio::join!(tokio::spawn(side(client, crash(false))), tokio::spawn(side(server, crash(true))))
-        })
-        .await
-        .expect("the test hung");
-        let (c, s) = (c.unwrap(), s.unwrap());
+    let (c, s) = rt.block_on(run_pair(&p, scenario, &cut, budget));
 
-        let bound = p.duration + Duration::from_secs(5);
-        assert!(c.elapsed <= bound, "the client took {:?}: {:?}", c.elapsed, c.result.map(|_| ()));
-        assert!(s.elapsed <= bound, "the server took {:?}: {:?}", s.elapsed, s.result.map(|_| ()));
-        let (Some(Ok(cr)), Some(Ok(sr))) = (&c.result, &s.result) else {
-            let errs = (c.result.map(|r| r.err()), s.result.map(|r| r.err()));
-            assert!(cut.is_set(), "a test failed with nothing cut: {errs:?}");
-            return;
-        };
-        let up = (&cr.client_sent, &cr.server_received, &sr.client_sent, &sr.server_received);
-        let down = (&cr.server_sent, &cr.client_received, &sr.server_sent, &sr.client_received);
-        for (active, (sent, received, their_sent, their_received)) in
-            [(p.direction != Direction::Download, up), (p.direction != Direction::Upload, down)]
-        {
-            if !active {
-                continue;
-            }
-            let (Some(sent), Some(received)) = (bytes(sent), bytes(received)) else {
-                panic!("missing stats: {cr:?}");
-            };
-            assert_eq!((bytes(their_sent), bytes(their_received)), (Some(sent), Some(received)), "sides disagree");
-            if p.bytes > 0 {
-                assert_eq!(sent, p.bytes * p.streams as i64, "sent the wrong amount");
-            }
-            // A link cut after its data was sent can lose some in flight,
-            // which the receiver reports rather than failing.
-            if cut.is_set() {
-                assert!(received <= sent, "received {received} of {sent} bytes");
-            } else {
-                assert_eq!(received, sent, "lost data with nothing cut");
-            }
-        }
-    });
+    let bound = p.duration + Duration::from_secs(5);
+    assert!(c.elapsed <= bound, "the client took {:?}: {:?}", c.elapsed, c.result.map(|_| ()));
+    assert!(s.elapsed <= bound, "the server took {:?}: {:?}", s.elapsed, s.result.map(|_| ()));
+    let (Some(Ok(cr)), Some(Ok(sr))) = (&c.result, &s.result) else {
+        let errs = (c.result.map(|r| r.err()), s.result.map(|r| r.err()));
+        assert!(cut.is_set(), "a test failed with nothing cut: {errs:?}");
+        return;
+    };
+    let cut = cut.is_set();
+    if p.direction != Direction::Download {
+        check_transfer(&p, [&cr.client_sent, &cr.server_received], [&sr.client_sent, &sr.server_received], cut);
+    }
+    if p.direction != Direction::Upload {
+        check_transfer(&p, [&cr.server_sent, &cr.client_received], [&sr.server_sent, &sr.client_received], cut);
+    }
 }
 
 /// A stream task that panics fails the test, and the others' results
 /// stay at their streams' indices.
 #[tokio::test]
 async fn panicked_stream_tasks_fail_the_test() {
-    let (c, _s) = link(Flag::default(), None);
+    let (c, _s) = intact_link();
     let p = Params {
         proto: Proto::Tcp,
         direction: Direction::Upload,

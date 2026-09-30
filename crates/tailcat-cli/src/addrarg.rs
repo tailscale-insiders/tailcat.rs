@@ -102,14 +102,14 @@ mod tests {
     fn classifies() {
         assert!(matches!(classify(ADDR).unwrap(), AddrArg::Addr(_)));
         assert_eq!(classify("example.com").unwrap(), AddrArg::Dns("example.com".into()));
-        assert!(classify("nonsense").is_err());
-        assert!(classify(&format!("{ADDR}.")).is_err());
-        assert!(classify(&format!("{ADDR}.example.com")).is_err());
-        assert!(classify("bad_name.com").is_err());
-        assert!(classify("-x.com").is_err());
         // A fully qualified name keeps its dot for the lookup.
         assert_eq!(classify("example.com.").unwrap(), AddrArg::Dns("example.com.".into()));
-        assert!(classify("a..b").is_err());
+
+        let addr_dot = format!("{ADDR}.");
+        let addr_label = format!("{ADDR}.example.com");
+        for bad in ["nonsense", &addr_dot, &addr_label, "bad_name.com", "-x.com", "a..b"] {
+            assert!(classify(bad).is_err(), "{bad:?} classified");
+        }
     }
 
     #[test]
@@ -137,6 +137,8 @@ mod tests {
     async fn validated_addrs() {
         let (a, via_dns) = validated_addr(ADDR).await.unwrap();
         assert_eq!((a.as_str(), via_dns), (ADDR, false));
-        assert!(validated_addr("tcnope").await.unwrap_err().to_string().contains("invalid tailcat address"));
+
+        let e = validated_addr("tcnope").await.unwrap_err();
+        assert!(e.to_string().contains("invalid tailcat address"), "{e}");
     }
 }

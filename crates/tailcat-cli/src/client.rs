@@ -147,20 +147,46 @@ pub async fn ping_mode(g: &Global, until_direct: bool, timeout: Duration, addr_a
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{self, Write, pipe};
+    use std::sync::mpsc as std_mpsc;
+    use std::thread;
 
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, duplex, sink};
+    use tokio::runtime::Runtime;
+    use tokio::time::timeout;
 
     use super::*;
 
+    /// A reader whose every read fails.
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("broken"))
+        }
+    }
+
+    /// Drops `rt` on a thread of its own, and reports whether that
+    /// finished within `limit`.
+    fn shuts_down_within(rt: Runtime, limit: Duration) -> bool {
+        let (tx, dropped) = std_mpsc::channel();
+        thread::spawn(move || {
+            drop(rt);
+            let _ = tx.send(());
+        });
+        dropped.recv_timeout(limit).is_ok()
+    }
+
     #[tokio::test]
     async fn uploads_then_half_closes() {
-        let (r, mut w) = std::io::pipe().unwrap();
-        let (mut server, client) = tokio::io::duplex(64);
+        let (r, mut w) = pipe().unwrap();
+        let (mut server, client) = duplex(64);
         let up = tokio::spawn(upload(read_chunks(r), client));
+
         w.write_all(b"hello ").unwrap();
         w.write_all(b"world").unwrap();
         drop(w);
+
         let mut got = Vec::new();
         server.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"hello world");
@@ -169,13 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_fails_on_read_errors() {
-        struct Broken;
-        impl Read for Broken {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("broken"))
-            }
-        }
-        let e = upload(read_chunks(Broken), tokio::io::sink()).await.unwrap_err();
+        let e = upload(read_chunks(Broken), sink()).await.unwrap_err();
         assert_eq!(e.to_string(), "broken");
     }
 
@@ -183,17 +203,14 @@ mod tests {
     /// so the process, from exiting.
     #[test]
     fn blocked_reads_dont_hold_up_exit() {
-        let (r, _w) = std::io::pipe().unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        let (r, _w) = pipe().unwrap();
+        let rt = Runtime::new().unwrap();
+        let recv = rt.block_on(async {
             let mut rx = read_chunks(r);
-            assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+            timeout(Duration::from_millis(50), rx.recv()).await
         });
-        let (tx, dropped) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            drop(rt);
-            let _ = tx.send(());
-        });
-        dropped.recv_timeout(Duration::from_secs(10)).expect("runtime shutdown waited for the blocked read");
+        assert!(recv.is_err(), "a read of an open, empty pipe returned");
+        let exited = shuts_down_within(rt, Duration::from_secs(10));
+        assert!(exited, "runtime shutdown waited for the blocked read");
     }
 }

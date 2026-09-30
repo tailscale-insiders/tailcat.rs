@@ -109,24 +109,58 @@ impl DerpMapCache for DiskDerpMapCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use super::*;
+
+    const URL: &str = "https://example.com/derpmap.json";
+
+    /// The body and ETag cached for `URL` in `dir`.
+    fn cached(dir: &Path) -> Option<(Vec<u8>, String)> {
+        get(dir, URL).map(|(body, etag, _)| (body, etag))
+    }
+
     #[test]
     fn escapes_like_go() {
-        assert_eq!(super::query_escape("https://tailcat.dev/derpmap.json"), "https%3A%2F%2Ftailcat.dev%2Fderpmap.json");
-        assert_eq!(super::query_escape("a b?c=d&e~"), "a+b%3Fc%3Dd%26e~");
-        assert_eq!(super::query_escape("é"), "%C3%A9");
+        assert_eq!(query_escape("https://tailcat.dev/derpmap.json"), "https%3A%2F%2Ftailcat.dev%2Fderpmap.json");
+        assert_eq!(query_escape("a b?c=d&e~"), "a+b%3Fc%3Dd%26e~");
+        assert_eq!(query_escape("é"), "%C3%A9");
     }
 
     #[test]
     fn stores_body_and_etag() {
         let dir = tempfile::tempdir().unwrap();
-        let url = "https://example.com/derpmap.json";
-        assert!(super::get(dir.path(), url).is_none());
-        super::put(dir.path(), url, b"{}", "\"v1\"");
-        let (d, e, _) = super::get(dir.path(), url).unwrap();
-        assert_eq!((d.as_slice(), e.as_str()), (&b"{}"[..], "\"v1\""));
-        super::put(dir.path(), url, b"{ }", "");
-        let (d, e, _) = super::get(dir.path(), url).unwrap();
-        assert_eq!((d.as_slice(), e.as_str()), (&b"{ }"[..], ""));
+        assert_eq!(cached(dir.path()), None);
+
+        put(dir.path(), URL, b"{}", "\"v1\"");
+        assert_eq!(cached(dir.path()), Some((b"{}".to_vec(), "\"v1\"".into())));
+
+        put(dir.path(), URL, b"{ }", "");
+        assert_eq!(cached(dir.path()), Some((b"{ }".to_vec(), "".into())));
+    }
+
+    /// Fetch `i`'s body, longer for each fetch so that a torn one shows.
+    #[cfg(unix)]
+    fn body(i: usize) -> Vec<u8> {
+        format!("{{\"fetch\": {i}, \"pad\": \"{}\"}}", "x".repeat(i * 1000)).into_bytes()
+    }
+
+    #[cfg(unix)]
+    fn etag(i: usize) -> String {
+        format!("\"{i}\"")
+    }
+
+    /// Checks that `dir` caches one fetch's body with that fetch's ETag,
+    /// or with none.
+    #[cfg(unix)]
+    fn check_paired(dir: &Path) -> Result<(), String> {
+        let (d, e) = cached(dir).ok_or("no cache entry")?;
+        let i = (0..=4).find(|&i| d == body(i)).ok_or("torn body")?;
+        if !e.is_empty() && e != etag(i) {
+            return Err(format!("body of fetch {i} with ETag {e}"));
+        }
+        Ok(())
     }
 
     /// Racing processes each store their own fetch, and a reader always
@@ -136,31 +170,21 @@ mod tests {
     #[test]
     fn body_and_etag_stay_paired() {
         let dir = tempfile::tempdir().unwrap();
-        let url = "https://example.com/derpmap.json";
-        let body = |i: usize| format!("{{\"fetch\": {i}, \"pad\": \"{}\"}}", "x".repeat(i * 1000));
-        super::put(dir.path(), url, body(0).as_bytes(), "\"0\"");
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let check = || {
-            let (d, e, _) = super::get(dir.path(), url).ok_or("no cache entry")?;
-            let i = (0..=4).find(|&i| d == body(i).as_bytes()).ok_or("torn body")?;
-            if !e.is_empty() && e != format!("\"{i}\"") {
-                return Err(format!("body of fetch {i} with ETag {e}"));
+        put(dir.path(), URL, &body(0), &etag(0));
+        let stop = AtomicBool::new(false);
+        // Writer `w` stores fetches w and w + 2, over and over.
+        let writer = |w: usize| {
+            while !stop.load(Ordering::Relaxed) {
+                for i in [w, w + 2] {
+                    put(dir.path(), URL, &body(i), &etag(i));
+                }
             }
-            Ok(())
         };
-        let res = std::thread::scope(|s| {
-            for w in 1..=2 {
-                let (dir, stop) = (dir.path(), &stop);
-                s.spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        for i in [w, w + 2] {
-                            super::put(dir, url, body(i).as_bytes(), &format!("\"{i}\""));
-                        }
-                    }
-                });
-            }
-            let res = (0..2000).try_for_each(|_| check());
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = thread::scope(|s| {
+            s.spawn(|| writer(1));
+            s.spawn(|| writer(2));
+            let res = (0..2000).try_for_each(|_| check_paired(dir.path()));
+            stop.store(true, Ordering::Relaxed);
             res
         });
         res.unwrap();

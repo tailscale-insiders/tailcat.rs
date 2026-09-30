@@ -425,19 +425,89 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use tailcat::derp::server::DevDerp;
+    use tailcat::{DerpRegion, PrivateKey, Server, UdpConn, udp_handler};
+    use tokio::time::timeout;
+
     use super::*;
 
     const ADDR: &str = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu";
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    pub(super) fn global() -> Global {
+        Global { key: None, verbose: false, json: false, derpmap_url: String::new() }
+    }
+
+    /// Echoes a UDP flow's datagrams back to it.
+    async fn echo(c: UdpConn) {
+        let mut b = [0u8; 2048];
+        while let Ok(n) = c.recv(&mut b).await {
+            let _ = c.send(&b[..n]).await;
+        }
+    }
+
+    /// A tailcat server in `dev`'s region that echoes every UDP flow.
+    pub(super) async fn udp_echo_server(dev: &DevDerp) -> Server {
+        Server::builder().region(dev.region.clone()).on_udp(|_| Some(udp_handler(echo))).start().await.unwrap()
+    }
+
+    /// A tailcat address in `region` that no server has.
+    fn unserved_addr(region: &DerpRegion) -> Addr {
+        let mut ghost = PrivateKey::generate().public;
+        (ghost.region, ghost.region_id) = (vec![region.clone()], 0);
+        ghost.addr()
+    }
+
+    /// A greeting that offers "no authentication", then a request for
+    /// command `cmd` with the address `host:port`.
+    pub(super) fn request(cmd: u8, host: &str, port: u16) -> Vec<u8> {
+        let mut b = vec![5, 1, 0, 5, cmd, 0];
+        put_addr(&mut b, host, port);
+        b
+    }
+
+    /// A datagram for the relay: a UDP request header for `host:port`,
+    /// then `payload`.
+    pub(super) fn datagram(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0, 0, 0];
+        put_addr(&mut b, host, port);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// Opens a UDP association through `proxy` for the client at
+    /// `client`, and returns its control connection and relay address.
+    pub(super) async fn udp_associate_via(proxy: SocketAddr, client: SocketAddr) -> (TcpStream, SocketAddr) {
+        let mut ctrl = TcpStream::connect(proxy).await.unwrap();
+        ctrl.write_all(&request(3, &client.ip().to_string(), client.port())).await.unwrap();
+        let mut rep = [0u8; 12];
+        ctrl.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], REP_SUCCESS);
+        let ip: [u8; 4] = rep[6..10].try_into().unwrap();
+        let port = u16::from_be_bytes([rep[10], rep[11]]);
+        (ctrl, SocketAddr::from((ip, port)))
+    }
+
+    async fn target(host: &str, port: u16) -> Target {
+        classify(host, port).await.unwrap()
+    }
+
+    fn via(s: &str) -> Target {
+        Target::Via(addr(s))
+    }
+
     #[tokio::test]
     async fn classifies_destinations() {
-        assert_eq!(classify("server.tailcat", 80).await.unwrap(), Target::Server(80));
-        assert_eq!(classify("", 80).await.unwrap(), Target::Server(80));
-        assert_eq!(classify(ADDR, 81).await.unwrap(), Target::Addr(Addr::new(ADDR), 81));
-        assert_eq!(classify("10.1.2.3", 22).await.unwrap(), Target::Via("10.1.2.3:22".parse().unwrap()));
-        assert_eq!(classify("::ffff:10.1.2.3", 22).await.unwrap(), Target::Via("10.1.2.3:22".parse().unwrap()));
-        assert_eq!(classify("fd7a::1", 22).await.unwrap(), Target::Via("[fd7a::1]:22".parse().unwrap()));
-        assert_eq!(classify("localhost", 22).await.unwrap(), Target::Via("127.0.0.1:22".parse().unwrap()));
+        assert_eq!(target("server.tailcat", 80).await, Target::Server(80));
+        assert_eq!(target("", 80).await, Target::Server(80));
+        assert_eq!(target(ADDR, 81).await, Target::Addr(Addr::new(ADDR), 81));
+        assert_eq!(target("10.1.2.3", 22).await, via("10.1.2.3:22"));
+        assert_eq!(target("::ffff:10.1.2.3", 22).await, via("10.1.2.3:22"));
+        assert_eq!(target("fd7a::1", 22).await, via("[fd7a::1]:22"));
+        assert_eq!(target("localhost", 22).await, via("127.0.0.1:22"));
     }
 
     #[test]
@@ -466,22 +536,22 @@ mod tests {
 
     #[test]
     fn udp_clients() {
-        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let ctrl = a("127.0.0.1:4000");
+        let ctrl = addr("127.0.0.1:4000");
         // An unspecified address (or a hostname) means the control
         // connection's IP, and port 0 the first datagram's port.
         for host in ["0.0.0.0", "::", "localhost"] {
             let mut c = UdpClient::new(host, 0, ctrl);
-            assert!(!c.admit(a("10.0.0.1:5000")), "{host}: another IP admitted");
-            assert!(c.admit(a("127.0.0.1:5000")), "{host}: the client wasn't admitted");
-            assert!(c.admit(a("[::ffff:127.0.0.1]:5000")), "{host}: the mapped client wasn't admitted");
-            assert!(!c.admit(a("127.0.0.1:5001")), "{host}: another port admitted after the first datagram");
+            assert!(!c.admit(addr("10.0.0.1:5000")), "{host}: another IP admitted");
+            assert!(c.admit(addr("127.0.0.1:5000")), "{host}: the client wasn't admitted");
+            assert!(c.admit(addr("[::ffff:127.0.0.1]:5000")), "{host}: the mapped client wasn't admitted");
+            assert!(!c.admit(addr("127.0.0.1:5001")), "{host}: another port admitted after the first datagram");
         }
         // A specific address is the only one admitted.
         let mut c = UdpClient::new("::ffff:10.0.0.1", 5000, ctrl);
         assert_eq!(c, UdpClient { ip: "10.0.0.1".parse().unwrap(), port: 5000 });
-        assert!(!c.admit(a("127.0.0.1:5000")) && !c.admit(a("10.0.0.1:5001")));
-        assert!(c.admit(a("10.0.0.1:5000")));
+        assert!(!c.admit(addr("127.0.0.1:5000")));
+        assert!(!c.admit(addr("10.0.0.1:5001")));
+        assert!(c.admit(addr("10.0.0.1:5000")));
     }
 
     #[tokio::test]
@@ -501,8 +571,7 @@ mod tests {
     async fn proxy() -> SocketAddr {
         let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = ln.local_addr().unwrap();
-        let g = Global { key: None, verbose: false, json: false, derpmap_url: String::new() };
-        let d = Dialer { g, key: NodePrivate::generate(), default: None, clients: Mutex::default() };
+        let d = Dialer { g: global(), key: NodePrivate::generate(), default: None, clients: Mutex::default() };
         tokio::spawn(serve(ln, Arc::new(d)));
         a
     }
@@ -522,68 +591,49 @@ mod tests {
         assert_eq!(roundtrip(a, &[5, 1, 2], 2).await, [5, 0xff]);
         let ok_reply = |rep| vec![5, 0, 5, rep, 0, 1, 0, 0, 0, 0, 0, 0];
         // BIND isn't supported.
-        let bind = [5, 1, 0, 5, 2, 0, 1, 127, 0, 0, 1, 0, 80];
+        let bind = request(2, "127.0.0.1", 80);
         assert_eq!(roundtrip(a, &bind, 12).await, ok_reply(REP_COMMAND_NOT_SUPPORTED));
         // Nor are unknown address types.
-        assert_eq!(roundtrip(a, &[5, 1, 0, 5, 1, 0, 9], 12).await, ok_reply(REP_ADDR_TYPE_NOT_SUPPORTED));
+        let bad_atyp = [5, 1, 0, 5, 1, 0, 9];
+        assert_eq!(roundtrip(a, &bad_atyp, 12).await, ok_reply(REP_ADDR_TYPE_NOT_SUPPORTED));
         // Without a server argument, only tailcat address hostnames can
         // be dialed.
-        let connect = [&[5, 1, 0, 5, 1, 0, 3, 14][..], b"server.tailcat", &[0, 80]].concat();
+        let connect = request(1, "server.tailcat", 80);
         assert_eq!(roundtrip(a, &connect, 12).await, ok_reply(REP_HOST_UNREACHABLE));
+    }
+
+    /// Sends `msg` to `to` every half second until a reply comes back,
+    /// and returns the reply. The first datagrams can be lost while the
+    /// tunnel comes up.
+    async fn send_until_answered(u: &UdpSocket, msg: &[u8], to: SocketAddr) -> Vec<u8> {
+        let mut buf = [0u8; 2048];
+        loop {
+            u.send_to(msg, to).await.unwrap();
+            if let Ok(Ok((n, _))) = timeout(Duration::from_millis(500), u.recv_from(&mut buf)).await {
+                return buf[..n].to_vec();
+            }
+        }
     }
 
     /// A UDP flow that's slow to open doesn't hold up another flow's
     /// datagrams.
     #[tokio::test]
     async fn slow_udp_flows_dont_stall_others() {
-        let dev = tailcat::derp::server::DevDerp::start_local().await.unwrap();
-        let echo = tailcat::Server::builder()
-            .region(dev.region.clone())
-            .on_udp(|_| {
-                Some(tailcat::udp_handler(|c: tailcat::UdpConn| async move {
-                    let mut b = [0u8; 2048];
-                    while let Ok(n) = c.recv(&mut b).await {
-                        let _ = c.send(&b[..n]).await;
-                    }
-                }))
-            })
-            .start()
-            .await
-            .unwrap();
+        let dev = DevDerp::start_local().await.unwrap();
+        let echo = udp_echo_server(&dev).await;
         let echo_addr = echo.tailcat_addr();
         // No server has this address, so opening a flow to it waits for
         // an answer that never comes.
-        let mut ghost = tailcat::PrivateKey::generate().public;
-        (ghost.region, ghost.region_id) = (vec![dev.region.clone()], 0);
-        let ghost_addr = ghost.addr();
-        assert!(echo_addr.as_str().len() < 256 && ghost_addr.as_str().len() < 256);
-
-        let mut c = TcpStream::connect(proxy().await).await.unwrap();
-        c.write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
-        let mut rep = [0u8; 12];
-        c.read_exact(&mut rep).await.unwrap();
-        let relay =
-            SocketAddr::from((<[u8; 4]>::try_from(&rep[6..10]).unwrap(), u16::from_be_bytes([rep[10], rep[11]])));
+        let ghost_addr = unserved_addr(&dev.region);
+        assert!(echo_addr.as_str().len() < 256);
+        assert!(ghost_addr.as_str().len() < 256);
+        let (_ctrl, relay) = udp_associate_via(proxy().await, addr("0.0.0.0:0")).await;
         let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let datagram = |host: &str, port, payload: &[u8]| {
-            let mut b = vec![0, 0, 0];
-            put_addr(&mut b, host, port);
-            b.extend_from_slice(payload);
-            b
-        };
+
         u.send_to(&datagram(ghost_addr.as_str(), 7, b"lost"), relay).await.unwrap();
-        // The first datagrams can be lost while the tunnel comes up, so
-        // resend.
         let want = datagram(echo_addr.as_str(), 7, b"echo");
-        let echoed = tokio::time::timeout(Duration::from_secs(8), async {
-            let mut buf = [0u8; 2048];
-            loop {
-                u.send_to(&want, relay).await.unwrap();
-                if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(500), u.recv_from(&mut buf)).await {
-                    return buf[..n].to_vec();
-                }
-            }
-        });
-        assert_eq!(echoed.await.expect("the echo flow was held up"), want);
+        let echoed = timeout(Duration::from_secs(8), send_until_answered(&u, &want, relay)).await;
+
+        assert_eq!(echoed.expect("the echo flow was held up"), want);
     }
 }

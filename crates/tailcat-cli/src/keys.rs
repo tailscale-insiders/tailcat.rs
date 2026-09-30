@@ -54,19 +54,34 @@ pub fn client_key(g: &Global) -> Result<NodePrivate> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
     use super::*;
 
     fn global(key: Option<&str>) -> Global {
         Global { key: key.map(String::from), verbose: false, json: false, derpmap_url: String::new() }
     }
 
+    /// The key name `--key <key>` selects, with a default of "default".
+    fn named(key: &str) -> String {
+        key_name(&global(Some(key)), "default").unwrap()
+    }
+
+    /// The client key per `--key <path>`.
+    fn client_key_at(path: &Path) -> Result<NodePrivate> {
+        client_key(&global(path.to_str()))
+    }
+
     #[test]
     fn names_and_paths() {
-        assert!(is_path("a/b.private.json") && is_path(r"a\b") && !is_path("default"));
+        assert!(is_path("a/b.private.json"));
+        assert!(is_path(r"a\b"));
+        assert!(!is_path("default"));
         assert_eq!(key_path("./k.json").unwrap(), PathBuf::from("./k.json"));
         assert!(key_path("foo").unwrap().ends_with("tailcat/keys/foo.private.json"));
-        assert_eq!(key_name(&global(Some("new")), "default").unwrap(), "new");
-        assert_eq!(key_name(&global(Some("foo")), "default").unwrap(), "foo");
+        assert_eq!(named("new"), "new");
+        assert_eq!(named("foo"), "foo");
     }
 
     #[test]
@@ -74,12 +89,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.private.json");
         let k = PrivateKey::generate();
-        std::fs::write(&path, k.to_json_pretty()).unwrap();
-        assert_eq!(client_key(&global(path.to_str())).unwrap(), k.private);
-        assert_ne!(client_key(&global(Some("new"))).unwrap(), k.private);
-        std::fs::write(&path, "{").unwrap();
-        let e = client_key(&global(path.to_str())).unwrap_err();
+        fs::write(&path, k.to_json_pretty()).unwrap();
+        assert_eq!(client_key_at(&path).unwrap(), k.private);
+
+        let fresh = client_key(&global(Some("new"))).unwrap();
+        assert_ne!(fresh, k.private);
+
+        fs::write(&path, "{").unwrap();
+        let e = client_key_at(&path).unwrap_err();
         assert!(format!("{e:#}").contains("failed to parse"), "{e:#}");
-        assert!(client_key(&global(dir.path().join("missing").to_str())).is_err());
+        assert!(client_key_at(&dir.path().join("missing")).is_err());
     }
 }

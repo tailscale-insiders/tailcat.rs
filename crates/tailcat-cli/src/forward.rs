@@ -152,25 +152,32 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    /// Parses a mapping that listens on 127.0.0.1.
+    fn local(spec: &str) -> Result<ForwardSpec> {
+        parse_forward_spec("127.0.0.1", spec)
+    }
+
     #[test]
     fn specs() {
-        let s = parse_forward_spec("127.0.0.1", "8080").unwrap();
+        let s = local("8080").unwrap();
         assert_eq!(s, ForwardSpec { listen_addr: "127.0.0.1:8080".into(), target: None, port: 8080 });
+
         let s = parse_forward_spec("0.0.0.0", "18080:8080").unwrap();
         assert_eq!(s.listen_addr, "0.0.0.0:18080");
         assert_eq!(s.port, 8080);
-        let s = parse_forward_spec("127.0.0.1", "0:80").unwrap();
-        assert_eq!(s.listen_addr, "127.0.0.1:0");
-        let s = parse_forward_spec("127.0.0.1", "13306:192.168.1.10:3306").unwrap();
+
+        assert_eq!(local("0:80").unwrap().listen_addr, "127.0.0.1:0");
+        assert_eq!(local("1:2").unwrap().remote_target(), "localhost:2");
+
+        let s = local("13306:192.168.1.10:3306").unwrap();
         assert_eq!(s.target, Some("192.168.1.10:3306".parse().unwrap()));
-        assert!(parse_forward_spec("127.0.0.1", "0").is_err());
-        assert!(parse_forward_spec("127.0.0.1", "80:nope").is_err());
+
         let s = parse_forward_spec("::1", "8080:[fd7a::1]:80").unwrap();
         assert_eq!(s.listen_addr, "[::1]:8080");
         assert_eq!(s.remote_target(), "[fd7a::1]:80");
-        assert_eq!(parse_forward_spec("127.0.0.1", "1:2").unwrap().remote_target(), "localhost:2");
-        for bad in ["", ":80", "x:80", "65536", "80:0", "80:65536", "80:host:22", "00:80"] {
-            assert!(parse_forward_spec("127.0.0.1", bad).is_err(), "{bad:?} parsed");
+
+        for bad in ["", "0", ":80", "x:80", "65536", "80:0", "80:65536", "80:nope", "80:host:22", "00:80"] {
+            assert!(local(bad).is_err(), "{bad:?} parsed");
         }
     }
 }

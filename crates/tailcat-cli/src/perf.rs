@@ -1514,9 +1514,12 @@ mod model_tests;
 #[cfg(test)]
 mod tests {
     use hegel::TestCase;
-    use hegel::generators as gs;
+    use hegel::generators::{self as gs, Generator};
+    use tokio::io::{duplex, split};
 
     use super::*;
+
+    pub(super) const DIRECTIONS: [Direction; 3] = [Direction::Upload, Direction::Download, Direction::Bidirectional];
 
     #[test]
     fn go_durations() {
@@ -1572,28 +1575,33 @@ mod tests {
         }
     }
 
+    /// Validates `p` with the server's default limits.
+    fn server_validate(p: &Params) -> Result<(), String> {
+        p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION)
+    }
+
     #[test]
     fn wire_formats() {
-        let j = serde_json::to_string(&Message { params: Some(params()), ..Message::new("hello") }).unwrap();
+        let hello = Message { params: Some(params()), ..Message::new("hello") };
         assert_eq!(
-            j,
+            serde_json::to_string(&hello).unwrap(),
             r#"{"type":"hello","params":{"proto":"udp","dir":"both","duration":10000000000,"streams":1,"length":1232,"bitrate":1000000,"interval":1000000000}}"#
         );
+
         let h = UdpHeader { id: [1; 8], stream: 2, flags: FLAG_FIN, seq: 9, send_time: 42 };
         let b = h.datagram();
         assert_eq!(b[..11], [1, 1, 1, 1, 1, 1, 1, 1, 0, 2, FLAG_FIN]);
         let back = UdpHeader::parse(&b).unwrap();
         assert_eq!((back.id, back.stream, back.flags, back.seq, back.send_time), ([1; 8], 2, FLAG_FIN, 9, 42));
         assert!(UdpHeader::parse(&b[..31]).is_none());
+
         // Zero fields are omitted, like Go's omitempty.
-        let j = serde_json::to_string(&Message {
-            stats: Some(Stats { bytes: 5, duration: Duration::from_millis(1), ..Default::default() }),
-            ..Message::new("done")
-        })
-        .unwrap();
-        assert_eq!(j, r#"{"type":"done","stats":{"bytes":5,"duration":1000000}}"#);
-        let m: Message = serde_json::from_str(r#"{"type":"ok","id":"0102030405060708","extra":1}"#).unwrap();
-        assert_eq!(parse_id(&m.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
+        let stats = Stats { bytes: 5, duration: Duration::from_millis(1), ..Default::default() };
+        let done = Message { stats: Some(stats), ..Message::new("done") };
+        assert_eq!(serde_json::to_string(&done).unwrap(), r#"{"type":"done","stats":{"bytes":5,"duration":1000000}}"#);
+
+        let ok: Message = serde_json::from_str(r#"{"type":"ok","id":"0102030405060708","extra":1}"#).unwrap();
+        assert_eq!(parse_id(&ok.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(parse_id("0102"), None);
         assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
     }
@@ -1601,10 +1609,11 @@ mod tests {
     /// Any duration, well past the ~292 years Go's time.Duration holds.
     fn draw_duration(tc: &TestCase) -> Duration {
         if tc.draw(gs::booleans()) {
-            tc.draw(gs::durations())
-        } else {
-            Duration::new(tc.draw(gs::integers::<u64>()), tc.draw(gs::integers::<u32>().max_value(999_999_999)))
+            return tc.draw(gs::durations());
         }
+        let secs = tc.draw(gs::integers::<u64>());
+        let nanos = tc.draw(gs::integers::<u32>().max_value(999_999_999));
+        Duration::new(secs, nanos)
     }
 
     /// Params survive the hello line, with durations saturating at Go's
@@ -1612,9 +1621,8 @@ mod tests {
     #[hegel::test]
     fn params_round_trip(tc: TestCase) {
         let p = Params {
-            proto: [Proto::Tcp, Proto::Udp][tc.draw(gs::integers::<usize>().max_value(1))],
-            direction: [Direction::Upload, Direction::Download, Direction::Bidirectional]
-                [tc.draw(gs::integers::<usize>().max_value(2))],
+            proto: tc.draw(gs::sampled_from(&[Proto::Tcp, Proto::Udp]).print_as_debug()),
+            direction: tc.draw(gs::sampled_from(&DIRECTIONS).print_as_debug()),
             duration: draw_duration(&tc),
             bytes: tc.draw(gs::integers()),
             streams: tc.draw(gs::integers()),
@@ -1622,13 +1630,15 @@ mod tests {
             bitrate: tc.draw(gs::integers()),
             interval: draw_duration(&tc),
         };
-        let line = Message { params: Some(p.clone()), ..Message::new("hello") }.line();
-        let back = serde_json::from_slice::<Message>(&line).unwrap().params.expect("params");
+        let hello = Message { params: Some(p.clone()), ..Message::new("hello") };
+
+        let back = serde_json::from_slice::<Message>(&hello.line()).unwrap().params.expect("params");
+
         let go_max = Duration::from_nanos(i64::MAX as u64);
         let want = Params { duration: p.duration.min(go_max), interval: p.interval.min(go_max), ..p.clone() };
         assert_eq!(back, want);
-        let judge = |p: &Params| p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok();
-        assert_eq!(judge(&back), judge(&p), "the server judges {back:?} differently from {p:?}");
+        let (judged, judged_back) = (server_validate(&p).is_ok(), server_validate(&back).is_ok());
+        assert_eq!(judged_back, judged, "the server judges {back:?} differently from {p:?}");
     }
 
     #[hegel::test]
@@ -1649,11 +1659,11 @@ mod tests {
 
     #[test]
     fn validates_params() {
-        assert!(params().validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok());
+        assert!(server_validate(&params()).is_ok());
         let bad = |f: fn(&mut Params), want: &str| {
             let mut p = params();
             f(&mut p);
-            let e = p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).unwrap_err();
+            let e = server_validate(&p).unwrap_err();
             assert!(e.contains(want), "{e:?} doesn't contain {want:?}");
         };
         bad(|p| p.bytes = -1, "negative byte count");
@@ -1675,19 +1685,20 @@ mod tests {
         // A byte count lifts the duration limit, and clients have no limits.
         let mut p = params();
         (p.bytes, p.duration) = (1, Duration::from_secs(10_000));
-        assert!(p.validate(DEFAULT_MAX_STREAMS, DEFAULT_MAX_DURATION).is_ok());
+        assert!(server_validate(&p).is_ok());
         p.streams = 1000;
         assert!(p.validate(0, Duration::ZERO).is_ok());
     }
 
     #[tokio::test]
     async fn control_lines() {
-        let (a, b) = tokio::io::duplex(1 << 20);
-        let (_ar, mut aw) = tokio::io::split(a);
+        let (a, b) = duplex(1 << 20);
+        let (_ar, mut aw) = split(a);
         let mut br = BufReader::new(b);
         aw.write_all(&Message::new("ready").line()).await.unwrap();
         aw.write_all(b"not json\n").await.unwrap();
         aw.write_all(&vec![b' '; CTRL_BUF_SIZE + 1]).await.unwrap();
+
         assert_eq!(read_message(&mut br).await.unwrap().typ, "ready");
         let e = read_message(&mut br).await.unwrap_err();
         assert!(e.to_string().contains("bad control message"), "{e}");
@@ -1726,8 +1737,9 @@ mod tests {
             ]
         );
         assert_eq!(perf_summary(&res), "UDP client -> server 896 Kbit/s (10.0% lost), server -> client ?");
-        let res =
-            PerfResult { params: Params { proto: Proto::Tcp, direction: Direction::Download, ..params() }, ..res };
+
+        let tcp_download = Params { proto: Proto::Tcp, direction: Direction::Download, ..params() };
+        let res = PerfResult { params: tcp_download, ..res };
         assert_eq!(perf_summary(&res), "TCP server -> client ?");
         assert_eq!(describe(&res.params), "TCP, server -> client, 1 stream, 10s, 1.00 Mbit/s per stream");
         let p = Params { bytes: 5_000_000, streams: 2, bitrate: 0, ..params() };

@@ -414,6 +414,12 @@ fn fmt_mtime(t: i64, now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Display;
+    use std::fs;
+
+    use tokio::io::duplex;
+    use tokio::time::timeout;
+
     use super::*;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE comment";
@@ -429,15 +435,20 @@ mod tests {
         assert_eq!(split_remote_arg("plain"), None);
     }
 
+    fn join_unix<const N: usize>(args: [&str; N]) -> Result<String> {
+        proxy_command_join_unix(&args.map(String::from))
+    }
+
+    fn join_windows<const N: usize>(args: [&str; N]) -> Result<String> {
+        proxy_command_join_windows(&args.map(String::from))
+    }
+
     #[test]
     fn quoting() {
-        assert_eq!(
-            proxy_command_join_unix(&["a b".into(), "it's".into(), "50%".into()]).unwrap(),
-            "'a b' 'it'\"'\"'s' '50%%'"
-        );
-        assert!(proxy_command_join_unix(&["a\nb".into()]).is_err());
-        assert_eq!(proxy_command_join_windows(&["C:\\x\\".into(), "y".into()]).unwrap(), "\"C:\\x\\\\\" \"y\"");
-        assert!(proxy_command_join_windows(&["100%".into()]).is_err());
+        assert_eq!(join_unix(["a b", "it's", "50%"]).unwrap(), "'a b' 'it'\"'\"'s' '50%%'");
+        assert!(join_unix(["a\nb"]).is_err());
+        assert_eq!(join_windows(["C:\\x\\", "y"]).unwrap(), "\"C:\\x\\\\\" \"y\"");
+        assert!(join_windows(["100%"]).is_err());
     }
 
     #[test]
@@ -445,17 +456,19 @@ mod tests {
         assert_eq!(validated_ssh_port("22").unwrap(), "22");
         assert_eq!(validated_ssh_port("10.0.0.1").unwrap(), "10.0.0.1:22");
         assert_eq!(validated_ssh_port("[fd7a::1]:2222").unwrap(), "[fd7a::1]:2222");
-        assert!(validated_ssh_port("0").is_err());
-        assert!(validated_ssh_port("10.0.0.1:0").is_err());
-        assert!(validated_ssh_port("host:22").is_err());
-        assert!(ssh_dest_host("tcabc").starts_with("tailcat-"));
-        assert_eq!(ssh_dest_host("tcabc").len(), "tailcat-".len() + 16);
+        for bad in ["0", "10.0.0.1:0", "host:22"] {
+            assert!(validated_ssh_port(bad).is_err(), "{bad:?} validated");
+        }
+
+        let host = ssh_dest_host("tcabc");
+        assert!(host.starts_with("tailcat-"));
+        assert_eq!(host.len(), "tailcat-".len() + 16);
+
         assert!(valid_github_user("bradfitz"));
         assert!(valid_github_user("a-b"));
-        assert!(!valid_github_user("-x"));
-        assert!(!valid_github_user("x-"));
-        assert!(!valid_github_user(""));
-        assert!(!valid_github_user(&"a".repeat(40)));
+        for bad in ["-x", "x-", "", &"a".repeat(40)] {
+            assert!(!valid_github_user(bad), "{bad:?} is valid");
+        }
     }
 
     #[test]
@@ -470,28 +483,35 @@ mod tests {
     /// hanging.
     #[tokio::test]
     async fn sftp_open_times_out() {
-        let (conn, _server) = tokio::io::duplex(1 << 16);
+        let (conn, _server) = duplex(1 << 16);
         let open = open_sftp(conn, "u".into(), Duration::from_millis(100));
-        let r = tokio::time::timeout(Duration::from_secs(5), open).await.expect("open_sftp outlived its timeout");
-        assert_eq!(r.err().expect("a silent server let us in").to_string(), "opening SFTP session: timed out");
+        let opened = timeout(Duration::from_secs(5), open).await.expect("open_sftp outlived its timeout");
+        let Err(e) = opened else { panic!("a silent server let us in") };
+        assert_eq!(e.to_string(), "opening SFTP session: timed out");
+    }
+
+    /// Why loading the authorized keys in `list` fails.
+    async fn load_err(list: impl Display) -> String {
+        load_authorized_keys(&list.to_string()).await.unwrap_err().to_string()
     }
 
     #[tokio::test]
     async fn authorized_key_sources() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("keys");
-        std::fs::write(&file, format!("# mine\n{KEY}\n")).unwrap();
+        fs::write(&file, format!("# mine\n{KEY}\n")).unwrap();
         let texts = load_authorized_keys(&format!("{KEY}, {}", file.display())).await.unwrap();
         assert_eq!(texts, [KEY.to_string(), format!("# mine\n{KEY}\n")]);
 
-        let err = |list: String| async move { load_authorized_keys(&list).await.unwrap_err().to_string() };
-        assert_eq!(err(format!("{KEY},")).await, "source 2 is empty");
-        assert!(err("ssh-ed25519 AAAA".into()).await.starts_with("source 1: invalid SSH public key"));
-        assert!(err("/nonexistent/keys".into()).await.starts_with("source 1: reading \"/nonexistent/keys\""));
-        assert!(err("-x@github".into()).await.contains("invalid GitHub username"));
-        std::fs::write(&file, "# no keys\n").unwrap();
-        assert!(err(file.display().to_string()).await.contains("no SSH public keys found"));
-        std::fs::write(&file, vec![b'#'; MAX_AUTHORIZED_KEYS_SIZE + 1]).unwrap();
-        assert!(err(file.display().to_string()).await.contains("file is larger than"));
+        assert_eq!(load_err(format!("{KEY},")).await, "source 2 is empty");
+        assert!(load_err("ssh-ed25519 AAAA").await.starts_with("source 1: invalid SSH public key"));
+        assert!(load_err("/nonexistent/keys").await.starts_with("source 1: reading \"/nonexistent/keys\""));
+        assert!(load_err("-x@github").await.contains("invalid GitHub username"));
+
+        fs::write(&file, "# no keys\n").unwrap();
+        assert!(load_err(file.display()).await.contains("no SSH public keys found"));
+
+        fs::write(&file, vec![b'#'; MAX_AUTHORIZED_KEYS_SIZE + 1]).unwrap();
+        assert!(load_err(file.display()).await.contains("file is larger than"));
     }
 }

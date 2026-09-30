@@ -9,69 +9,73 @@
 //! may come back to any other socket, and an association's tasks must
 //! end with its control connection.
 
+use std::mem;
+use std::net::Ipv4Addr;
 use std::sync::OnceLock;
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use tailcat::Server;
 use tailcat::derp::server::DevDerp;
+use tokio::runtime::{self, Runtime};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
+use super::tests::{datagram, global, udp_associate_via, udp_echo_server};
 use super::*;
 
 /// The proxy, a tailcat server that echoes every UDP flow, and the relay
 /// they share, set up once for every test case.
 struct World {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     proxy: SocketAddr,
     echo: Addr,
     _dev: DevDerp,
-    _server: tailcat::Server,
+    _server: Server,
+}
+
+/// Brings `c`'s tunnel up, which can lose the first datagrams, and gives
+/// the direct path to `server` a moment: a path switch mid-test could
+/// reorder datagrams in flight.
+async fn warm_up(c: &Client, server: &Server) {
+    let u = c.dial_udp_port(9).await.unwrap();
+    let mut buf = [0u8; 16];
+    loop {
+        u.send(b"up").await.unwrap();
+        if let Ok(Ok(_)) = timeout(Duration::from_millis(500), u.recv(&mut buf)).await {
+            break;
+        }
+    }
+    let ms = c.magicsock().unwrap();
+    for _ in 0..30 {
+        if ms.peer_path(&server.public_key()).and_then(|p| p.direct()).is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Runs a proxy with no default server that dials `server` with `echo`,
+/// and returns its address.
+async fn proxy_to(server: &Server, echo: Client, key: NodePrivate) -> SocketAddr {
+    let clients = Mutex::new(HashMap::from([(server.tailcat_addr(), echo)]));
+    let d = Dialer { g: global(), key, default: None, clients };
+    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = ln.local_addr().unwrap();
+    tokio::spawn(serve(ln, Arc::new(d)));
+    proxy
 }
 
 fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let rt = runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let (dev, server, proxy) = rt.block_on(async {
             let dev = DevDerp::start_local().await.unwrap();
-            let server = tailcat::Server::builder()
-                .region(dev.region.clone())
-                .on_udp(|_| {
-                    Some(tailcat::udp_handler(|c: tailcat::UdpConn| async move {
-                        let mut b = [0u8; 2048];
-                        while let Ok(n) = c.recv(&mut b).await {
-                            let _ = c.send(&b[..n]).await;
-                        }
-                    }))
-                })
-                .start()
-                .await
-                .unwrap();
-            let g = Global { key: None, verbose: false, json: false, derpmap_url: String::new() };
+            let server = udp_echo_server(&dev).await;
             let key = NodePrivate::generate();
-            let echo = crate::client::new_client(&g, server.tailcat_addr(), key.clone());
-            // Bring the tunnel up, which can lose the first datagrams, and
-            // give the direct path a moment: a path switch mid-test could
-            // reorder datagrams in flight.
-            let u = echo.dial_udp_port(9).await.unwrap();
-            let mut buf = [0u8; 16];
-            loop {
-                u.send(b"up").await.unwrap();
-                if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), u.recv(&mut buf)).await {
-                    break;
-                }
-            }
-            for _ in 0..30 {
-                let ms = echo.magicsock().unwrap();
-                if ms.peer_path(&server.public_key()).and_then(|p| p.direct()).is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let clients = Mutex::new(HashMap::from([(server.tailcat_addr(), echo)]));
-            let d = Dialer { g, key, default: None, clients };
-            let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let proxy = ln.local_addr().unwrap();
-            tokio::spawn(serve(ln, Arc::new(d)));
+            let echo = crate::client::new_client(&global(), server.tailcat_addr(), key.clone());
+            warm_up(&echo, &server).await;
+            let proxy = proxy_to(&server, echo, key).await;
             (dev, server, proxy)
         });
         let echo = server.tailcat_addr();
@@ -87,6 +91,11 @@ fn dsts(w: &World) -> [(String, u16); 3] {
 
 const UNDIALABLE: usize = 2;
 
+/// The destinations whose flows open.
+fn dialable() -> impl Iterator<Item = usize> {
+    (0..3).filter(|&i| i != UNDIALABLE)
+}
+
 /// How many local sockets send datagrams to each association.
 const SOCKETS: usize = 2;
 
@@ -100,11 +109,11 @@ struct Request {
 }
 
 impl Request {
-    const UNSPECIFIED: Request = Request { ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), socket: None };
+    const UNSPECIFIED: Request = Request { ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED), socket: None };
 
     fn draw(tc: &TestCase) -> Request {
         let ips = ["0.0.0.0", "127.0.0.1", "192.0.2.1"].map(|ip| ip.parse::<IpAddr>().unwrap());
-        let ip = ips[tc.draw(gs::integers::<usize>().max_value(ips.len() - 1))];
+        let ip = tc.draw(gs::sampled_from(&ips));
         let socket = tc.draw(gs::integers::<usize>().max_value(SOCKETS)).checked_sub(1);
         Request { ip, socket }
     }
@@ -118,21 +127,20 @@ struct Assoc {
     want: SocketAddr,
 }
 
-async fn associate(proxy: SocketAddr, req: Request) -> Assoc {
+/// `SOCKETS` local UDP sockets.
+async fn bind_sockets() -> [UdpSocket; SOCKETS] {
     let mut socks = Vec::new();
     for _ in 0..SOCKETS {
         socks.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     }
-    let socks: [UdpSocket; SOCKETS] = socks.try_into().unwrap();
-    let want = SocketAddr::new(req.ip, req.socket.map_or(0, |i| socks[i].local_addr().unwrap().port()));
-    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
-    let mut b = vec![5, 1, 0, 5, 3, 0];
-    put_addr(&mut b, &want.ip().to_string(), want.port());
-    ctrl.write_all(&b).await.unwrap();
-    let mut rep = [0u8; 12];
-    ctrl.read_exact(&mut rep).await.unwrap();
-    assert_eq!(rep[1], REP_SUCCESS);
-    let relay = SocketAddr::from((<[u8; 4]>::try_from(&rep[6..10]).unwrap(), u16::from_be_bytes([rep[10], rep[11]])));
+    socks.try_into().unwrap()
+}
+
+async fn associate(proxy: SocketAddr, req: Request) -> Assoc {
+    let socks = bind_sockets().await;
+    let port = req.socket.map_or(0, |i| socks[i].local_addr().unwrap().port());
+    let want = SocketAddr::new(req.ip, port);
+    let (ctrl, relay) = udp_associate_via(proxy, want).await;
     Assoc { ctrl, relay, socks, want }
 }
 
@@ -178,10 +186,9 @@ impl Socks {
 
     /// Sends `n` datagrams to destination `i` from socket `j`.
     fn burst(&mut self, i: usize, j: usize, n: usize) {
+        let (host, port) = self.dsts[i].clone();
         for _ in 0..n {
-            let mut b = vec![0, 0, 0];
-            put_addr(&mut b, &self.dsts[i].0, self.dsts[i].1);
-            b.extend(self.next.to_be_bytes());
+            let b = datagram(&host, port, &self.next.to_be_bytes());
             self.w.rt.block_on(self.assoc.socks[j].send_to(&b, self.assoc.relay)).unwrap();
             if self.admits(j) {
                 self.sent[i].push(self.next);
@@ -194,26 +201,12 @@ impl Socks {
     /// comes back to it, and that nothing else comes back to anyone.
     fn check(&mut self) {
         self.collect(Duration::from_secs(3));
-        for i in 0..3 {
-            if i != UNDIALABLE {
-                assert_eq!(self.got[i], self.sent[i], "{:?}: datagrams lost", self.dsts[i]);
-            }
+        for i in dialable() {
+            assert_eq!(self.got[i], self.sent[i], "{:?}: datagrams lost", self.dsts[i]);
         }
-        let Socks { w, assoc, client, .. } = self;
-        let [a, b] = &assoc.socks;
-        let (mut ba, mut bb) = ([0u8; 2048], [0u8; 2048]);
-        let stray = w.rt.block_on(async {
-            let recv = async {
-                tokio::select! {
-                    _ = a.recv_from(&mut ba) => 0,
-                    _ = b.recv_from(&mut bb) => 1,
-                }
-            };
-            tokio::time::timeout(Duration::from_millis(50), recv).await
-        });
-        if let Ok(j) = stray {
-            panic!("socket {j} got a stray reply (client {client:?}, request {})", assoc.want);
-        }
+        let stray = self.w.rt.block_on(first_to_receive(&self.assoc.socks, Duration::from_millis(50)));
+        let (client, request) = (self.client, self.assoc.want);
+        assert_eq!(stray, None, "a socket got a stray reply (client {client:?}, request {request})");
     }
 
     /// Reads echoes until every datagram the client sent to a flow that
@@ -225,22 +218,52 @@ impl Socks {
         let sock = &assoc.socks[client];
         w.rt.block_on(async {
             let mut buf = [0u8; 2048];
-            let done = |got: &[Vec<u32>; 3]| (0..3).all(|i| i == UNDIALABLE || got[i].len() == sent[i].len());
-            let end = tokio::time::Instant::now() + deadline;
-            while !done(got) {
-                let Ok(r) = tokio::time::timeout_at(end, sock.recv_from(&mut buf)).await else { return };
+            let end = Instant::now() + deadline;
+            while !dialable().all(|i| got[i].len() == sent[i].len()) {
+                let Ok(r) = timeout_at(end, sock.recv_from(&mut buf)).await else { return };
                 let (n, from) = r.unwrap();
                 assert_eq!(from, assoc.relay);
-                assert!(n > 3 && buf[..3] == [0, 0, 0], "bad header {:?}", &buf[..n.min(8)]);
-                let (dst, payload) = parse_addr(&buf[3..n]).expect("bad reply address");
+                let (dst, seq) = parse_echo(&buf[..n]);
                 let i = dsts.iter().position(|d| *d == dst).expect("reply from an unknown destination");
                 assert_ne!(i, UNDIALABLE, "a reply from a flow that can't open");
-                got[i].push(u32::from_be_bytes(payload.try_into().unwrap()));
-                let k = got[i].len();
-                assert!(k <= sent[i].len() && got[i] == sent[i][..k], "{dst:?}: sent {:?}, got {:?}", sent[i], got[i]);
+                got[i].push(seq);
+                assert!(sent[i].starts_with(&got[i]), "{dst:?}: sent {:?}, got {:?}", sent[i], got[i]);
             }
         });
     }
+}
+
+/// An echoed datagram's destination and sequence number.
+fn parse_echo(d: &[u8]) -> ((String, u16), u32) {
+    assert!(d.len() > 3 && d[..3] == [0, 0, 0], "bad header {:?}", &d[..d.len().min(8)]);
+    let (dst, payload) = parse_addr(&d[3..]).expect("bad reply address");
+    (dst, u32::from_be_bytes(payload.try_into().unwrap()))
+}
+
+/// The index of the first of `socks` to receive a datagram within
+/// `limit`, if any does.
+async fn first_to_receive(socks: &[UdpSocket; SOCKETS], limit: Duration) -> Option<usize> {
+    let [a, b] = socks;
+    let (mut ba, mut bb) = ([0u8; 2048], [0u8; 2048]);
+    let recv = async {
+        tokio::select! {
+            _ = a.recv_from(&mut ba) => 0,
+            _ = b.recv_from(&mut bb) => 1,
+        }
+    };
+    timeout(limit, recv).await.ok()
+}
+
+/// Whether `addr` can be bound again within two seconds, once nothing
+/// holds it.
+async fn frees_up(addr: SocketAddr) -> bool {
+    for _ in 0..100 {
+        if UdpSocket::bind(addr).await.is_ok() {
+            return true;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    false
 }
 
 #[hegel::state_machine]
@@ -265,18 +288,14 @@ impl Socks {
     #[rule]
     fn reassociate(&mut self, tc: TestCase) {
         let w = self.w;
-        let old = std::mem::replace(&mut self.assoc, w.rt.block_on(associate(w.proxy, Request::draw(&tc))));
+        let new = w.rt.block_on(associate(w.proxy, Request::draw(&tc)));
+        let old = mem::replace(&mut self.assoc, new);
+
         drop(old.ctrl);
+
         // The relay socket is free again once nothing holds it.
-        w.rt.block_on(async {
-            for _ in 0..100 {
-                if UdpSocket::bind(old.relay).await.is_ok() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            panic!("the association's relay outlived its control connection");
-        });
+        let freed = w.rt.block_on(frees_up(old.relay));
+        assert!(freed, "the association's relay outlived its control connection");
         (self.client, self.sent, self.got) = Default::default();
     }
 }

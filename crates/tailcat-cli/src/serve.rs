@@ -590,73 +590,89 @@ pub fn parse_files_flag(v: &str) -> Result<(tailcat::ssh::FileService, &'static 
 
 #[cfg(test)]
 mod tests {
+    use tailcat::Client;
+    use tailcat::derp::server::DevDerp;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::watch;
+    use tokio::time::{sleep, timeout};
+
     use super::*;
 
     #[test]
     fn port_sets() {
         let ps = parse_port_set("22, 80,8000-8002,exec").unwrap();
-        assert_eq!(ps.ports.iter().copied().collect::<Vec<_>>(), vec![22, 80, 8000, 8001, 8002]);
+        assert_eq!(ps.ports, BTreeSet::from([22, 80, 8000, 8001, 8002]));
         assert!(ps.services.contains("exec"));
+
         let ps = parse_port_set("5555:10.2.200.213:5555,8080:80,9:[fd7a::1]:22").unwrap();
         assert_eq!(ps.targets[&5555], "10.2.200.213:5555");
         assert_eq!(ps.targets[&8080], "localhost:80");
         assert_eq!(ps.targets[&9], "[fd7a::1]:22");
-        assert!(parse_port_set("bogus").is_err());
-        assert!(parse_port_set("0:80").is_err());
-        assert!(parse_port_set("80:host").is_err());
-        assert!(parse_port_set("80:1,80:2").is_err());
+
         assert!(parse_port_set("all").unwrap().contains(443));
         assert_eq!(parse_port_set("9-7").unwrap().ports.len(), 3);
         assert!(parse_port_set("").unwrap().is_empty());
+        for bad in ["bogus", "0:80", "80:host", "80:1,80:2"] {
+            assert!(parse_port_set(bad).is_err(), "{bad:?} parsed");
+        }
     }
 
     #[test]
     fn port_set_edges() {
         // "all" admits every port but 0, and isn't a service.
         let ps = parse_port_set(" all , perf ").unwrap();
-        assert!(ps.all && !ps.contains(0) && ps.contains(65535));
-        assert_eq!(ps.services.iter().collect::<Vec<_>>(), ["perf"]);
+        assert!(ps.all);
+        assert!(!ps.contains(0));
+        assert!(ps.contains(65535));
+        assert_eq!(ps.services, BTreeSet::from(["perf".into()]));
         assert_eq!(ps.sorted_ports().len(), 65535);
         // SSH services need SSH support.
         assert_eq!(parse_port_set("files").is_ok(), cfg!(feature = "ssh"));
+
         let ps = parse_port_set("exec,exit-node").unwrap();
         assert!(ps.is_empty());
         assert_eq!(ps.services.len(), 2);
+
         // The same mapping twice is fine; mapping a port also serves it.
         let ps = parse_port_set("80:8080,80:8080").unwrap();
-        assert_eq!((ps.targets.len(), ps.contains(80)), (1, true));
+        assert_eq!(ps.targets.len(), 1);
+        assert!(ps.contains(80));
+
         for bad in ["65536", "1-65536", "80-", "-80", "a-b", "80:host:0", "80::22", "80:[::1]"] {
             assert!(parse_port_set(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    /// A handler that notes in `ran` that it ran, then answers "ok".
+    fn answer_ok(ran: Arc<AtomicBool>) -> TcpHandler {
+        handler(move |mut c: TcpStream| {
+            ran.store(true, Ordering::Relaxed);
+            async move {
+                let _ = c.write_all(b"ok").await;
+                let _ = c.shutdown().await;
+                c.drain(Duration::from_secs(5)).await;
+            }
+        })
     }
 
     /// A connection that arrives before the server is ready waits for it
     /// instead of reaching a handler whose server cells are still empty.
     #[tokio::test]
     async fn handlers_wait_for_start() {
-        use tokio::io::AsyncReadExt;
-        let dev = tailcat::derp::server::DevDerp::start_local().await.unwrap();
-        let (ready_tx, ready) = tokio::sync::watch::channel(false);
+        let dev = DevDerp::start_local().await.unwrap();
+        let (ready_tx, ready) = watch::channel(false);
         let ran = Arc::new(AtomicBool::new(false));
-        let h = after_start(ready, {
-            let ran = ran.clone();
-            handler(move |mut c: TcpStream| {
-                ran.store(true, Ordering::Relaxed);
-                async move {
-                    let _ = c.write_all(b"ok").await;
-                    let _ = c.shutdown().await;
-                    c.drain(Duration::from_secs(5)).await;
-                }
-            })
-        });
+        let h = after_start(ready, answer_ok(ran.clone()));
         let s = Server::builder().region(dev.region.clone()).on_tcp(move |_| Some(h.clone())).start().await.unwrap();
-        let cl = tailcat::Client::new(s.tailcat_addr());
-        let mut c = tokio::time::timeout(Duration::from_secs(15), cl.dial_tcp_port(1)).await.unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cl = Client::new(s.tailcat_addr());
+        let mut c = timeout(Duration::from_secs(15), cl.dial_tcp_port(1)).await.expect("dial timed out").unwrap();
+
+        sleep(Duration::from_millis(200)).await;
         assert!(!ran.load(Ordering::Relaxed), "the handler ran before the server was ready");
+
         ready_tx.send_replace(true);
         let mut got = String::new();
-        tokio::time::timeout(Duration::from_secs(10), c.read_to_string(&mut got)).await.unwrap().unwrap();
+        timeout(Duration::from_secs(10), c.read_to_string(&mut got)).await.expect("read timed out").unwrap();
         assert_eq!(got, "ok");
     }
 
@@ -676,7 +692,10 @@ mod tests {
     #[cfg(feature = "ssh")]
     #[test]
     fn files_flags() {
+        use std::{env, fs};
+
         use tailcat::ssh::FileServeMode as M;
+
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
         for (suffix, mode, name) in [
@@ -686,15 +705,19 @@ mod tests {
             (":wo", M::WriteOnly, "flat write-only"),
             (":wo+", M::WriteOnlyTree, "recursive write-only"),
         ] {
-            let (fs, n) = parse_files_flag(&format!("{d}{suffix}")).unwrap();
-            assert_eq!((fs.dir.as_path(), fs.mode, n), (dir.path(), mode, name));
+            let (svc, n) = parse_files_flag(&format!("{d}{suffix}")).unwrap();
+            assert_eq!((svc.dir.as_path(), svc.mode, n), (dir.path(), mode, name));
         }
-        let (fs, _) = parse_files_flag(":rw").unwrap();
-        assert_eq!(fs.dir, std::env::current_dir().unwrap());
+
+        let (cwd, _) = parse_files_flag(":rw").unwrap();
+        assert_eq!(cwd.dir, env::current_dir().unwrap());
+
         let file = dir.path().join("f");
-        std::fs::write(&file, "").unwrap();
+        fs::write(&file, "").unwrap();
         let e = parse_files_flag(file.to_str().unwrap()).unwrap_err();
         assert!(e.is::<crate::UsageError>());
-        assert!(parse_files_flag(dir.path().join("missing").to_str().unwrap()).is_err());
+
+        let missing = dir.path().join("missing");
+        assert!(parse_files_flag(missing.to_str().unwrap()).is_err());
     }
 }

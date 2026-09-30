@@ -210,6 +210,16 @@ pub fn join_host_port(host: &str, port: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::future::ready;
+    use std::io::{self, ErrorKind};
+    use std::time::Instant;
+    use std::{fs, thread};
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -229,26 +239,31 @@ mod tests {
     }
 
     #[hegel::test]
-    fn parse_duration_never_panics(tc: hegel::TestCase) {
+    fn parse_duration_never_panics(tc: TestCase) {
         // Mostly digits, to reach huge values, among the units.
-        let s = tc.draw(hegel::generators::text().alphabet("0123456789.nuµmsh ").max_size(60));
+        let s = tc.draw(gs::text().alphabet("0123456789.nuµmsh ").max_size(60));
         let _ = parse_duration(&s);
     }
 
+    /// How far `fmt_duration` rounds `d`: to whole µs, 0.01ms, or 1ms.
+    fn rounding(d: Duration) -> Duration {
+        if d < Duration::from_millis(1) {
+            Duration::from_micros(1)
+        } else if d < Duration::from_secs(1) {
+            Duration::from_micros(6)
+        } else {
+            Duration::from_micros(501)
+        }
+    }
+
     #[hegel::test]
-    fn formatted_durations_parse_back(tc: hegel::TestCase) {
+    fn formatted_durations_parse_back(tc: TestCase) {
         // Up to about 31 years.
-        let d =
-            Duration::from_nanos(tc.draw(hegel::generators::integers::<u64>().max_value(1_000_000_000_000_000_000)));
+        let nanos = tc.draw(gs::integers::<u64>().max_value(1_000_000_000_000_000_000));
+        let d = Duration::from_nanos(nanos);
         let s = fmt_duration(d);
         let parsed = parse_duration(&s).unwrap_or_else(|e| panic!("{s}: {e}"));
-        // fmt_duration rounds: to whole µs, 0.01ms, or 1ms.
-        let tolerance = match d {
-            _ if d < Duration::from_millis(1) => Duration::from_micros(1),
-            _ if d < Duration::from_secs(1) => Duration::from_micros(6),
-            _ => Duration::from_micros(501),
-        };
-        assert!(parsed.abs_diff(d) <= tolerance, "{d:?} formatted as {s} parsed as {parsed:?}");
+        assert!(parsed.abs_diff(d) <= rounding(d), "{d:?} formatted as {s} parsed as {parsed:?}");
     }
 
     #[test]
@@ -265,22 +280,36 @@ mod tests {
         assert_eq!(split_host_port("[::1]:22").unwrap(), ("::1".into(), 22));
         assert_eq!(split_host_port("localhost:80").unwrap(), ("localhost".into(), 80));
         assert_eq!(split_host_port(":80").unwrap(), ("".into(), 80));
-        assert!(split_host_port("localhost").is_err());
-        assert!(split_host_port("[::1]22").is_err());
-        assert!(split_host_port("host:99999").is_err());
+        for bad in ["localhost", "[::1]22", "host:99999"] {
+            assert!(split_host_port(bad).is_err(), "{bad:?} split");
+        }
         assert_eq!(join_host_port("fd7a::1", 5), "[fd7a::1]:5");
         assert_eq!(join_host_port("example.com", 5), "example.com:5");
     }
 
     #[tokio::test]
     async fn dials_localhost_without_dns() {
-        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = ln.local_addr().unwrap().port();
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
         for host in ["localhost", "LocalHost", "app.localhost", "127.0.0.1"] {
-            let c = dial_local(&format!("{host}:{port}")).await.unwrap();
-            assert_eq!(c.peer_addr().unwrap(), ln.local_addr().unwrap());
+            let c = dial_local(&format!("{host}:{}", addr.port())).await.unwrap();
+            assert_eq!(c.peer_addr().unwrap(), addr);
         }
         assert!(dial_local("localhost").await.is_err());
+    }
+
+    /// `p`'s permission bits.
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn file_names(dir: &Path) -> Vec<OsString> {
+        let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        names
     }
 
     #[cfg(unix)]
@@ -289,22 +318,42 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         replace_private(&p, b"long contents").unwrap();
         replace_private(&p, b"short").unwrap();
-        assert_eq!(std::fs::read(&p).unwrap(), b"short");
+        assert_eq!(fs::read(&p).unwrap(), b"short");
         assert_eq!(mode(&p), 0o600);
+
         // Replacing a world-readable file leaves an owner-only one.
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         replace_private(&p, b"secret").unwrap();
         assert_eq!(mode(&p), 0o600);
+
         let q = dir.path().join("g");
         create_private(&q, b"new").unwrap();
-        assert_eq!((std::fs::read(&q).unwrap(), mode(&q)), (b"new".to_vec(), 0o600));
+        assert_eq!(fs::read(&q).unwrap(), b"new");
+        assert_eq!(mode(&q), 0o600);
+
         // No temporary files are left behind.
-        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-        names.sort();
-        assert_eq!(names, ["f", "g"]);
+        assert_eq!(file_names(dir.path()), ["f", "g"]);
+    }
+
+    /// Whether a `create_private` created its file, rather than finding one
+    /// there already.
+    fn created(r: io::Result<()>) -> bool {
+        match r {
+            Ok(()) => true,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => false,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Races `n` threads to create `path`, each with its own contents,
+    /// and returns which of them did.
+    fn race_to_create(path: &Path, n: u8) -> Vec<bool> {
+        thread::scope(|s| {
+            let racers: Vec<_> = (0..n).map(|i| s.spawn(move || created(create_private(path, &[i; 4096])))).collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        })
     }
 
     #[test]
@@ -312,35 +361,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("key");
         // Of racing creators, exactly one wins, and its file is whole.
-        let wins: Vec<bool> = std::thread::scope(|s| {
-            let racers: Vec<_> = (0..8u8)
-                .map(|i| {
-                    let p = &p;
-                    s.spawn(move || match create_private(p, &[i; 4096]) {
-                        Ok(()) => true,
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-                        Err(e) => panic!("{e}"),
-                    })
-                })
-                .collect();
-            racers.into_iter().map(|r| r.join().unwrap()).collect()
-        });
+        let wins = race_to_create(&p, 8);
         assert_eq!(wins.iter().filter(|w| **w).count(), 1, "{wins:?}");
         let winner = wins.iter().position(|w| *w).unwrap() as u8;
-        assert_eq!(std::fs::read(&p).unwrap(), [winner; 4096]);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(fs::read(&p).unwrap(), [winner; 4096]);
+        assert_eq!(file_names(dir.path()), ["key"]);
     }
 
     #[tokio::test]
     async fn accept_rides_out_errors() {
-        let mut results = vec![
-            Err(std::io::Error::from_raw_os_error(24)), // EMFILE
-            Err(std::io::ErrorKind::ConnectionAborted.into()),
-            Ok(7),
-        ]
-        .into_iter();
-        let t0 = std::time::Instant::now();
-        assert_eq!(accept(|| std::future::ready(results.next().unwrap())).await, 7);
+        let emfile = io::Error::from_raw_os_error(24);
+        let mut results = [Err(emfile), Err(ErrorKind::ConnectionAborted.into()), Ok(7)].into_iter();
+        let t0 = Instant::now();
+        let accepted = accept(|| ready(results.next().unwrap())).await;
+        assert_eq!(accepted, 7);
         // It backed off (5ms, then 10ms) between tries.
         assert!(t0.elapsed() >= Duration::from_millis(15));
     }
