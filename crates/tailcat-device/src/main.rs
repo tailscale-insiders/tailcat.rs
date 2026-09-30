@@ -349,9 +349,7 @@ async fn serve(derpmap_url: &str, a: UpArgs) -> Result<()> {
             {
                 ready = true;
                 info!("overlay: all {n} peers reachable");
-                if let Some(f) = &a.ready_file
-                    && let Err(e) = record::write_atomic(f, b"ready\n")
-                {
+                if let Some(Err(e)) = a.ready_file.as_ref().map(|f| record::write_atomic(f, b"ready\n")) {
                     warn!("{e:#}");
                 }
             }
