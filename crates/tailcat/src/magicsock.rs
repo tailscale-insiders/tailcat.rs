@@ -74,6 +74,19 @@ pub struct WireguardPacket {
     pub data: Vec<u8>,
 }
 
+impl WireguardPacket {
+    /// A packet from `src` over UDP, from `peer` if the address is known.
+    pub fn udp(peer: Option<NodePublic>, src: SocketAddr, data: impl Into<Vec<u8>>) -> Self {
+        WireguardPacket { peer, src: PathAddr::Udp(src), data: data.into() }
+    }
+
+    /// A packet `peer` sent through region `region_id`'s relay, which
+    /// vouches for who sent it.
+    pub fn derp(region_id: i32, peer: NodePublic, data: impl Into<Vec<u8>>) -> Self {
+        WireguardPacket { peer: Some(peer), src: PathAddr::Derp(region_id), data: data.into() }
+    }
+}
+
 /// A hook consulted for every non-disco packet received from DERP before
 /// it's treated as WireGuard. Returning true consumes the packet.
 pub type DerpRecvHook = Arc<dyn Fn(i32, NodePublic, &[u8]) -> bool + Send + Sync>;
@@ -729,7 +742,7 @@ impl MagicSock {
             p.last_recv = Some(Instant::now());
         }
         drop(inner);
-        let _ = self.wg_tx.try_send(WireguardPacket { peer, src: PathAddr::Udp(src), data: pkt.to_vec() });
+        let _ = self.wg_tx.try_send(WireguardPacket::udp(peer, src, pkt));
     }
 
     fn handle_derp(&self, rp: ReceivedPacket) {
@@ -748,11 +761,7 @@ impl MagicSock {
             p.last_recv = Some(Instant::now());
         }
         drop(inner);
-        let _ = self.wg_tx.try_send(WireguardPacket {
-            peer: Some(rp.src),
-            src: PathAddr::Derp(rp.region_id),
-            data: rp.data,
-        });
+        let _ = self.wg_tx.try_send(WireguardPacket::derp(rp.region_id, rp.src, rp.data));
     }
 
     fn handle_stun(&self, pkt: &[u8]) {

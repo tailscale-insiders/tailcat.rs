@@ -177,7 +177,7 @@ impl Mesh {
             rounds += 1;
             assert!(rounds < 20, "packets bounce forever");
             for (i, data) in mem::take(&mut to_engine) {
-                let pkt = WireguardPacket { peer: Some(self.public(i)), src: PathAddr::Derp(1), data };
+                let pkt = WireguardPacket::derp(1, self.public(i), data);
                 self.rt.block_on(self.engine.handle(pkt));
             }
             to_engine = self.flush_sent();

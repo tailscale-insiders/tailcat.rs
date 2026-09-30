@@ -481,7 +481,7 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::OnceLock;
 
     use hegel::TestCase;
@@ -676,8 +676,8 @@ mod tests {
     }
 
     /// A UDP source address, which vouches for no one.
-    fn udp_src() -> PathAddr {
-        PathAddr::Udp("192.0.2.1:41641".parse().unwrap())
+    fn udp_src() -> SocketAddr {
+        "192.0.2.1:41641".parse().unwrap()
     }
 
     /// A handshake initiation from `from` to `to`.
@@ -728,7 +728,7 @@ mod tests {
             1 => handshake_init(sender, &key.public()),
             kind => addressed_to(kind, engine.peer(&sender.public()).unwrap().index),
         };
-        let src = if over_derp { PathAddr::Derp(1) } else { udp_src() };
+        let src = if over_derp { PathAddr::Derp(1) } else { PathAddr::Udp(udp_src()) };
 
         let got = engine.identify(&WireguardPacket { peer: label, src, data }).map(|p| p.key);
 
@@ -754,7 +754,7 @@ mod tests {
         let (engine, key) = offline(Some(lookup));
         slot.set(Arc::downgrade(&engine)).unwrap();
         let client = NodePrivate::generate();
-        let pkt = WireguardPacket { peer: None, src: udp_src(), data: handshake_init(&client, &key.public()) };
+        let pkt = WireguardPacket::udp(None, udp_src(), handshake_init(&client, &key.public()));
         (engine, client.public(), pkt)
     }
 
