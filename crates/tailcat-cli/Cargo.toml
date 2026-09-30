@@ -17,6 +17,7 @@ ssh = ["tailcat/ssh", "dep:russh", "dep:russh-sftp"]
 
 [dependencies]
 tailcat.workspace = true
+tailcat-args.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

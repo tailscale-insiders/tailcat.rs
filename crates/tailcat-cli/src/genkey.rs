@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args};
-use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, PresharedKey, PrivateKey, RegionArg};
+use tailcat::{DerpMap, DerpNode, DerpRegion, FetchMode, PresharedKey, PrivateKey, RegionChoice};
+use tailcat_args::RegionArg;
 
 use crate::{Global, usagef};
 
@@ -42,7 +43,7 @@ pub struct GenkeyArgs {
 pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     let key = g.key.as_deref().unwrap_or("");
     let region_set = a.region.is_some();
-    let region = a.region.unwrap_or(RegionArg::Auto);
+    let region = a.region.unwrap_or(RegionArg::Choice(RegionChoice::Nearest));
     let listing = region == RegionArg::List;
     // Whether to find the nearest region now, rather than at each start.
     let mut pick_now = false;
@@ -105,12 +106,12 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
         pick_now = true;
     }
     if a.embed_derp_map {
-        if region_set && region == RegionArg::Auto {
+        if region_set && region == RegionArg::Choice(RegionChoice::Nearest) {
             return Err(usagef!(
                 "genkey --embed-derp-map and --region=auto are mutually exclusive; embedding needs a region chosen now, so use --fixed-region or name a region with --region"
             ));
         }
-        if matches!(region, RegionArg::Hosts(_)) {
+        if matches!(region, RegionArg::Choice(RegionChoice::Custom(_))) {
             return Err(usagef!(
                 "genkey --embed-derp-map does not take DERP hostnames in --region; naming hosts already embeds them in the address"
             ));
@@ -157,7 +158,10 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
     }
 
     let ci = &mut priv_key.public;
-    let dm = if pick_now || a.embed_derp_map || matches!(region, RegionArg::Name(_) | RegionArg::List) {
+    let dm = if pick_now
+        || a.embed_derp_map
+        || matches!(region, RegionArg::Choice(RegionChoice::Named(_)) | RegionArg::List)
+    {
         let fetch = tailcat::derpmap::fetch_derp_map(crate::cache::fetch_options(g, FetchMode::Server));
         tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
@@ -171,30 +175,33 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
             eprintln!("  {:3} {} {}", r.region_id, r.region_code, r.region_name);
         }
     };
+    let choice = match region {
+        RegionArg::List => {
+            list();
+            return Ok(());
+        }
+        RegionArg::Choice(c) => c,
+    };
     if pick_now {
         ci.region_id = tailcat::netcheck::pick_best_region(&dm)
             .await?
             .ok_or_else(|| anyhow!("couldn't determine the closest DERP region; specify --region"))?;
     } else {
-        match &region {
+        match &choice {
             // Picked at each server start.
-            RegionArg::Auto => ci.region_id = -1,
-            RegionArg::Id(n) => ci.region_id = *n,
-            RegionArg::Hosts(hosts) => {
-                let nodes = hosts.iter().map(|h| DerpNode { host_name: h.as_str().into(), ..Default::default() });
+            RegionChoice::Nearest => ci.region_id = -1,
+            RegionChoice::Id(n) => ci.region_id = *n,
+            RegionChoice::Custom(hosts) => {
+                let nodes = hosts.iter().map(|h| DerpNode { host_name: h.clone(), ..Default::default() });
                 ci.region.push(DerpRegion { nodes: nodes.collect(), ..Default::default() });
             }
-            RegionArg::Name(n) => match region.find(&dm) {
+            RegionChoice::Named(n) => match choice.find(&dm) {
                 Some(id) => ci.region_id = id,
                 None => {
                     list();
                     bail!("\nno region found matching {n:?}");
                 }
             },
-            RegionArg::List => {
-                list();
-                return Ok(());
-            }
         }
     }
     if a.embed_derp_map {
