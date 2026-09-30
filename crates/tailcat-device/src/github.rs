@@ -8,9 +8,9 @@
 //! nothing by existing, so they must carry an OIDC token whose audience
 //! is the record's node key and whose claims match ours.
 
-use std::fmt;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::time::Duration;
+use std::{env, fmt};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::{IntoUrl, RequestBuilder, Response, Url};
@@ -113,18 +113,18 @@ pub struct GithubEnv {
 impl GithubEnv {
     /// Reads the environment GitHub Actions sets for every step.
     pub fn from_env() -> Result<GithubEnv> {
-        let env = |k| std::env::var(k).unwrap_or_default();
+        let var = |k| env::var(k).unwrap_or_default();
         let e = GithubEnv {
-            api_url: std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
-            repository: env("GITHUB_REPOSITORY"),
-            repository_id: RepositoryId::given(&env("GITHUB_REPOSITORY_ID")),
-            run_id: env("GITHUB_RUN_ID").into(),
-            run_attempt: env("GITHUB_RUN_ATTEMPT").into(),
-            git_ref: env("GITHUB_REF"),
-            ref_name: env("GITHUB_REF_NAME"),
-            head_ref: env("GITHUB_HEAD_REF"),
-            workflow_ref: env("GITHUB_WORKFLOW_REF"),
-            token: env("GITHUB_TOKEN"),
+            api_url: env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
+            repository: var("GITHUB_REPOSITORY"),
+            repository_id: RepositoryId::given(&var("GITHUB_REPOSITORY_ID")),
+            run_id: var("GITHUB_RUN_ID").into(),
+            run_attempt: var("GITHUB_RUN_ATTEMPT").into(),
+            git_ref: var("GITHUB_REF"),
+            ref_name: var("GITHUB_REF_NAME"),
+            head_ref: var("GITHUB_HEAD_REF"),
+            workflow_ref: var("GITHUB_WORKFLOW_REF"),
+            token: var("GITHUB_TOKEN"),
         };
         ensure!(
             !e.repository.is_empty() && !e.run_id.as_str().is_empty(),
@@ -171,6 +171,7 @@ impl Artifact {
     /// When it was uploaded, in Unix seconds, if GitHub says.
     pub fn uploaded(&self) -> Option<u64> {
         use time::format_description::well_known::Rfc3339;
+
         let t = time::OffsetDateTime::parse(self.created_at.as_deref()?, &Rfc3339).ok()?;
         u64::try_from(t.unix_timestamp()).ok()
     }
@@ -250,7 +251,7 @@ pub async fn download(e: &GithubEnv, a: &Artifact) -> Result<Vec<u8>> {
     if !body.starts_with(b"PK\x03\x04") {
         return Ok(body.into());
     }
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(body)).context("opening the artifact zip")?;
+    let mut z = zip::ZipArchive::new(Cursor::new(body)).context("opening the artifact zip")?;
     ensure!(!z.is_empty(), "artifact {} is an empty zip", a.name);
     let mut out = Vec::new();
     z.by_index(0)?.take(1 << 20).read_to_end(&mut out)?;
@@ -264,10 +265,10 @@ pub async fn mint_oidc(audience: &str) -> Result<Jwt> {
     struct Resp {
         value: String,
     }
-    let url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
+    let url = env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
         anyhow!("ACTIONS_ID_TOKEN_REQUEST_URL is unset; the job needs `permissions: id-token: write` (and fork PRs can't mint tokens)")
     })?;
-    let tok = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is unset")?;
+    let tok = env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is unset")?;
     let mut url = Url::parse(&url).context("parsing ACTIONS_ID_TOKEN_REQUEST_URL")?;
     url.query_pairs_mut().append_pair("audience", audience);
     let req = tailcat::shared_client().get(url).bearer_auth(tok).timeout(Duration::from_secs(15));
