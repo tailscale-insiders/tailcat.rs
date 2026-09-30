@@ -904,6 +904,13 @@ impl Test {
         }
     }
 
+    /// Whether data is still to come: the peer hasn't said it's done
+    /// sending, and the test isn't over. Until then, a failed read fails
+    /// the test.
+    fn expects_data(&self) -> bool {
+        !self.peer_sent.arrived.is_set() && !self.done.is_set()
+    }
+
     /// Resolves once the peer said it's done sending and the grace
     /// period for in-flight data has passed.
     async fn grace_expired(&self) {
@@ -948,10 +955,7 @@ impl Test {
             }
         }
         .await;
-        if let Err(e) = res
-            && !self.peer_sent.arrived.is_set()
-            && !self.done.is_set()
-        {
+        if let Some(e) = res.err().filter(|_| self.expects_data()) {
             self.fail(format!("stream {i}: read: {e}"));
         }
         st
