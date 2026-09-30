@@ -12,6 +12,8 @@
 pub mod client;
 pub mod server;
 
+use std::io::{self, ErrorKind};
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -77,13 +79,13 @@ pub const PEER_GONE_DISCONNECTED: u8 = 0x00;
 pub const PEER_GONE_NOT_HERE: u8 = 0x01;
 
 /// Reads one frame, returning its raw type byte and payload.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> std::io::Result<(u8, Vec<u8>)> {
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     r.read_exact(&mut hdr).await?;
     let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
     if len > max {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
             format!("DERP frame of {len} bytes exceeds limit of {max}"),
         ));
     }
@@ -105,7 +107,7 @@ pub fn frame(t: FrameType, parts: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Writes and flushes one frame.
-pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, t: FrameType, parts: &[&[u8]]) -> std::io::Result<()> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, t: FrameType, parts: &[&[u8]]) -> io::Result<()> {
     w.write_all(&frame(t, parts)).await?;
     w.flush().await
 }
@@ -116,7 +118,7 @@ async fn write_queued<W: AsyncWrite + Unpin>(
     w: &mut W,
     first: Vec<u8>,
     rx: &mut mpsc::Receiver<Vec<u8>>,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     w.write_all(&first).await?;
     while let Ok(f) = rx.try_recv() {
         w.write_all(&f).await?;
@@ -194,8 +196,6 @@ pub fn valid_app_name(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
-
     use super::*;
 
     #[test]
