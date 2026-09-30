@@ -3,9 +3,9 @@
 //! as Tailscale's `types/key` package so that key files and addresses
 //! interoperate with the Go implementation.
 
-use std::fmt;
 use std::net::Ipv6Addr;
 use std::str::FromStr;
+use std::{fmt, hint, iter};
 
 use base64::Engine as _;
 use boringtun::x25519;
@@ -69,7 +69,7 @@ fn short_string(k: &[u8; KEY_LEN]) -> String {
 
 /// Constant-time equality of two byte slices.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && std::hint::black_box(a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y))) == 0
+    a.len() == b.len() && hint::black_box(a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y))) == 0
 }
 
 /// Defines a 32-byte key type with raw-byte accessors and a
@@ -312,7 +312,7 @@ key_type! {
 impl PresharedKey {
     /// Generates a new random, non-zero pre-shared key.
     pub fn generate() -> Self {
-        std::iter::repeat_with(|| PresharedKey(random_bytes())).find(|k| !k.is_zero()).unwrap()
+        iter::repeat_with(|| PresharedKey(random_bytes())).find(|k| !k.is_zero()).unwrap()
     }
 
     /// Returns the key for the WireGuard engine, or `None` if zero.
