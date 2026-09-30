@@ -126,6 +126,17 @@ struct PendingAccept {
     since: tokio::time::Instant,
 }
 
+/// What a poll of the stack leaves for the poll loop.
+struct Polled {
+    /// Packets to send.
+    out: VecDeque<Vec<u8>>,
+    /// When smoltcp next needs polling, if it knows.
+    delay: Option<smoltcp::time::Duration>,
+    /// Inbound connections to hand to their handlers.
+    accepted: Vec<(SocketHandle, PendingAccept)>,
+    closed: bool,
+}
+
 /// How a TCP connection ended.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum End {
@@ -200,6 +211,62 @@ impl State {
             }
         }
         Err(io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no free ephemeral port on {local_ip}")))
+    }
+
+    /// Runs smoltcp, hands off inbound connections that finished their
+    /// handshake, and reaps closed sockets, returning what the poll loop
+    /// does next with the stack unlocked.
+    fn poll(&mut self) -> Polled {
+        let t = self.now();
+        self.iface.poll_maintenance(t);
+        self.ingress(t);
+        while self.iface.poll_egress(t, &mut self.device, &mut self.sockets) == PollResult::SocketStateChanged {}
+
+        // Hand off inbound connections that finished their handshake,
+        // and give up on ones that never did. A socket only ever
+        // connects to its own flow's peer, but check: the handler
+        // trusts peer_addr() as the peer's identity.
+        let sockets = &self.sockets;
+        let (accepted, dead): (Vec<_>, Vec<_>) = self
+            .accepting
+            .extract_if(|&h, pa| match sockets.get::<tcp::Socket>(h).state() {
+                tcp::State::SynReceived => pa.since.elapsed() > ACCEPT_TIMEOUT,
+                tcp::State::Closed | tcp::State::Listen => pa.since.elapsed() > LISTEN_TIMEOUT,
+                _ => true,
+            })
+            .partition(|(h, pa)| {
+                let s = sockets.get::<tcp::Socket>(*h);
+                matches!(s.state(), tcp::State::Established | tcp::State::CloseWait)
+                    && (s.local_endpoint().map(socket_addr), s.remote_endpoint().map(socket_addr))
+                        == (Some(pa.flow.0), Some(pa.flow.1))
+            });
+        for (h, _) in dead {
+            self.sockets.get_mut::<tcp::Socket>(h).abort();
+            self.orphans.push((h, tokio::time::Instant::now()));
+        }
+
+        // Reap closed sockets nobody holds any more, and abort ones that
+        // take too long to close: a live peer that never sends its FIN
+        // would keep one in FIN-WAIT-2 forever.
+        let State { sockets, tuples, ends, fins, orphans, .. } = self;
+        orphans.retain(|&(h, since)| {
+            let s = sockets.get_mut::<tcp::Socket>(h);
+            // An aborted socket keeps its peer until it has sent the RST.
+            let done =
+                s.state() == tcp::State::TimeWait || s.state() == tcp::State::Closed && s.remote_endpoint().is_none();
+            if done {
+                sockets.remove(h);
+                tuples.retain(|_, v| *v != h);
+                ends.remove(&h);
+                fins.remove(&h);
+            } else if since.elapsed() > TCP_TIMEOUT {
+                s.abort();
+            }
+            !done
+        });
+
+        let delay = self.iface.poll_delay(self.now(), &self.sockets);
+        Polled { out: std::mem::take(&mut self.device.tx), delay, accepted, closed: self.closed }
     }
 
     fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
@@ -606,60 +673,8 @@ fn abort(s: &mut tcp::Socket<'static>, h: SocketHandle, ends: &mut HashMap<Socke
 async fn poll_loop(shared: Weak<Shared>) {
     loop {
         let Some(sh) = shared.upgrade() else { return };
-        let (out, delay, accepted, closed) = {
-            let mut guard = sh.lock();
-            let st = &mut *guard;
-            let t = st.now();
-            st.iface.poll_maintenance(t);
-            st.ingress(t);
-            while st.iface.poll_egress(t, &mut st.device, &mut st.sockets) == PollResult::SocketStateChanged {}
-
-            // Hand off inbound connections that finished their handshake,
-            // and give up on ones that never did. A socket only ever
-            // connects to its own flow's peer, but check: the handler
-            // trusts peer_addr() as the peer's identity.
-            let sockets = &st.sockets;
-            let (accepted, dead): (Vec<_>, Vec<_>) = st
-                .accepting
-                .extract_if(|&h, pa| match sockets.get::<tcp::Socket>(h).state() {
-                    tcp::State::SynReceived => pa.since.elapsed() > ACCEPT_TIMEOUT,
-                    tcp::State::Closed | tcp::State::Listen => pa.since.elapsed() > LISTEN_TIMEOUT,
-                    _ => true,
-                })
-                .partition(|(h, pa)| {
-                    let s = sockets.get::<tcp::Socket>(*h);
-                    matches!(s.state(), tcp::State::Established | tcp::State::CloseWait)
-                        && (s.local_endpoint().map(socket_addr), s.remote_endpoint().map(socket_addr))
-                            == (Some(pa.flow.0), Some(pa.flow.1))
-                });
-            for (h, _) in dead {
-                st.sockets.get_mut::<tcp::Socket>(h).abort();
-                st.orphans.push((h, tokio::time::Instant::now()));
-            }
-
-            // Reap closed sockets nobody holds any more, and abort ones that
-            // take too long to close: a live peer that never sends its FIN
-            // would keep one in FIN-WAIT-2 forever.
-            let State { sockets, tuples, ends, fins, orphans, .. } = st;
-            orphans.retain(|&(h, since)| {
-                let s = sockets.get_mut::<tcp::Socket>(h);
-                // An aborted socket keeps its peer until it has sent the RST.
-                let done = s.state() == tcp::State::TimeWait
-                    || s.state() == tcp::State::Closed && s.remote_endpoint().is_none();
-                if done {
-                    sockets.remove(h);
-                    tuples.retain(|_, v| *v != h);
-                    ends.remove(&h);
-                    fins.remove(&h);
-                } else if since.elapsed() > TCP_TIMEOUT {
-                    s.abort();
-                }
-                !done
-            });
-
-            let delay = st.iface.poll_delay(st.now(), &st.sockets);
-            (std::mem::take(&mut st.device.tx), delay, accepted, st.closed)
-        };
+        // The stack is locked for this statement only.
+        let Polled { out, delay, accepted, closed } = sh.lock().poll();
         for p in out {
             (sh.out)(p);
         }
