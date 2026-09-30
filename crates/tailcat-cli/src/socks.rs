@@ -46,9 +46,9 @@ pub async fn classify(host: &str, port: u16) -> Result<Target> {
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
         Err(_) => {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-            let first = addrs.first().ok_or_else(|| anyhow!("no addresses found for {host:?}"))?;
-            addrs.iter().find(|a| a.is_ipv4()).unwrap_or(first).ip()
+            let mut addrs = tokio::net::lookup_host((host, port)).await?;
+            let first = addrs.next().ok_or_else(|| anyhow!("no addresses found for {host:?}"))?;
+            std::iter::once(first).chain(addrs).find(SocketAddr::is_ipv4).unwrap_or(first).ip()
         }
     };
     Ok(Target::Via(SocketAddr::new(ip.to_canonical(), port)))
