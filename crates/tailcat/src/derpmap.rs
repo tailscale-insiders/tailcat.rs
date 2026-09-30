@@ -568,63 +568,6 @@ impl RegionChoice {
     }
 }
 
-/// What a `--region` argument names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegionArg {
-    /// The lowest-latency region (`auto`).
-    Auto,
-    /// No region: list them instead (`list`).
-    List,
-    /// A region ID.
-    Id(i32),
-    /// A region of one's own DERP servers, by hostname (comma-separated,
-    /// each with a dot).
-    Hosts(Vec<String>),
-    /// A region code, or part of a region's name, as [`find_region`]
-    /// takes.
-    Name(String),
-}
-
-impl std::str::FromStr for RegionArg {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("empty DERP region".into());
-        }
-        if s.eq_ignore_ascii_case("auto") {
-            return Ok(RegionArg::Auto);
-        }
-        if s.eq_ignore_ascii_case("list") {
-            return Ok(RegionArg::List);
-        }
-        if let Ok(id) = s.parse() {
-            return Ok(RegionArg::Id(id));
-        }
-        if !s.contains('.') {
-            return Ok(RegionArg::Name(s.into()));
-        }
-        let hosts: Vec<String> = s.split(',').map(|h| h.trim().to_string()).collect();
-        if hosts.iter().any(String::is_empty) {
-            return Err(format!("empty hostname in DERP region {s:?}"));
-        }
-        Ok(RegionArg::Hosts(hosts))
-    }
-}
-
-impl RegionArg {
-    /// The region in `dm` this names, by ID or by name. The others name
-    /// no one region of a map.
-    pub fn find(&self, dm: &DerpMap) -> Option<i32> {
-        match self {
-            RegionArg::Id(id) => dm.regions.contains_key(id).then_some(*id),
-            RegionArg::Name(n) => find_region(dm, n),
-            RegionArg::Auto | RegionArg::List | RegionArg::Hosts(_) => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -727,22 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn region_args() {
-        let arg = |s: &str| s.parse::<RegionArg>();
-        assert_eq!(arg("auto"), Ok(RegionArg::Auto));
-        assert_eq!(arg(" AUTO "), Ok(RegionArg::Auto));
-        assert_eq!(arg("list"), Ok(RegionArg::List));
-        assert_eq!(arg("302"), Ok(RegionArg::Id(302)));
-        assert_eq!(arg("-1"), Ok(RegionArg::Id(-1)));
-        assert_eq!(arg("sfo"), Ok(RegionArg::Name("sfo".into())));
-        assert_eq!(arg("San Francisco"), Ok(RegionArg::Name("San Francisco".into())));
-        let hosts = RegionArg::Hosts(vec!["a.example".into(), "b.example".into()]);
-        assert_eq!(arg("a.example, b.example"), Ok(hosts));
-        assert!(arg("").is_err());
-        assert!(arg("a.example,").is_err());
-    }
-
-    #[test]
     fn parses_tailcat_dev_format() {
         let dm: DerpMap = serde_json::from_str(SAMPLE).unwrap();
 
@@ -755,8 +682,6 @@ mod tests {
         assert_eq!(find_region(&dm, "SFO"), Some(302));
         assert_eq!(find_region(&dm, "franc"), Some(302));
         assert_eq!(find_region(&dm, "nope"), None);
-        let find = |s: &str| s.parse::<RegionArg>().unwrap().find(&dm);
-        assert_eq!((find("302"), find("301"), find("sfo"), find("auto")), (Some(302), None, Some(302), None));
 
         let back = serde_json::to_string(&dm).unwrap();
         let again: DerpMap = serde_json::from_str(&back).unwrap();
