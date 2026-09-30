@@ -70,7 +70,7 @@ async fn stun_report(dm: &DerpMap) -> Report {
         return rep;
     }
 
-    let regions: HashSet<i32> = targets.iter().map(|t| t.0).collect();
+    let regions = targets.iter().map(|t| t.0).collect::<HashSet<i32>>().len();
     let mut pending: HashMap<stun::TxId, (i32, Instant)> = HashMap::new();
     let deadline = tokio::time::Instant::now() + STUN_TIMEOUT;
     let mut resend = tokio::time::interval(Duration::from_millis(500));
@@ -100,8 +100,9 @@ async fn stun_report(dm: &DerpMap) -> Report {
                 }
             }
         }
-        // Stop early once every region has answered at least once.
-        if rounds >= 2 && regions.iter().all(|r| rep.region_latency.contains_key(r)) {
+        // Stop early once every region has answered at least once: only
+        // those regions were asked, so that's when all have latencies.
+        if rounds >= 2 && rep.region_latency.len() == regions {
             break;
         }
     }
