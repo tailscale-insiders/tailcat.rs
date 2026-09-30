@@ -12,7 +12,9 @@ use std::mem;
 use std::pin::pin;
 use std::ptr;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{OnceLock, mpsc as std_mpsc};
 use std::task::Waker;
+use std::thread;
 
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -1256,4 +1258,73 @@ fn drain_tcp_waits_quietly() {
     assert_eq!(drained, Some(false), "an open connection drained");
     let n = polls.load(Ordering::Relaxed);
     assert!(n < 20, "{n} polls in half a second");
+}
+
+/// Runs `f` on another thread, failing the test if it hangs: a thread
+/// that locks the stack again while holding the lock never returns.
+fn finishes(what: &str, f: impl FnOnce() + Send + 'static) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    thread::spawn(move || {
+        f();
+        let _ = done_tx.send(());
+    });
+    done_rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|e| panic!("{what}: {e}"));
+}
+
+/// A policy accepting every connection with a handler that holds a UDP
+/// flow of `stack`'s, which locks the stack when dropped; with `close`,
+/// the stack is closed before the policy answers.
+fn accept_holding_flow(stack: Arc<OnceLock<Stack>>, close: bool) -> TcpPolicy {
+    Arc::new(move |_, _| {
+        let s = stack.get().unwrap();
+        let flow = s.dial_udp(local_ip(), SocketAddr::new(remote_ip(), DIALED)).unwrap();
+        if close {
+            s.close();
+        }
+        TcpDecision::Accept(Box::new(move |_| drop(flow)))
+    })
+}
+
+/// A handler the stack doesn't keep, since the stack closed while the
+/// policy decided, is dropped with the stack unlocked: it was dropped
+/// under the lock, and one holding a stream or flow deadlocked.
+#[test]
+fn handler_left_by_close_drops_unlocked() {
+    finishes("inject", || {
+        let rt = paused_runtime();
+        let _guard = rt.enter();
+        let cell: Arc<OnceLock<Stack>> = Arc::default();
+        let stack = Stack::new(stack_config(), Arc::new(|_| {}), Some(accept_holding_flow(cell.clone(), true)), None);
+        let _ = cell.set(stack.clone());
+        let (local, remote) = inbound(SOURCE_PORTS[0]);
+
+        stack.inject(segment(remote, local, TcpControl::Syn, TcpSeqNumber(1000), None, &[]));
+
+        assert!(stack.shared.lock().udp.is_empty(), "the handler's flow is still open");
+    });
+}
+
+/// The handler of a connection whose handshake times out is dropped
+/// with the stack unlocked, as above.
+#[test]
+fn handler_of_stalled_handshake_drops_unlocked() {
+    finishes("the poll loop", || {
+        let rt = paused_runtime();
+        let _guard = rt.enter();
+        let cell: Arc<OnceLock<Stack>> = Arc::default();
+        let stack = Stack::new(stack_config(), Arc::new(|_| {}), Some(accept_holding_flow(cell.clone(), false)), None);
+        let _ = cell.set(stack.clone());
+        let (local, remote) = inbound(SOURCE_PORTS[0]);
+
+        stack.inject(segment(remote, local, TcpControl::Syn, TcpSeqNumber(1000), None, &[]));
+        rt.block_on(async {
+            let end = Instant::now() + ACCEPT_TIMEOUT + SLACK;
+            while Instant::now() < end {
+                time::advance(Duration::from_secs(1)).await;
+                yield_now().await;
+            }
+        });
+
+        assert!(stack.shared.lock().udp.is_empty(), "the handler's flow is still open");
+    });
 }

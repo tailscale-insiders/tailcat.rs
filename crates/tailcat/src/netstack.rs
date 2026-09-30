@@ -138,6 +138,9 @@ struct Polled {
     delay: Option<smoltcp::time::Duration>,
     /// Inbound connections to hand to their handlers.
     accepted: Vec<(SocketHandle, PendingAccept)>,
+    /// Inbound connections given up on, whose handlers are dropped with
+    /// the stack unlocked: dropping one may lock it.
+    abandoned: Vec<PendingAccept>,
     closed: bool,
 }
 
@@ -244,9 +247,11 @@ impl State {
                     && (s.local_endpoint().map(socket_addr), s.remote_endpoint().map(socket_addr))
                         == (Some(pa.flow.0), Some(pa.flow.1))
             });
-        for (h, _) in dead {
+        let mut abandoned = Vec::with_capacity(dead.len());
+        for (h, pa) in dead {
             self.sockets.get_mut::<tcp::Socket>(h).abort();
             self.orphans.push((h, tokio::time::Instant::now()));
+            abandoned.push(pa);
         }
 
         // Reap closed sockets nobody holds any more, and abort ones that
@@ -270,7 +275,7 @@ impl State {
         });
 
         let delay = self.iface.poll_delay(self.now(), &self.sockets);
-        Polled { out: mem::take(&mut self.device.tx), delay, accepted, closed: self.closed }
+        Polled { out: mem::take(&mut self.device.tx), delay, accepted, abandoned, closed: self.closed }
     }
 
     fn tcp_sockets(&self) -> impl Iterator<Item = &tcp::Socket<'static>> {
@@ -457,6 +462,9 @@ impl Stack {
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {}
             _ => return trace!("netstack: dropping protocol {proto}"),
         }
+        // Declared before the lock, so a handler the stack doesn't keep
+        // is dropped after it's released: dropping one may lock it.
+        let mut handler;
         let mut st = self.shared.lock();
         if st.closed {
             return;
@@ -494,27 +502,25 @@ impl Stack {
                 } else {
                     // The policy may block briefly; don't hold the lock.
                     drop(st);
-                    let decision = self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d));
+                    handler = match self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d)) {
+                        TcpDecision::Drop => return,
+                        TcpDecision::Reset => None, // smoltcp answers unmatched SYNs with RST
+                        TcpDecision::Accept(_) if d.port() == 0 => return,
+                        TcpDecision::Accept(h) => Some(h),
+                    };
                     st = self.shared.lock();
                     if st.closed {
                         return;
                     }
-                    match decision {
-                        TcpDecision::Drop => return,
-                        TcpDecision::Reset => {} // smoltcp answers unmatched SYNs with RST
-                        TcpDecision::Accept(handler) => {
-                            if d.port() == 0 {
-                                return;
-                            }
-                            // The socket stays closed until the poll loop
-                            // gets to this SYN; see State::ingress.
-                            if !st.tuples.contains_key(&(d, s)) {
-                                let h = st.sockets.add(new_tcp_socket());
-                                st.tuples.insert((d, s), h);
-                                let pa = PendingAccept { flow: (d, s), handler, since: tokio::time::Instant::now() };
-                                st.accepting.insert(h, pa);
-                            }
-                        }
+                    // The socket stays closed until the poll loop gets to
+                    // this SYN; see State::ingress.
+                    if !st.tuples.contains_key(&(d, s))
+                        && let Some(handler) = handler.take()
+                    {
+                        let h = st.sockets.add(new_tcp_socket());
+                        st.tuples.insert((d, s), h);
+                        let pa = PendingAccept { flow: (d, s), handler, since: tokio::time::Instant::now() };
+                        st.accepting.insert(h, pa);
                     }
                 }
             }
@@ -677,7 +683,8 @@ async fn poll_loop(shared: Weak<Shared>) {
     loop {
         let Some(sh) = shared.upgrade() else { return };
         // The stack is locked for this statement only.
-        let Polled { out, delay, accepted, closed } = sh.lock().poll();
+        let Polled { out, delay, accepted, abandoned, closed } = sh.lock().poll();
+        drop(abandoned);
         for p in out {
             (sh.out)(p);
         }
