@@ -66,13 +66,13 @@ impl Dialer {
     /// The client that dials `t`.
     fn client(&self, t: &Target) -> Result<Client> {
         match t {
-            Target::Addr(a, _) => Ok(self
-                .clients
-                .lock()
-                .unwrap()
-                .entry(a.clone())
-                .or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone()))
-                .clone()),
+            Target::Addr(a, _) => {
+                let mut clients = self.clients.lock().unwrap();
+                let c = clients
+                    .entry(a.clone())
+                    .or_insert_with(|| crate::client::new_client(&self.g, a.clone(), self.key.clone()));
+                Ok(c.clone())
+            }
             _ => self.default.clone().ok_or_else(|| {
                 anyhow!(
                     "no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed"
