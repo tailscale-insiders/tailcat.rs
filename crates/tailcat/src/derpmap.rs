@@ -1,7 +1,10 @@
 //! DERP map types, mirroring the JSON form of Tailscale's
 //! `tailcfg.DERPMap`, and fetching the map with a freshness-aware cache.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -18,7 +21,7 @@ pub const DERP_MAP_CACHE_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// The magic IP address used in disco pongs to mean "via DERP"; the port
 /// is the region ID.
-pub const DERP_MAGIC_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 3, 3, 40);
+pub const DERP_MAGIC_IP: Ipv4Addr = Ipv4Addr::new(127, 3, 3, 40);
 
 /// Reports whether `v` is its type's zero value, for omitting fields the
 /// way Go's `omitempty` does.
@@ -102,7 +105,7 @@ pub enum NodeIp {
     Disabled,
     /// The address to use instead of looking the hostname up. One of the
     /// other family is ignored, and so is the family.
-    Addr(std::net::IpAddr),
+    Addr(IpAddr),
     /// Anything else, kept as given; the family isn't used, as with
     /// `none`.
     Other(String),
@@ -110,7 +113,7 @@ pub enum NodeIp {
 
 impl NodeIp {
     /// The address given, if it's of the family `v4` says.
-    pub fn addr(&self, v4: bool) -> Option<std::net::IpAddr> {
+    pub fn addr(&self, v4: bool) -> Option<IpAddr> {
         match self {
             NodeIp::Addr(ip) if ip.is_ipv4() == v4 => Some(*ip),
             _ => None,
@@ -118,7 +121,7 @@ impl NodeIp {
     }
 
     /// The text form, as the map has it.
-    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
             NodeIp::Lookup => "".into(),
             NodeIp::Disabled => "none".into(),
@@ -153,8 +156,8 @@ impl PartialEq<&str> for NodeIp {
     }
 }
 
-impl std::fmt::Display for NodeIp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NodeIp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text())
     }
 }
@@ -179,14 +182,14 @@ pub enum Host {
     #[default]
     Unset,
     /// An IP literal.
-    Ip(std::net::IpAddr),
+    Ip(IpAddr),
     /// A DNS name.
     Dns(String),
 }
 
 impl Host {
     /// The text form, as the map has it.
-    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
             Host::Unset => "".into(),
             Host::Ip(ip) => ip.to_string().into(),
@@ -195,7 +198,7 @@ impl Host {
     }
 
     /// The name to dial, look up and check a certificate for, if any.
-    pub fn dialable(&self) -> Option<std::borrow::Cow<'_, str>> {
+    pub fn dialable(&self) -> Option<Cow<'_, str>> {
         (*self != Host::Unset).then(|| self.text())
     }
 }
@@ -224,8 +227,8 @@ impl PartialEq<&str> for Host {
     }
 }
 
-impl std::fmt::Display for Host {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text())
     }
 }
@@ -263,7 +266,7 @@ impl CertName {
     const SHA256_PREFIX: &str = "sha256-raw:";
 
     /// The text form, as the map has it.
-    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
             CertName::HostName => "".into(),
             CertName::Sha256(hash) => format!("{}{}", CertName::SHA256_PREFIX, hex::encode(hash)).into(),
@@ -301,8 +304,8 @@ impl PartialEq<&str> for CertName {
     }
 }
 
-impl std::fmt::Display for CertName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CertName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text())
     }
 }
@@ -321,7 +324,7 @@ impl<'de> Deserialize<'de> for CertName {
 
 /// The address a node's STUN is tested at instead of its own, if any
 /// (for Tailscale's tests).
-pub type StunTestIp = Option<std::net::IpAddr>;
+pub type StunTestIp = Option<IpAddr>;
 
 /// Reads and writes a [`StunTestIp`] as the map does: the address, or
 /// the empty string for none. Text that isn't an address reads as none,
@@ -388,8 +391,7 @@ impl DerpNode {
 
     /// The addresses to use for this node: explicit IPs if given
     /// (`"none"` disables a family), else a DNS lookup of the hostname.
-    pub async fn resolve_addrs(&self, port: u16) -> Vec<std::net::SocketAddr> {
-        use std::net::SocketAddr;
+    pub async fn resolve_addrs(&self, port: u16) -> Vec<SocketAddr> {
         let mut out: Vec<_> = [self.ipv4.addr(true), self.ipv6.addr(false)]
             .into_iter()
             .flatten()
@@ -566,8 +568,6 @@ impl RegionChoice {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn node_ips() {
-        let v4: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
         assert_eq!(NodeIp::from(""), NodeIp::Lookup);
         assert_eq!(NodeIp::from("none"), NodeIp::Disabled);
         assert_eq!(NodeIp::from("192.0.2.1"), NodeIp::Addr(v4));
