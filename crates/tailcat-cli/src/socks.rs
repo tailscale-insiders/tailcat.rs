@@ -32,27 +32,29 @@ pub enum Target {
     Via(SocketAddr),
 }
 
-/// Classifies a SOCKS destination host and port, resolving ordinary
-/// hostnames locally (preferring IPv4, which rides the NAT64 mapping).
-pub async fn classify(host: &str, port: u16) -> Result<Target> {
-    if host.is_empty() || host == "server.tailcat" {
-        return Ok(Target::Server(port));
-    }
-    if host.starts_with("tc") && !host.contains('.') {
-        let a = Addr::new(host);
-        if a.parse().is_ok() {
-            return Ok(Target::Addr(a, port));
+impl Target {
+    /// Classifies a SOCKS destination host and port, resolving ordinary
+    /// hostnames locally (preferring IPv4, which rides the NAT64 mapping).
+    pub async fn classify(host: &str, port: u16) -> Result<Self> {
+        if host.is_empty() || host == "server.tailcat" {
+            return Ok(Target::Server(port));
         }
-    }
-    let ip: IpAddr = match host.parse() {
-        Ok(ip) => ip,
-        Err(_) => {
-            let mut addrs = tokio::net::lookup_host((host, port)).await?;
-            let first = addrs.next().ok_or_else(|| anyhow!("no addresses found for {host:?}"))?;
-            std::iter::once(first).chain(addrs).find(SocketAddr::is_ipv4).unwrap_or(first).ip()
+        if host.starts_with("tc") && !host.contains('.') {
+            let a = Addr::new(host);
+            if a.parse().is_ok() {
+                return Ok(Target::Addr(a, port));
+            }
         }
-    };
-    Ok(Target::Via(SocketAddr::new(ip.to_canonical(), port)))
+        let ip: IpAddr = match host.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                let mut addrs = tokio::net::lookup_host((host, port)).await?;
+                let first = addrs.next().ok_or_else(|| anyhow!("no addresses found for {host:?}"))?;
+                std::iter::once(first).chain(addrs).find(SocketAddr::is_ipv4).unwrap_or(first).ip()
+            }
+        };
+        Ok(Target::Via(SocketAddr::new(ip.to_canonical(), port)))
+    }
 }
 
 /// Dials tailcat servers on behalf of the proxy.
@@ -239,7 +241,8 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
     };
     match cmd {
         1 => {
-            let dial = tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_tcp(&classify(&host, port).await?).await });
+            let dial =
+                tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_tcp(&Target::classify(&host, port).await?).await });
             let remote = match dial.await.unwrap_or_else(|_| Err(anyhow!("dial {host}:{port}: timed out"))) {
                 Ok(r) => r,
                 Err(e) => {
@@ -368,7 +371,7 @@ async fn udp_flow(
     sock: Arc<UdpSocket>,
     client_addr: ClientAddr,
 ) {
-    let dial = tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_udp(&classify(&dst.0, dst.1).await?).await });
+    let dial = tokio::time::timeout(DIAL_TIMEOUT, async { d.dial_udp(&Target::classify(&dst.0, dst.1).await?).await });
     let f = match dial.await.unwrap_or_else(|_| Err(anyhow!("timed out"))) {
         Ok(f) => f,
         Err(e) => {
@@ -471,7 +474,7 @@ mod tests {
     }
 
     async fn target(host: &str, port: u16) -> Target {
-        classify(host, port).await.unwrap()
+        Target::classify(host, port).await.unwrap()
     }
 
     fn via(s: &str) -> Target {
