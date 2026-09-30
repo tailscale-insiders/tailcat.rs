@@ -52,10 +52,10 @@ impl GithubSource {
 
     async fn poll(&mut self) -> Result<Vec<NodeRecord>> {
         let runs = match self.scope {
-            Scope::Run => vec![self.env.run_id.clone()],
+            Scope::Run => vec![(self.env.run_id.clone(), self.env.run_attempt.clone())],
             s => github::sibling_runs(&self.env, s).await?,
         };
-        for run in &runs {
+        for (run, _) in &runs {
             for a in github::list_artifacts(&self.env, run).await? {
                 if !a.name.starts_with(&self.name_prefix) || self.seen.contains_key(&a.id) {
                     continue;
@@ -83,13 +83,23 @@ impl GithubSource {
                 self.seen.insert(a.id, (run.clone(), admitted));
             }
         }
-        // Only runs still in progress: a finished run's nodes are gone.
-        // Oldest artifact first, so the result doesn't depend on hashing.
+        // Only the attempt each run in progress is on: a finished run's
+        // nodes are gone, and so are an earlier attempt's. That's checked
+        // here, not when an artifact is first seen, since a run can be
+        // re-run between polls. Run scope admits records that name no
+        // attempt, as `admit` does. Oldest artifact first, so the result
+        // doesn't depend on hashing.
+        let current = |run: &str, r: &NodeRecord| {
+            runs.iter().any(|(id, attempt)| {
+                id == run && (r.run_attempt == *attempt || self.scope == Scope::Run && r.run_attempt.is_empty())
+            })
+        };
         let mut live: Vec<(u64, &NodeRecord)> = self
             .seen
             .iter()
-            .filter(|(_, (run, _))| runs.contains(run))
-            .filter_map(|(id, (_, r))| Some((*id, r.as_ref()?)))
+            .filter_map(|(id, (run, r))| Some((*id, run, r.as_ref()?)))
+            .filter(|(_, run, r)| current(run, r))
+            .map(|(id, _, r)| (id, r))
             .collect();
         live.sort_by_key(|(id, _)| *id);
         Ok(live.into_iter().map(|(_, r)| r.clone()).collect())
@@ -289,8 +299,11 @@ mod tests {
     #[tokio::test]
     async fn github_branch_scope() {
         let s = Signer::new();
-        let ours = s.rec(json!({}));
+        // We're run 100's second attempt, and its first left a record.
+        let ours = s.rec(json!({"run_attempt": "2"}));
+        let earlier = s.rec(json!({}));
         let sibling = s.rec(json!({"run_id": "99"}));
+        let rerun = s.rec(json!({"run_id": "99", "run_attempt": "2"}));
         let untokened = rec("1");
         let misfiled = s.rec(json!({})); // a token for run 100 in run 99's artifacts
         let bodies = bodies([
@@ -298,26 +311,46 @@ mod tests {
             ("/dl/2", body(&sibling)),
             ("/dl/3", body(&untokened)),
             ("/dl/4", body(&misfiled)),
+            ("/dl/5", body(&earlier)),
+            ("/dl/6", body(&rerun)),
         ]);
         let (base, _) = fake_github(Box::new(move |base, path, n| match path {
-            // Run 99 finishes after the first poll.
-            "/repos/o/r/actions/workflows/mesh.yml/runs?status=in_progress&per_page=50&branch=main" if n == 1 => {
-                (200, br#"{"workflow_runs": [{"id": 99}]}"#.to_vec())
-            }
+            // Run 99 is re-run after the first poll, and finishes after the
+            // second. The list leaves our run out at first.
             "/repos/o/r/actions/workflows/mesh.yml/runs?status=in_progress&per_page=50&branch=main" => {
-                (200, br#"{"workflow_runs": []}"#.to_vec())
+                let runs = match n {
+                    1 => json!([{"id": 99, "run_attempt": 1}]),
+                    2 => json!([{"id": 99, "run_attempt": 2}, {"id": 100, "run_attempt": 2}]),
+                    _ => json!([]),
+                };
+                (200, serde_json::to_vec(&json!({ "workflow_runs": runs })).unwrap())
             }
             "/repos/o/r/actions/runs/100/artifacts?per_page=100&page=1" => {
-                (200, artifacts(base, &[(1, "node-1-0", false)]))
+                (200, artifacts(base, &[(1, "node-2-0", false), (5, "node-1-0", false)]))
             }
             "/repos/o/r/actions/runs/99/artifacts?per_page=100&page=1" => {
-                (200, artifacts(base, &[(2, "node-1-0", false), (3, "node-1-1", false), (4, "node-2-0", false)]))
+                let mut list = vec![(2, "node-1-0", false), (3, "node-1-1", false), (4, "node-2-0", false)];
+                if n > 1 {
+                    list.push((6, "node-2-1", false));
+                }
+                (200, artifacts(base, &list))
             }
             p => bodies.get(p).map_or((404, Vec::new()), |b| (200, b.clone())),
         }))
         .await;
-        let mut src = Source::github(github(base, Scope::Branch, "node-").with_verifier(s.verifier()));
-        assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours.clone(), sibling]));
+        let env = GithubEnv { api_url: base, run_attempt: "2".into(), ..genv() };
+        let g = GithubSource::new(env, Scope::Branch, "node-".into(), P.into()).with_verifier(s.verifier());
+        let mut src = Source::github(g);
+        assert_eq!(
+            keys(&src.poll().await.unwrap()),
+            keys(&[ours.clone(), sibling]),
+            "our run's earlier attempt's records are dropped"
+        );
+        assert_eq!(
+            keys(&src.poll().await.unwrap()),
+            keys(&[ours.clone(), rerun]),
+            "a re-run run's earlier attempt's records are dropped"
+        );
         assert_eq!(keys(&src.poll().await.unwrap()), keys(&[ours]), "a finished run's records are dropped");
     }
 

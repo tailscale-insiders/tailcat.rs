@@ -130,8 +130,9 @@ pub async fn list_artifacts(e: &GithubEnv, run_id: &str) -> Result<Vec<Artifact>
 }
 
 /// Lists the in-progress runs of this workflow sharing our branch (or,
-/// for a pull request, its head branch).
-pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
+/// for a pull request, its head branch), each with the attempt it's on:
+/// `(run ID, attempt)`. Our own run is always there, on our attempt.
+pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<(String, String)>> {
     #[derive(Deserialize)]
     struct List {
         workflow_runs: Vec<Run>,
@@ -139,6 +140,7 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
     #[derive(Deserialize)]
     struct Run {
         id: u64,
+        run_attempt: u64,
     }
     let workflow = e
         .workflow_ref
@@ -154,11 +156,14 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<String>> {
     )?;
     let l: List =
         send(e.get(url), || "listing workflow runs".into()).await?.json().await.context("decoding the run list")?;
-    let mut ids: Vec<String> = l.workflow_runs.into_iter().map(|r| r.id.to_string()).collect();
-    if !ids.contains(&e.run_id) {
-        ids.push(e.run_id.clone());
-    }
-    Ok(ids)
+    let mut runs: Vec<(String, String)> = l
+        .workflow_runs
+        .into_iter()
+        .map(|r| (r.id.to_string(), r.run_attempt.to_string()))
+        .filter(|(id, _)| *id != e.run_id)
+        .collect();
+    runs.push((e.run_id.clone(), e.run_attempt.clone()));
+    Ok(runs)
 }
 
 /// Downloads an artifact's content: the single file inside its zip, or
