@@ -209,18 +209,15 @@ impl Overlay {
             }
         }
         st.contested = contested.into_iter().map(|(n, r)| (n, r.nodekey)).collect();
-        // Checking regions takes `st` mutably, so this can't be done lazily
-        // while `reconcile` reads `st.peers`.
-        let usable: Vec<&NodeRecord> = polled
-            .iter()
-            .filter(|r| {
-                let ok = r.nodekey == self.me.nodekey || st.region(r, dm).is_some();
-                if !ok {
-                    warn!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region);
-                }
-                ok
-            })
-            .collect();
+        // Records `st.region` finds a region for, checked without cloning
+        // it or registering embedded ones, which upserting does.
+        let usable = polled.iter().filter(|r| {
+            let ok = r.nodekey == self.me.nodekey || r.derp.is_some() || dm.regions.contains_key(&r.derp_region);
+            if !ok {
+                warn!("peer {}: DERP region {} is not in the DERP map", r.index, r.derp_region);
+            }
+            ok
+        });
         let changes = reconcile(&self.me, &st.peers, usable);
         for c in changes {
             self.apply_locked(&mut st, c, dm);
