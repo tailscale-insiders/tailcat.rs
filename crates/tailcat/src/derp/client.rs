@@ -207,14 +207,16 @@ async fn serve(
 
     let reader = async {
         loop {
-            let (t, payload) = tokio::time::timeout(READ_TIMEOUT, super::read_frame(&mut rd, MAX_FRAME_SIZE))
+            let (t, mut payload) = tokio::time::timeout(READ_TIMEOUT, super::read_frame(&mut rd, MAX_FRAME_SIZE))
                 .await
                 .map_err(|_| Error::Derp("read timeout".into()))??;
             match FrameType::from_u8(t) {
                 Some(FrameType::RecvPacket) => {
-                    let (src, data) =
+                    let (src, _) =
                         super::split_key(&payload).ok_or_else(|| Error::Derp("short recv packet frame".into()))?;
-                    if recv.send(ReceivedPacket { region_id, src, data: data.to_vec() }).await.is_err() {
+                    // The frame's own buffer, less the key, is the packet.
+                    payload.drain(..crate::key::KEY_LEN);
+                    if recv.send(ReceivedPacket { region_id, src, data: payload }).await.is_err() {
                         return Ok(());
                     }
                 }
