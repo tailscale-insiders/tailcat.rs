@@ -103,8 +103,27 @@ fn ssh_dest_host(addr: &str) -> String {
     format!("tailcat-{}", hex::encode(&Sha256::digest(addr.as_bytes())[..8]))
 }
 
+/// Quotes arguments for the shell that runs a ProxyCommand here.
+#[cfg(not(windows))]
+fn proxy_command_join(args: &[String]) -> Result<String> {
+    proxy_command_join_unix(args)
+}
+
+/// Quotes arguments for the shell that runs a ProxyCommand here.
+#[cfg(windows)]
+fn proxy_command_join(args: &[String]) -> Result<String> {
+    proxy_command_join_windows(args)
+}
+
+/// Where ssh should keep known hosts: nowhere.
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+
 /// Quotes arguments for the POSIX shell that runs a ProxyCommand;
 /// percent signs are doubled for OpenSSH's own token expansion.
+#[cfg(any(not(windows), test))]
 fn proxy_command_join_unix(args: &[String]) -> Result<String> {
     let quoted: Result<Vec<_>> = args
         .iter()
@@ -118,6 +137,7 @@ fn proxy_command_join_unix(args: &[String]) -> Result<String> {
     Ok(quoted?.join(" "))
 }
 
+#[cfg(any(windows, test))]
 fn proxy_command_join_windows(args: &[String]) -> Result<String> {
     let quoted: Result<Vec<_>> = args
         .iter()
@@ -143,13 +163,12 @@ fn ssh_opts(g: &Global, addr: &str, port: &str) -> Result<Vec<String>> {
         proxy.push(format!("--derpmap-url={}", g.derpmap_url));
     }
     proxy.extend([addr.into(), port.into()]);
-    let proxy = if cfg!(windows) { proxy_command_join_windows(&proxy) } else { proxy_command_join_unix(&proxy) }?;
-    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let proxy = proxy_command_join(&proxy)?;
     Ok([
         "UpdateHostKeys no".into(),
         "StrictHostKeyChecking no".into(),
         "LogLevel ERROR".into(),
-        format!("UserKnownHostsFile {null}"),
+        format!("UserKnownHostsFile {NULL_DEVICE}"),
         format!("ProxyCommand={proxy}"),
     ]
     .into_iter()
@@ -157,15 +176,21 @@ fn ssh_opts(g: &Global, addr: &str, port: &str) -> Result<Vec<String>> {
     .collect())
 }
 
+/// Replaces this process with `argv`, returning only if that fails.
+#[cfg(unix)]
 fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    #[cfg(unix)]
-    {
-        let err = std::os::unix::process::CommandExt::exec(&mut cmd);
-        bail!("failed to run {}: {err}", argv[0]);
-    }
-    #[cfg(not(unix))]
+    let err = std::os::unix::process::CommandExt::exec(&mut cmd);
+    bail!("failed to run {}: {err}", argv[0]);
+}
+
+/// Runs `argv` to completion, exiting as it did: processes can't be
+/// replaced here.
+#[cfg(not(unix))]
+fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
     Ok(ExitCode::from(cmd.status()?.code().unwrap_or(1) as u8))
 }
 

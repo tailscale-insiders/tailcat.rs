@@ -498,10 +498,7 @@ async fn one_shot(me: Arc<OnceLock<Server>>, mut c: TcpStream) {
     let _ = out.flush().await;
     drop(out);
     // Close stdout so a downstream pipeline sees EOF now.
-    #[cfg(unix)]
-    unsafe {
-        libc::close(1);
-    }
+    close_stdout();
     let _ = c.shutdown().await;
     drop(c);
     // The client exits once it reads our EOF, which confirms delivery of
@@ -512,6 +509,18 @@ async fn one_shot(me: Arc<OnceLock<Server>>, mut c: TcpStream) {
     }
     std::process::exit(0);
 }
+
+/// Closes this process's stdout.
+#[cfg(unix)]
+fn close_stdout() {
+    unsafe {
+        libc::close(1);
+    }
+}
+
+/// Does nothing: stdout stays open until exit here.
+#[cfg(not(unix))]
+fn close_stdout() {}
 
 /// Finds an executable in $PATH, like Go's exec.LookPath.
 pub fn which(name: &str) -> Option<String> {
@@ -524,27 +533,37 @@ pub fn which(name: &str) -> Option<String> {
         if is_executable(&p) {
             return Some(p.to_string_lossy().into_owned());
         }
-        #[cfg(windows)]
-        {
-            let p = dir.join(format!("{name}.exe"));
-            if p.exists() {
-                return Some(p.to_string_lossy().into_owned());
-            }
+        if let Some(p) = exe_in(&dir, name) {
+            return Some(p.to_string_lossy().into_owned());
         }
     }
     None
 }
 
+/// `name` with the `.exe` extension in `dir`, if it exists.
+#[cfg(windows)]
+fn exe_in(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let p = dir.join(format!("{name}.exe"));
+    p.exists().then_some(p)
+}
+
+/// None: executables don't need an extension here.
+#[cfg(not(windows))]
+fn exe_in(_: &std::path::Path, _: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Reports whether `p` is a file with any execute bit set.
+#[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Reports whether `p` is a file: there are no execute bits here.
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    p.is_file()
 }
 
 /// Parses --files: a directory with an optional :ro, :rw, :wo or :wo+ suffix.
@@ -642,14 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn finds_executables() {
+    fn finds_no_missing_executables() {
         assert!(which("definitely-not-a-tailcat-command").is_none());
         assert!(which("/definitely/not/a/path").is_none());
-        #[cfg(unix)]
-        {
-            assert!(which("sh").is_some_and(|p| p.ends_with("/sh")));
-            assert_eq!(which("/bin/sh").as_deref(), Some("/bin/sh"));
-        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_executables() {
+        assert!(which("sh").is_some_and(|p| p.ends_with("/sh")));
+        assert_eq!(which("/bin/sh").as_deref(), Some("/bin/sh"));
     }
 
     #[cfg(feature = "ssh")]

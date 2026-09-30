@@ -107,25 +107,46 @@ pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
 fn ssh_key_dir() -> Result<PathBuf> {
     let dir = config_dir().ok_or_else(|| Error::other("no user config directory"))?.join("tailcat").join("ssh");
     std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    make_private_dir(&dir);
     Ok(dir)
 }
 
+/// Makes `dir` accessible only to its owner, if it can.
+#[cfg(unix)]
+fn make_private_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+/// Does nothing: directories have no Unix mode here.
+#[cfg(not(unix))]
+fn make_private_dir(_: &std::path::Path) {}
+
 /// Go's `os.UserConfigDir`, where the Go implementation keeps its host
-/// key too, so both share one.
+/// key too, so both share one: `%AppData%`.
+#[cfg(windows)]
 fn config_dir() -> Option<PathBuf> {
-    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if cfg!(windows) {
-        std::env::var_os("AppData").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        var("HOME").map(|h| h.join("Library/Application Support"))
-    } else {
-        var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|h| h.join(".config")))
-    }
+    std::env::var_os("AppData").map(PathBuf::from)
+}
+
+/// Go's `os.UserConfigDir`, where the Go implementation keeps its host
+/// key too, so both share one: `~/Library/Application Support`.
+#[cfg(target_os = "macos")]
+fn config_dir() -> Option<PathBuf> {
+    env_path("HOME").map(|h| h.join("Library/Application Support"))
+}
+
+/// Go's `os.UserConfigDir`, where the Go implementation keeps its host
+/// key too, so both share one: `$XDG_CONFIG_HOME`, else `~/.config`.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn config_dir() -> Option<PathBuf> {
+    env_path("XDG_CONFIG_HOME").or_else(|| env_path("HOME").map(|h| h.join(".config")))
+}
+
+/// The path in the environment variable `k`, unless it's unset or empty.
+#[cfg(not(windows))]
+fn env_path(k: &str) -> Option<PathBuf> {
+    std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// Returns the SSH host key, generating an ed25519 key on first use in
@@ -142,23 +163,34 @@ pub fn host_key() -> Result<PrivateKey> {
 fn load_or_create_key(path: &std::path::Path) -> Result<PrivateKey> {
     // Replacing an empty file can't be made safe by linking alone, so
     // tailcat processes also take turns, by locking the directory.
-    #[cfg(unix)]
-    let _turn = {
-        use std::os::fd::AsRawFd;
-        let dir = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new(".")))?;
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        dir // Unlocked when closed.
-    };
-    let pem = match std::fs::read_to_string(path) {
-        Ok(pem) if !pem.trim().is_empty() => pem,
-        Ok(_) => install_new_key(path, true)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => install_new_key(path, false)?,
-        Err(e) => return Err(e.into()),
-    };
-    russh::keys::decode_secret_key(&pem, None)
-        .map_err(|e| Error::other(format!("parsing host key {}: {e}", path.display())))
+    with_dir_locked(path.parent().unwrap_or(std::path::Path::new(".")), || {
+        let pem = match std::fs::read_to_string(path) {
+            Ok(pem) if !pem.trim().is_empty() => pem,
+            Ok(_) => install_new_key(path, true)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => install_new_key(path, false)?,
+            Err(e) => return Err(e.into()),
+        };
+        russh::keys::decode_secret_key(&pem, None)
+            .map_err(|e| Error::other(format!("parsing host key {}: {e}", path.display())))
+    })
+}
+
+/// Runs `f` holding an exclusive lock on the directory `dir`, waiting
+/// for other processes' turns first.
+#[cfg(unix)]
+fn with_dir_locked<T>(dir: &std::path::Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::os::fd::AsRawFd;
+    let dir = std::fs::File::open(dir)?;
+    if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    f() // Unlocked when `dir` closes.
+}
+
+/// Runs `f`: directories can't be locked here.
+#[cfg(not(unix))]
+fn with_dir_locked<T>(_: &std::path::Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    f()
 }
 
 /// Generates a key and puts it at `path`, replacing what's there only
@@ -197,13 +229,22 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    owner_only(&mut o);
     let mut f = o.open(path)?;
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
 }
+
+/// Makes `o` create files readable and writable only by their owner.
+#[cfg(unix)]
+fn owner_only(o: &mut std::fs::OpenOptions) {
+    std::os::unix::fs::OpenOptionsExt::mode(o, 0o600);
+}
+
+/// Does nothing: files have no Unix mode here.
+#[cfg(not(unix))]
+fn owner_only(_: &mut std::fs::OpenOptions) {}
 
 impl Shared {
     fn new(peer_lookup: PeerLookup, mut opts: SshOptions, key: PrivateKey) -> Result<Self> {

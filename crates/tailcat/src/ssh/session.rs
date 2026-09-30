@@ -125,12 +125,7 @@ impl ConnHandler {
                     say(&wr, format!("{msg}\r\n")).await;
                     1
                 }
-                #[cfg(unix)]
-                (Some(plan), Some(p)) => pty::run(&mut rd, &wr, plan, p, winch_rx).await,
-                (Some(plan), _) => {
-                    drop(winch_rx);
-                    run_pipes(&mut rd, &wr, plan).await
-                }
+                (Some(plan), pty) => run_session(&mut rd, &wr, plan, pty, winch_rx).await,
             };
             finish(&wr, code).await;
         });
@@ -356,6 +351,39 @@ async fn serve_sftp(ch: Channel<Msg>, fs: Sftp) {
     finish(&wr, 0).await;
 }
 
+/// Runs a session's command, on a PTY if the client asked for one,
+/// returning its exit status.
+#[cfg(unix)]
+async fn run_session(
+    rd: &mut ChannelReadHalf,
+    wr: &Writer,
+    plan: Plan,
+    pty: Option<PtyReq>,
+    winch: mpsc::UnboundedReceiver<(u32, u32)>,
+) -> u32 {
+    match pty {
+        Some(p) => pty::run(rd, wr, plan, p, winch).await,
+        None => {
+            drop(winch);
+            run_pipes(rd, wr, plan).await
+        }
+    }
+}
+
+/// Runs a session's command with pipes for stdio, as there are no PTYs
+/// here, returning its exit status.
+#[cfg(not(unix))]
+async fn run_session(
+    rd: &mut ChannelReadHalf,
+    wr: &Writer,
+    plan: Plan,
+    _pty: Option<PtyReq>,
+    winch: mpsc::UnboundedReceiver<(u32, u32)>,
+) -> u32 {
+    drop(winch);
+    run_pipes(rd, wr, plan).await
+}
+
 /// Runs a command with pipes for stdio, returning its exit status.
 async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
     let mut cmd = plan.command();
@@ -393,11 +421,22 @@ async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
 
 fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
     let Ok(s) = status else { return 1 };
-    #[cfg(unix)]
-    if let Some(sig) = std::os::unix::process::ExitStatusExt::signal(&s) {
+    if let Some(sig) = killed_by(&s) {
         return 128 + sig as u32;
     }
     s.code().map_or(255, |c| c as u32)
+}
+
+/// The signal that ended the process, if one did.
+#[cfg(unix)]
+fn killed_by(s: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(s)
+}
+
+/// None: there are no signals here.
+#[cfg(not(unix))]
+fn killed_by(_: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(unix)]
@@ -424,6 +463,13 @@ mod pty {
     /// How long a command has to exit after the client hangs up before
     /// it's killed.
     const HANGUP_GRACE: Duration = Duration::from_secs(3);
+
+    /// The terminal's UTF-8 input mode flag, where there is one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const IUTF8: libc::tcflag_t = libc::IUTF8;
+    /// No flag: setting or clearing it changes nothing.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const IUTF8: libc::tcflag_t = 0;
 
     fn winsize(cols: u32, rows: u32) -> libc::winsize {
         libc::winsize {
@@ -471,8 +517,7 @@ mod pty {
                     Pty::IXANY => set(&mut t.c_iflag, libc::IXANY),
                     Pty::IXOFF => set(&mut t.c_iflag, libc::IXOFF),
                     Pty::IMAXBEL => set(&mut t.c_iflag, libc::IMAXBEL),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    Pty::IUTF8 => set(&mut t.c_iflag, libc::IUTF8),
+                    Pty::IUTF8 => set(&mut t.c_iflag, IUTF8),
                     Pty::ISIG => set(&mut t.c_lflag, libc::ISIG),
                     Pty::ICANON => set(&mut t.c_lflag, libc::ICANON),
                     Pty::ECHO => set(&mut t.c_lflag, libc::ECHO),
@@ -666,8 +711,10 @@ pub(crate) struct User {
     pub uid: u32,
 }
 
+/// The user this process runs as, from the password database, else the
+/// environment.
+#[cfg(unix)]
 pub(crate) fn current_user() -> User {
-    #[cfg(unix)]
     unsafe {
         let uid = libc::getuid();
         let pw = libc::getpwuid(uid);
@@ -682,7 +729,11 @@ pub(crate) fn current_user() -> User {
             uid,
         }
     }
-    #[cfg(not(unix))]
+}
+
+/// The user this process runs as, from the environment.
+#[cfg(not(unix))]
+pub(crate) fn current_user() -> User {
     User {
         name: std::env::var("USERNAME").unwrap_or_default(),
         home: std::env::var("USERPROFILE").unwrap_or_default(),
@@ -690,19 +741,35 @@ pub(crate) fn current_user() -> User {
     }
 }
 
-/// The user's login shell: from the directory service on macOS, else
-/// $SHELL, else /bin/sh (as the Go implementation does).
+/// The user's login shell: PowerShell.
+#[cfg(windows)]
+fn login_shell(_: &User) -> String {
+    "powershell.exe".into()
+}
+
+/// The user's login shell: from the directory service, else $SHELL, else
+/// /bin/sh (as the Go implementation does).
+#[cfg(target_os = "macos")]
 fn login_shell(u: &User) -> String {
-    if cfg!(windows) {
-        return "powershell.exe".into();
-    }
-    if cfg!(target_os = "macos")
-        && let Ok(out) =
-            std::process::Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
+    if let Ok(out) =
+        std::process::Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
         && let Some(s) = String::from_utf8_lossy(&out.stdout).strip_prefix("UserShell: ")
     {
         return s.trim().to_string();
     }
+    env_shell()
+}
+
+/// The user's login shell: $SHELL, else /bin/sh (as the Go
+/// implementation does).
+#[cfg(not(any(windows, target_os = "macos")))]
+fn login_shell(_: &User) -> String {
+    env_shell()
+}
+
+/// $SHELL, else /bin/sh.
+#[cfg(not(windows))]
+fn env_shell() -> String {
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }
 

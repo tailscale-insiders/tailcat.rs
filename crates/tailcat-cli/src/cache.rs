@@ -52,18 +52,22 @@ impl Lock {
     /// the cache goes unlocked.
     fn new(path: &Path, exclusive: bool) -> Option<Lock> {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
-            if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
-                return None;
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = exclusive;
-        Some(Lock { _file: file })
+        flock(&file, exclusive).then_some(Lock { _file: file })
     }
+}
+
+/// Locks `file`, shared or exclusive, reporting whether it could.
+#[cfg(unix)]
+fn flock(file: &std::fs::File, exclusive: bool) -> bool {
+    use std::os::fd::AsRawFd;
+    let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+    unsafe { libc::flock(file.as_raw_fd(), op) == 0 }
+}
+
+/// Doesn't lock `file`, but lets the cache go on as if it had.
+#[cfg(not(unix))]
+fn flock(_: &std::fs::File, _: bool) -> bool {
+    true
 }
 
 fn get(dir: &Path, url: &str) -> Option<(Vec<u8>, String, SystemTime)> {

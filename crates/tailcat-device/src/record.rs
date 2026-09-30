@@ -166,10 +166,7 @@ fn write_file(path: &Path, data: &[u8], mode: u32, replace: bool) -> io::Result<
     let res = (|| {
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, mode);
-        #[cfg(not(unix))]
-        let _ = mode;
+        set_mode(&mut o, mode);
         let mut f = o.open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
@@ -180,6 +177,16 @@ fn write_file(path: &Path, data: &[u8], mode: u32, replace: bool) -> io::Result<
     }
     res
 }
+
+/// Makes `o` create files with `mode`, less the umask.
+#[cfg(unix)]
+fn set_mode(o: &mut std::fs::OpenOptions, mode: u32) {
+    std::os::unix::fs::OpenOptionsExt::mode(o, mode);
+}
+
+/// Does nothing: files have no Unix mode here.
+#[cfg(not(unix))]
+fn set_mode(_: &mut std::fs::OpenOptions, _: u32) {}
 
 /// The default overlay address for a node: `base + attempt*256 + index`
 /// within an IPv4 prefix, so the default `100.64.0.0/16` gives
@@ -280,8 +287,7 @@ mod tests {
         let private = NodePrivate::generate();
         let k = DeviceKey { record: NodeRecord::new(1, &private, "100.64.1.1".parse().unwrap()), private };
         k.save(&path, false).unwrap();
-        #[cfg(unix)]
-        assert_eq!(mode(&path), 0o600);
+        assert_private(&path);
         let back = DeviceKey::load(&path).unwrap();
         assert_eq!(back.private, k.private);
         assert_eq!(back.record, k.record);
@@ -305,6 +311,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
+
+    /// Asserts that only its owner may read or write `p`.
+    #[cfg(unix)]
+    fn assert_private(p: &Path) {
+        assert_eq!(mode(p), 0o600);
+    }
+
+    /// Asserts nothing: files have no Unix mode here.
+    #[cfg(not(unix))]
+    fn assert_private(_: &Path) {}
 
     /// Replacing a world-readable file doesn't leave the new private key
     /// readable by others.

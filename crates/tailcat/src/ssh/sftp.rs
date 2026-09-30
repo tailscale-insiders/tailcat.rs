@@ -97,20 +97,38 @@ fn attrs(md: &Metadata) -> FileAttributes {
         mtime: secs(md.modified()),
         ..Default::default()
     };
-    #[cfg(unix)]
-    {
-        use cap_std::fs::MetadataExt;
-        a.permissions = Some(md.mode());
-        a.uid = Some(md.uid());
-        a.gid = Some(md.gid());
-    }
-    #[cfg(not(unix))]
-    {
-        let base = if md.permissions().readonly() { 0o444 } else { 0o644 };
-        let kind = if md.is_dir() { 0o040000 | 0o111 } else { 0o100000 };
-        a.permissions = Some(base | kind);
-    }
+    set_owner_attrs(&mut a, md);
     a
+}
+
+/// Fills in the file's mode and owner.
+#[cfg(unix)]
+fn set_owner_attrs(a: &mut FileAttributes, md: &Metadata) {
+    use cap_std::fs::MetadataExt;
+    a.permissions = Some(md.mode());
+    a.uid = Some(md.uid());
+    a.gid = Some(md.gid());
+}
+
+/// Fills in a Unix mode made up from the file's kind and read-only flag.
+#[cfg(not(unix))]
+fn set_owner_attrs(a: &mut FileAttributes, md: &Metadata) {
+    let base = if md.permissions().readonly() { 0o444 } else { 0o644 };
+    let kind = if md.is_dir() { 0o040000 | 0o111 } else { 0o100000 };
+    a.permissions = Some(base | kind);
+}
+
+/// The permissions a client's setstat asks for, if they apply here.
+#[cfg(unix)]
+fn permissions(mode: u32) -> Option<cap_std::fs::Permissions> {
+    use cap_std::fs::PermissionsExt;
+    Some(cap_std::fs::Permissions::from_mode(mode & 0o7777))
+}
+
+/// None: Unix permissions don't apply here.
+#[cfg(not(unix))]
+fn permissions(_: u32) -> Option<cap_std::fs::Permissions> {
+    None
 }
 
 /// An `ls -l`-style long name, which OpenSSH's sftp shows for `ls -l`.
@@ -268,10 +286,8 @@ impl Sftp {
     }
 
     fn setstat_path(&self, p: &str, a: &FileAttributes) -> io::Result<()> {
-        #[cfg(unix)]
-        if let Some(mode) = a.permissions {
-            use cap_std::fs::PermissionsExt;
-            self.root.set_permissions(p, cap_std::fs::Permissions::from_mode(mode & 0o7777))?;
+        if let Some(perms) = a.permissions.and_then(permissions) {
+            self.root.set_permissions(p, perms)?;
         }
         if let (Some(at), Some(mt)) = (a.atime, a.mtime) {
             use cap_fs_ext::{DirExt, SystemTimeSpec};
@@ -391,10 +407,8 @@ impl russh_sftp::server::Handler for Sftp {
         if let Some(size) = a.size {
             f.set_len(size).map_err(io_code)?;
         }
-        #[cfg(unix)]
-        if let Some(mode) = a.permissions {
-            use cap_std::fs::PermissionsExt;
-            f.set_permissions(cap_std::fs::Permissions::from_mode(mode & 0o7777)).map_err(io_code)?;
+        if let Some(perms) = a.permissions.and_then(permissions) {
+            f.set_permissions(perms).map_err(io_code)?;
         }
         Ok(ok(id))
     }
@@ -580,14 +594,28 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("a.txt"), "hi").unwrap();
         std::fs::write(t.0.join("secret"), "s3cret").unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&t.0, root.join("out")).unwrap();
-            std::os::unix::fs::symlink("..", root.join("up")).unwrap();
-        }
+        link_out(&t.0, &root);
         let fs = Sftp::new(Some(FileService { dir: root, mode })).unwrap();
         (t, fs)
     }
+
+    /// Makes the symlinks `out` (absolute) and `up` (relative) in `root`,
+    /// to its parent `base`.
+    #[cfg(unix)]
+    fn link_out(base: &Path, root: &Path) {
+        std::os::unix::fs::symlink(base, root.join("out")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("up")).unwrap();
+    }
+
+    /// Makes no symlinks: making them here may need privileges.
+    #[cfg(not(unix))]
+    fn link_out(_: &Path, _: &Path) {}
+
+    /// The symlinks [`link_out`] makes.
+    #[cfg(unix)]
+    const LINKS: &[&str] = &["out", "up"];
+    #[cfg(not(unix))]
+    const LINKS: &[&str] = &[];
 
     const R: OpenFlags = OpenFlags::READ;
     fn wc() -> OpenFlags {
@@ -624,30 +652,33 @@ mod tests {
 
     #[tokio::test]
     async fn paths_stay_inside_the_root() {
-        let (t, mut fs) = fixture(FileServeMode::ReadWrite);
+        let (_t, mut fs) = fixture(FileServeMode::ReadWrite);
         assert_eq!(read_file(&mut fs, "a.txt").await.unwrap(), b"hi");
         // `..` clamps at the root.
         assert_eq!(read_file(&mut fs, "../../sub/../a.txt").await.unwrap(), b"hi");
         assert_eq!(read_file(&mut fs, "../secret").await.unwrap_err(), StatusCode::NoSuchFile);
         let n = fs.realpath(0, "sub/../../x".into()).await.unwrap();
         assert_eq!(n.files[0].filename, "/x");
-        #[cfg(unix)]
-        {
-            // Symlinks out of the root don't resolve, absolute or relative.
-            assert!(read_file(&mut fs, "out/secret").await.is_err());
-            assert!(read_file(&mut fs, "up/secret").await.is_err());
-            assert!(fs.stat(0, "out".into()).await.is_err());
-            assert!(fs.opendir(0, "up".into()).await.is_err());
-            assert!(upload(&mut fs, "out/new", b"x").await.is_err());
-            // The links themselves are visible.
-            assert!(fs.lstat(0, "out".into()).await.is_ok());
-            // New links are made relative to the root, and can't escape it.
-            fs.symlink(0, "/a.txt".into(), "link".into()).await.unwrap();
-            assert_eq!(read_file(&mut fs, "link").await.unwrap(), b"hi");
-            fs.symlink(0, "../secret".into(), "link2".into()).await.unwrap();
-            assert_eq!(std::fs::read_link(t.0.join("root/link2")).unwrap(), Path::new("secret"));
-            assert_eq!(read_file(&mut fs, "link2").await.unwrap_err(), StatusCode::NoSuchFile);
-        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_stay_inside_the_root() {
+        let (t, mut fs) = fixture(FileServeMode::ReadWrite);
+        // Symlinks out of the root don't resolve, absolute or relative.
+        assert!(read_file(&mut fs, "out/secret").await.is_err());
+        assert!(read_file(&mut fs, "up/secret").await.is_err());
+        assert!(fs.stat(0, "out".into()).await.is_err());
+        assert!(fs.opendir(0, "up".into()).await.is_err());
+        assert!(upload(&mut fs, "out/new", b"x").await.is_err());
+        // The links themselves are visible.
+        assert!(fs.lstat(0, "out".into()).await.is_ok());
+        // New links are made relative to the root, and can't escape it.
+        fs.symlink(0, "/a.txt".into(), "link".into()).await.unwrap();
+        assert_eq!(read_file(&mut fs, "link").await.unwrap(), b"hi");
+        fs.symlink(0, "../secret".into(), "link2".into()).await.unwrap();
+        assert_eq!(std::fs::read_link(t.0.join("root/link2")).unwrap(), Path::new("secret"));
+        assert_eq!(read_file(&mut fs, "link2").await.unwrap_err(), StatusCode::NoSuchFile);
     }
 
     #[tokio::test]
@@ -689,10 +720,7 @@ mod tests {
         fs.mkdir(0, "d".into(), FileAttributes::default()).await.unwrap();
         fs.rmdir(0, "d".into()).await.unwrap();
         fs.rmdir(0, "sub".into()).await.unwrap();
-        let mut want = vec!["a.txt"];
-        if cfg!(unix) {
-            want.extend(["out", "up"]);
-        }
+        let want: Vec<_> = ["a.txt"].iter().chain(LINKS).copied().collect();
         assert_eq!(names(&root), want);
     }
 
@@ -745,7 +773,7 @@ mod tests {
         assert_eq!(std::fs::read(root.join("d").join(other)).unwrap(), b"2");
         denied(fs.opendir(0, "d".into()).await);
         denied(fs.rmdir(0, "d".into()).await);
-        #[cfg(unix)]
+        // Through a symlink out of the root, where there is one.
         assert!(upload(&mut fs, "out/escaped", b"x").await.is_err());
         assert!(!t.0.join("escaped").exists());
     }

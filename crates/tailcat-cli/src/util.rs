@@ -58,18 +58,28 @@ pub fn user_cache_dir() -> Option<PathBuf> {
     user_dir("LocalAppData", "Library/Caches", "XDG_CACHE_HOME", ".cache")
 }
 
-/// A per-user directory: `windows_var` on Windows, `macos` under the
-/// home directory on macOS, and elsewhere `xdg_var` or else `home_rel`
-/// under the home directory.
-fn user_dir(windows_var: &str, macos: &str, xdg_var: &str, home_rel: &str) -> Option<PathBuf> {
-    let var = |v| std::env::var_os(v).filter(|x| !x.is_empty()).map(PathBuf::from);
-    if cfg!(windows) {
-        return var(windows_var);
-    }
-    if cfg!(target_os = "macos") {
-        return var("HOME").map(|h| h.join(macos));
-    }
-    var(xdg_var).or_else(|| var("HOME").map(|h| h.join(home_rel)))
+/// A per-user directory: on Windows, the one in `windows_var`.
+#[cfg(windows)]
+fn user_dir(windows_var: &str, _macos: &str, _xdg_var: &str, _home_rel: &str) -> Option<PathBuf> {
+    env_path(windows_var)
+}
+
+/// A per-user directory: on macOS, `macos` under the home directory.
+#[cfg(target_os = "macos")]
+fn user_dir(_windows_var: &str, macos: &str, _xdg_var: &str, _home_rel: &str) -> Option<PathBuf> {
+    env_path("HOME").map(|h| h.join(macos))
+}
+
+/// A per-user directory: the one in `xdg_var`, or else `home_rel` under
+/// the home directory.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn user_dir(_windows_var: &str, _macos: &str, xdg_var: &str, home_rel: &str) -> Option<PathBuf> {
+    env_path(xdg_var).or_else(|| env_path("HOME").map(|h| h.join(home_rel)))
+}
+
+/// The path in the environment variable `v`, unless it's unset or empty.
+fn env_path(v: &str) -> Option<PathBuf> {
+    std::env::var_os(v).filter(|x| !x.is_empty()).map(PathBuf::from)
 }
 
 /// Atomically replaces `path` with a file of `data` readable only by its
@@ -99,8 +109,7 @@ pub fn create_private(path: impl AsRef<Path>, data: &[u8]) -> std::io::Result<()
             // file, though a crash can now leave a partial one.
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            owner_only(&mut opts);
             std::io::Write::write_all(&mut opts.open(path)?, data)
         }
         r => r,
@@ -119,13 +128,22 @@ fn write_temp_beside(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
     let tmp = path.with_file_name(tmp_name);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    owner_only(&mut opts);
     let mut f = opts.open(&tmp)?;
     let written = std::io::Write::write_all(&mut f, data).and_then(|()| f.sync_all());
     written.inspect_err(|_| _ = std::fs::remove_file(&tmp))?;
     Ok(tmp)
 }
+
+/// Makes `opts` create files readable and writable only by their owner.
+#[cfg(unix)]
+fn owner_only(opts: &mut std::fs::OpenOptions) {
+    std::os::unix::fs::OpenOptionsExt::mode(opts, 0o600);
+}
+
+/// Does nothing: files have no Unix mode here.
+#[cfg(not(unix))]
+fn owner_only(_: &mut std::fs::OpenOptions) {}
 
 /// Accepts the next connection from `accept` (a listener's accept),
 /// riding out errors: the likely ones (too many open files, a

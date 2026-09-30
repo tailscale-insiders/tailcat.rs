@@ -53,17 +53,34 @@ pub fn open_browser(url: &str) {
     eprintln!("# Opening {url}");
     let url = url.to_string();
     std::thread::spawn(move || {
-        let r = if cfg!(target_os = "macos") {
-            std::process::Command::new("open").arg(&url).status()
-        } else if cfg!(windows) {
-            std::process::Command::new("cmd").args(["/c", "start", "", &url]).status()
-        } else {
-            std::process::Command::new("xdg-open").arg(&url).status()
-        };
-        if let Err(e) = r {
+        if let Err(e) = browser_command(&url).status() {
             eprintln!("# opening browser failed: {e}");
         }
     });
+}
+
+/// The command that opens `url` in the default browser.
+#[cfg(target_os = "macos")]
+fn browser_command(url: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("open");
+    cmd.arg(url);
+    cmd
+}
+
+/// The command that opens `url` in the default browser.
+#[cfg(windows)]
+fn browser_command(url: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/c", "start", "", url]);
+    cmd
+}
+
+/// The command that opens `url` in the default browser.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn browser_command(url: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url);
+    cmd
 }
 
 /// Forwards each mapping until Ctrl-C or SIGTERM. `mappings` must not be
@@ -116,20 +133,19 @@ async fn forward_listener(cl: Client, ln: TcpListener, spec: ForwardSpec) {
 }
 
 /// Waits for Ctrl-C or SIGTERM.
+#[cfg(unix)]
 pub async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+}
+
+/// Waits for Ctrl-C.
+#[cfg(not(unix))]
+pub async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

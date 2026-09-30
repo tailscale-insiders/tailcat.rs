@@ -449,26 +449,27 @@ fn open_tun(name: Option<&str>, me: &NodeRecord, prefix: &IpNet, mtu: u16) -> Re
 
 /// Resolves on SIGINT or SIGTERM. The handlers are installed now, before
 /// the returned future is first polled.
+#[cfg(unix)]
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
-        let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
-        Ok(async move {
-            tokio::select! {
-                _ = int.recv() => {}
-                _ = term.recv() => {}
-            }
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
-        Ok(async move {
-            let _ = ctrl_c.await;
-        })
-    }
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut int = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+        }
+    })
+}
+
+/// Resolves on Ctrl-C. The handler is installed now, before the returned
+/// future is first polled.
+#[cfg(not(unix))]
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
+    Ok(async move {
+        let _ = ctrl_c.await;
+    })
 }
 
 /// Picks the home region for `init`.
