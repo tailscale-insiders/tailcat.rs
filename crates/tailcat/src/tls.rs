@@ -18,7 +18,7 @@ fn provider() -> Arc<CryptoProvider> {
 
 /// Parses a hostname or IP literal as a TLS server name.
 pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>> {
-    ServerName::try_from(host.to_string()).map_err(|e| Error::Derp(format!("invalid DERP hostname {host:?}: {e}")))
+    ServerName::try_from(host.to_string()).map_err(|error| Error::BadHostname { host: host.into(), error })
 }
 
 /// Builds the TLS client configuration for a DERP node: standard web PKI

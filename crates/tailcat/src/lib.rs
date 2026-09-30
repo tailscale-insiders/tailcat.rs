@@ -104,6 +104,8 @@ pub enum Error {
     Timeout(String),
     #[error("{0}")]
     Other(String),
+    #[error("DERP: invalid DERP hostname {host:?}: {error}")]
+    BadHostname { host: String, error: rustls::pki_types::InvalidDnsNameError },
     #[error("TLS: {0}")]
     Tls(rustls::Error),
     #[error("TLS verifier: {0}")]
