@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{io, iter};
 
 use anyhow::{Result, anyhow, bail};
 use tailcat::{Addr, Client, NodePrivate};
@@ -50,7 +51,7 @@ impl Target {
             Err(_) => {
                 let mut addrs = tokio::net::lookup_host((host, port)).await?;
                 let first = addrs.next().ok_or_else(|| anyhow!("no addresses found for {host:?}"))?;
-                std::iter::once(first).chain(addrs).find(SocketAddr::is_ipv4).unwrap_or(first).ip()
+                iter::once(first).chain(addrs).find(SocketAddr::is_ipv4).unwrap_or(first).ip()
             }
         };
         Ok(Target::Via(SocketAddr::new(ip.to_canonical(), port)))
@@ -154,7 +155,7 @@ const REP_HOST_UNREACHABLE: u8 = 4;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 7;
 const REP_ADDR_TYPE_NOT_SUPPORTED: u8 = 8;
 
-async fn reply(c: &mut TcpStream, rep: u8, bound: SocketAddr) -> std::io::Result<()> {
+async fn reply(c: &mut TcpStream, rep: u8, bound: SocketAddr) -> io::Result<()> {
     let mut b = vec![5, rep, 0];
     put_addr(&mut b, &bound.ip().to_string(), bound.port());
     c.write_all(&b).await
