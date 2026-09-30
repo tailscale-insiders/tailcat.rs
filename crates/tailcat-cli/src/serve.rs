@@ -39,8 +39,14 @@ impl PortSet {
         !self.all && self.ports.is_empty()
     }
 
-    fn sorted_ports(&self) -> Vec<u16> {
-        if self.all { (1..=65535).collect() } else { self.ports.iter().copied().collect() }
+    /// The TCP ports to admit: those served, plus `extra`. "all" covers
+    /// every port but 0.
+    fn tcp_ranges(&self, extra: impl IntoIterator<Item = u16>) -> Vec<PortRange> {
+        if self.all {
+            return vec![PortRange { first: 1, last: u16::MAX }];
+        }
+        let ports: BTreeSet<u16> = self.ports.iter().copied().chain(extra).collect();
+        PortRange::coalesce(ports)
     }
 }
 
@@ -276,15 +282,8 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
     // Outside the accept-one-connection mode (and exit-node and exec,
     // which accept any port), admit only the served ports.
     if !one_shot_stdout && !exit_node && !serve_exec {
-        let mut ports = ps.sorted_ports();
-        if ssh_services && !ps.contains(22) {
-            ports.insert(0, 22);
-        }
-        if serve_perf {
-            ports.push(PERF_PORT);
-            ports.sort();
-        }
-        b = b.served_tcp_ports(PortRange::coalesce(&ports));
+        let extra = [ssh_services.then_some(22), serve_perf.then_some(PERF_PORT)];
+        b = b.served_tcp_ports(ps.tcp_ranges(extra.into_iter().flatten()));
     }
     if serve_perf {
         b = b.served_udp_ports(vec![PortRange::single(PERF_PORT)]);
@@ -625,7 +624,9 @@ mod tests {
         assert!(!ps.contains(0));
         assert!(ps.contains(65535));
         assert_eq!(ps.services, BTreeSet::from(["perf".into()]));
-        assert_eq!(ps.sorted_ports().len(), 65535);
+        assert_eq!(ps.tcp_ranges([22]), [PortRange { first: 1, last: 65535 }]);
+        let ps = parse_port_set("80,81").unwrap();
+        assert_eq!(ps.tcp_ranges([22, 82, 22]), [PortRange::single(22), PortRange { first: 80, last: 82 }]);
         // SSH services need SSH support.
         assert_eq!(parse_port_set("files").is_ok(), cfg!(feature = "ssh"));
 

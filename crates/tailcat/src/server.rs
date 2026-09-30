@@ -66,9 +66,9 @@ impl PortRange {
     }
 
     /// Coalesces sorted ports into contiguous ranges.
-    pub fn coalesce(sorted: &[u16]) -> Vec<PortRange> {
+    pub fn coalesce(sorted: impl IntoIterator<Item = u16>) -> Vec<PortRange> {
         let mut out: Vec<PortRange> = Vec::new();
-        for &p in sorted {
+        for p in sorted {
             match out.last_mut() {
                 Some(r) if r.last.checked_add(1) == Some(p) => r.last = p,
                 _ => out.push(PortRange::single(p)),
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn coalesce_ports() {
-        let r = PortRange::coalesce(&[22, 80, 81, 82, 443]);
+        let r = PortRange::coalesce([22, 80, 81, 82, 443]);
         assert_eq!(r, vec![PortRange::single(22), PortRange { first: 80, last: 82 }, PortRange::single(443)]);
     }
 
@@ -997,7 +997,7 @@ mod tests {
     fn port_filters() {
         assert!(PortRange::ALL.contains(0));
         assert!(PortRange::ALL.contains(65535));
-        assert_eq!(PortRange::coalesce(&[65534, 65535]), vec![PortRange { first: 65534, last: 65535 }]);
+        assert_eq!(PortRange::coalesce([65534, 65535]), vec![PortRange { first: 65534, last: 65535 }]);
         assert!(admits(&None, 1));
         let only_ssh = Some(vec![PortRange::single(22)]);
         assert!(admits(&only_ssh, 22));
