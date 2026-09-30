@@ -387,9 +387,7 @@ fn a_poll_is_a_set(tc: TestCase) {
     let peers = from_scratch(&me, &draw_poll(&tc));
     let polled = draw_poll(&tc);
     let mut reordered = shuffled(&tc, &polled);
-    if let Some(r) = polled.first()
-        && tc.draw(gs::booleans())
-    {
+    if let Some(r) = polled.first().filter(|_| tc.draw(gs::booleans())) {
         reordered.push(r.clone());
     }
     assert_eq!(reconcile(&me, &peers, &polled), reconcile(&me, &peers, &reordered));
