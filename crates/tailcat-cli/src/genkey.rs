@@ -205,7 +205,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("no DERP region {} in the DERP map; can't embed its nodes", ci.region_id))?;
         reg.nodes.truncate(2);
         for n in &mut reg.nodes {
-            n.ipv6.clear();
+            n.ipv6 = tailcat::NodeIp::Lookup;
         }
         ci.region.push(reg);
         ci.region_id = 0;

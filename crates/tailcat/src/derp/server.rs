@@ -19,7 +19,7 @@ use tracing::{debug, trace};
 use super::{
     ClientInfo, FrameType, MAGIC, MAX_FRAME_SIZE, PEER_GONE_NOT_HERE, PROTOCOL_VERSION, ServerInfo, frame, split_key,
 };
-use crate::derpmap::{DerpNode, DerpRegion};
+use crate::derpmap::{DerpNode, DerpRegion, NodeIp};
 use crate::key::{NodePrivate, NodePublic};
 use crate::{Error, Result};
 
@@ -270,10 +270,10 @@ impl DevDerp {
         let stun_port = udp.local_addr()?.port();
         let tls = Arc::new(crate::tls::self_signed_server_config(&["T", "localhost"])?);
         let tasks = vec![tokio::spawn(server.clone().serve_tls(ln, tls)), tokio::spawn(serve_stun(udp))];
-        // "none" tells clients not to try the other family.
+        // Clients aren't to try the other family.
         let (ipv4, ipv6) = match advertise.unwrap_or(derp.ip()) {
-            ip @ IpAddr::V4(_) => (ip.to_string(), "none".into()),
-            ip @ IpAddr::V6(_) => ("none".into(), ip.to_string()),
+            ip @ IpAddr::V4(_) => (NodeIp::Addr(ip), NodeIp::Disabled),
+            ip @ IpAddr::V6(_) => (NodeIp::Disabled, NodeIp::Addr(ip)),
         };
         let region = DerpRegion {
             region_id: 1,

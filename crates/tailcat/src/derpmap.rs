@@ -163,6 +163,85 @@ pub struct DerpRegion {
     pub nodes: Vec<DerpNode>,
 }
 
+/// A DERP node's address in one family, as the map gives it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NodeIp {
+    /// None given (the empty string): look the hostname up.
+    #[default]
+    Lookup,
+    /// `none`: don't use this family.
+    Disabled,
+    /// The address to use instead of looking the hostname up. One of the
+    /// other family is ignored, and so is the family.
+    Addr(std::net::IpAddr),
+    /// Anything else, kept as given; the family isn't used, as with
+    /// `none`.
+    Other(String),
+}
+
+impl NodeIp {
+    /// The address given, if it's of the family `v4` says.
+    pub fn addr(&self, v4: bool) -> Option<std::net::IpAddr> {
+        match self {
+            NodeIp::Addr(ip) if ip.is_ipv4() == v4 => Some(*ip),
+            _ => None,
+        }
+    }
+
+    /// The text form, as the map has it.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            NodeIp::Lookup => "".into(),
+            NodeIp::Disabled => "none".into(),
+            NodeIp::Addr(ip) => ip.to_string().into(),
+            NodeIp::Other(s) => s.as_str().into(),
+        }
+    }
+}
+
+impl From<&str> for NodeIp {
+    fn from(s: &str) -> Self {
+        match s {
+            "" => NodeIp::Lookup,
+            "none" => NodeIp::Disabled,
+            s => s.parse().map_or_else(|_| NodeIp::Other(s.into()), NodeIp::Addr),
+        }
+    }
+}
+
+impl From<String> for NodeIp {
+    fn from(s: String) -> Self {
+        match NodeIp::from(s.as_str()) {
+            NodeIp::Other(_) => NodeIp::Other(s),
+            ip => ip,
+        }
+    }
+}
+
+impl PartialEq<&str> for NodeIp {
+    fn eq(&self, other: &&str) -> bool {
+        self.text() == *other
+    }
+}
+
+impl std::fmt::Display for NodeIp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+impl Serialize for NodeIp {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeIp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(d).map(NodeIp::from)
+    }
+}
+
 /// One DERP relay server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DerpNode {
@@ -175,9 +254,9 @@ pub struct DerpNode {
     #[serde(rename = "CertName", default, skip_serializing_if = "is_default")]
     pub cert_name: String,
     #[serde(rename = "IPv4", default, skip_serializing_if = "is_default")]
-    pub ipv4: String,
+    pub ipv4: NodeIp,
     #[serde(rename = "IPv6", default, skip_serializing_if = "is_default")]
-    pub ipv6: String,
+    pub ipv6: NodeIp,
     #[serde(rename = "STUNPort", default, skip_serializing_if = "is_default")]
     pub stun_port: i32,
     #[serde(rename = "STUNOnly", default, skip_serializing_if = "is_default")]
@@ -209,18 +288,18 @@ impl DerpNode {
     /// The addresses to use for this node: explicit IPs if given
     /// (`"none"` disables a family), else a DNS lookup of the hostname.
     pub async fn resolve_addrs(&self, port: u16) -> Vec<std::net::SocketAddr> {
-        use std::net::{IpAddr, SocketAddr};
-        let explicit = |s: &str, v4: bool| s.parse::<IpAddr>().ok().filter(|ip| ip.is_ipv4() == v4);
-        let mut out: Vec<_> = [explicit(&self.ipv4, true), explicit(&self.ipv6, false)]
+        use std::net::SocketAddr;
+        let mut out: Vec<_> = [self.ipv4.addr(true), self.ipv6.addr(false)]
             .into_iter()
             .flatten()
             .map(|ip| SocketAddr::new(ip, port))
             .collect();
-        if (self.ipv4.is_empty() || self.ipv6.is_empty())
+        let looks_up = |v4: bool| if v4 { &self.ipv4 } else { &self.ipv6 } == &NodeIp::Lookup;
+        if (looks_up(true) || looks_up(false))
             && !self.host_name.is_empty()
             && let Ok(addrs) = tokio::net::lookup_host((self.host_name.as_str(), port)).await
         {
-            for a in addrs.filter(|a| if a.is_ipv4() { self.ipv4.is_empty() } else { self.ipv6.is_empty() }) {
+            for a in addrs.filter(|a| looks_up(a.is_ipv4())) {
                 // A lookup can repeat an address, and not always next to
                 // itself, so `dedup` after the sort would miss it.
                 if !out.contains(&a) {
@@ -434,6 +513,22 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn node_ips() {
+        let v4: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(NodeIp::from(""), NodeIp::Lookup);
+        assert_eq!(NodeIp::from("none"), NodeIp::Disabled);
+        assert_eq!(NodeIp::from("192.0.2.1"), NodeIp::Addr(v4));
+        assert_eq!(NodeIp::from("bogus"), NodeIp::Other("bogus".into()));
+        assert_eq!((NodeIp::Addr(v4).addr(true), NodeIp::Addr(v4).addr(false)), (Some(v4), None));
+        for s in ["", "none", "192.0.2.1", "2001:db8::1", "bogus"] {
+            let n = DerpNode { ipv4: s.into(), ..Default::default() };
+            let back: DerpNode = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+            assert_eq!(back.ipv4.text(), s, "{s:?}");
+            assert_eq!(back.ipv4, n.ipv4, "{s:?}");
+        }
     }
 
     #[test]

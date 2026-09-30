@@ -15,6 +15,7 @@
 //! nodes use `n` (name), `i`, `h` (hostname), `t` (cert name), `4`, `6`
 //! (IPs), `s` (STUN port), `d` (DERP port) and `x` (insecure for tests).
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -23,7 +24,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::derpmap::{DerpMap, DerpNode, DerpRegion, FetchOptions, RegionCode, RegionName, is_default};
+use crate::derpmap::{DerpMap, DerpNode, DerpRegion, FetchOptions, NodeIp, RegionCode, RegionName, is_default};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::{Error, Result};
 
@@ -329,15 +330,15 @@ enum Field<'a> {
     Bool(&'a mut bool),
 }
 
-/// A text field: a plain string, or a region's code or name.
+/// A text field: a plain string, or a typed value written as one.
 trait Text {
-    fn text(&self) -> &str;
+    fn text(&self) -> Cow<'_, str>;
     fn set_text(&mut self, s: String);
 }
 
 impl Text for String {
-    fn text(&self) -> &str {
-        self
+    fn text(&self) -> Cow<'_, str> {
+        self.into()
     }
     fn set_text(&mut self, s: String) {
         *self = s;
@@ -345,8 +346,8 @@ impl Text for String {
 }
 
 impl Text for RegionCode {
-    fn text(&self) -> &str {
-        self.as_str()
+    fn text(&self) -> Cow<'_, str> {
+        self.as_str().into()
     }
     fn set_text(&mut self, s: String) {
         *self = s.into();
@@ -354,8 +355,17 @@ impl Text for RegionCode {
 }
 
 impl Text for RegionName {
-    fn text(&self) -> &str {
-        self.as_str()
+    fn text(&self) -> Cow<'_, str> {
+        self.as_str().into()
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s.into();
+    }
+}
+
+impl Text for NodeIp {
+    fn text(&self) -> Cow<'_, str> {
+        NodeIp::text(self)
     }
     fn set_text(&mut self, s: String) {
         *self = s.into();
@@ -401,7 +411,7 @@ impl Field<'_> {
 
     fn to_cbor(&self) -> Value {
         match self {
-            Field::Str(s) => Value::Text(s.text().to_string()),
+            Field::Str(s) => Value::Text(s.text().into_owned()),
             Field::Int(i) => Value::Integer((**i).into()),
             Field::Bool(b) => Value::Bool(**b),
         }
@@ -409,7 +419,7 @@ impl Field<'_> {
 
     fn to_json(&self) -> serde_json::Value {
         match self {
-            Field::Str(s) => s.text().into(),
+            Field::Str(s) => s.text().into_owned().into(),
             Field::Int(i) => (**i).into(),
             Field::Bool(b) => (**b).into(),
         }
@@ -676,7 +686,7 @@ mod tests {
         let n = &r.nodes[0];
         assert_eq!(n.name, "127.0.0.1", "a name redundant with the hostname becomes the hostname");
         assert_eq!((n.region_id, n.derp_port, n.stun_port), (1, 4443, -1));
-        assert_eq!((n.cert_name.as_str(), n.ipv6.as_str()), ("c", "none"));
+        assert_eq!((n.cert_name.as_str(), &n.ipv6), ("c", &NodeIp::Disabled));
         assert!(n.insecure_for_tests);
         assert_eq!(r.nodes[1].name, "bare", "a name with no hostname is kept");
     }
