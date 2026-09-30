@@ -18,7 +18,7 @@ use crate::github::{Attempt, RunId};
 /// A GitHub OIDC token, as its compact JWT text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Jwt(pub String);
+pub struct Jwt(String);
 
 impl Jwt {
     pub fn as_str(&self) -> &str {

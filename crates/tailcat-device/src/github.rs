@@ -271,7 +271,7 @@ pub async fn mint_oidc(audience: &str) -> Result<Jwt> {
     let mut url = Url::parse(&url).context("parsing ACTIONS_ID_TOKEN_REQUEST_URL")?;
     url.query_pairs_mut().append_pair("audience", audience);
     let req = tailcat::shared_client().get(url).bearer_auth(tok).timeout(Duration::from_secs(15));
-    Ok(Jwt(send(req, || "minting an OIDC token".into()).await?.json::<Resp>().await?.value))
+    Ok(Jwt::from(send(req, || "minting an OIDC token".into()).await?.json::<Resp>().await?.value))
 }
 
 /// The claims of a GitHub Actions OIDC token that admission checks.
@@ -460,7 +460,7 @@ pub(crate) mod tests {
         let mut b = jwt.as_ref().unwrap().as_str().as_bytes().to_vec();
         let i = b.len() - 10; // inside the signature
         b[i] = if b[i] == b'A' { b'B' } else { b'A' };
-        Some(Jwt(String::from_utf8(b).unwrap()))
+        Some(Jwt::from(String::from_utf8(b).unwrap()))
     }
 
     #[test]
@@ -475,7 +475,7 @@ pub(crate) mod tests {
         assert!(admit(&claims_another, "100", Scope::Run).is_err(), "says it's from another run");
         assert!(admit(&rec("1"), "100", Scope::Branch).is_err(), "no token outside run scope");
         assert!(admit(&rec("1"), "100", Scope::Pr).is_err(), "no token outside run scope");
-        let tokened = NodeRecord { jwt: Some(Jwt("x.y.z".into())), ..rec("1") };
+        let tokened = NodeRecord { jwt: Some(Jwt::from("x.y.z".to_string())), ..rec("1") };
         assert!(admit(&tokened, "100", Scope::Run).is_err(), "a token but no verifier");
     }
 
@@ -513,7 +513,7 @@ pub(crate) mod tests {
                 "iss": OIDC_ISSUER, "exp": self.now + 600, "iat": self.now,
                 "repository_id": "42", "ref": "refs/heads/main", "run_id": "100", "run_attempt": "1",
             });
-            Some(Jwt(jsonwebtoken::encode(&header, &merged(defaults, claims), &self.enc).unwrap()))
+            Some(Jwt::from(jsonwebtoken::encode(&header, &merged(defaults, claims), &self.enc).unwrap()))
         }
 
         /// A record for a fresh key with a token for it, plus `claims`.
