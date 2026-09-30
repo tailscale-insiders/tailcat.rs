@@ -5,6 +5,7 @@
 //! subcommands, flags, and output, built on the `tailcat` crate.
 
 mod addrarg;
+mod args;
 mod cache;
 mod client;
 mod forward;
@@ -47,7 +48,7 @@ pub struct ServeFlags {
     /// Comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If
     /// empty, all clients are allowed.
     #[arg(long, value_name = "KEYS")]
-    pub allow: Option<String>,
+    pub allow: Option<args::AllowArg>,
     /// Print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map
     /// region ID. This lets clients connect more quickly, without a DERP map fetch.
     #[arg(long)]

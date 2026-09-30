@@ -330,12 +330,8 @@ pub async fn server(g: &Global, flags: &ServeFlags, spec: String, exec_args: Opt
         b = b.served_udp_ports(vec![PortRange::single(PERF_PORT)]);
     }
     if let Some(allow) = &flags.allow {
-        let set = KeySet::default();
-        // "none" adds nothing, and an empty set allows no clients.
-        for ks in allow.split(',').filter(|&k| k != "none") {
-            set.add(ks.parse().map_err(|e| anyhow!("invalid key {ks:?} in --allow: {e}"))?);
-        }
-        b = b.allow_client(set.checker());
+        // An empty set allows no clients.
+        b = b.allow_client(KeySet::from(allow.clone()).checker());
     }
     if exit_node {
         b = b
