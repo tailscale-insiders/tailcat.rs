@@ -230,8 +230,8 @@ struct Message {
     typ: MessageType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Params>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "message_id")]
+    id: MessageId,
     #[serde(default, skip_serializing_if = "is_zero")]
     stream: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -244,7 +244,7 @@ struct Message {
 
 impl Message {
     fn new(typ: MessageType) -> Self {
-        Message { typ, params: None, id: String::new(), stream: 0, error: String::new(), t: 0, stats: None }
+        Message { typ, params: None, id: None, stream: 0, error: String::new(), t: 0, stats: None }
     }
 
     fn error(e: impl Into<String>) -> Self {
@@ -259,9 +259,23 @@ impl Message {
     }
 }
 
-/// Parses a hex test ID.
-fn parse_id(s: &str) -> Option<[u8; 8]> {
-    hex::decode(s).ok()?.try_into().ok()
+/// The test a message is about, if it names one.
+type MessageId = Option<[u8; 8]>;
+
+/// Reads and writes a [`MessageId`] in hex. Text that isn't an ID reads
+/// as none, which is how a message that must name its test fails.
+mod message_id {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::MessageId;
+
+    pub fn serialize<S: Serializer>(id: &MessageId, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&id.map(hex::encode).unwrap_or_default())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MessageId, D::Error> {
+        Ok(hex::decode(String::deserialize(d)?).ok().and_then(|b| b.try_into().ok()))
+    }
 }
 
 fn unix_nanos() -> i64 {
@@ -1009,7 +1023,7 @@ impl Server {
         match m.typ {
             MessageType::Hello => self.run_test(Ctrl::new(br, wr), m, remote).await,
             MessageType::Stream => {
-                let Some(id) = parse_id(&m.id) else { return };
+                let Some(id) = m.id else { return };
                 let t = match self.lookup(id, m.stream) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1065,10 +1079,7 @@ impl Server {
             return;
         }
         let res = async {
-            t.ctrl
-                .send(&Message { id: hex::encode(id), ..Message::new(MessageType::Ok) })
-                .await
-                .map_err(|e| e.to_string())?;
+            t.ctrl.send(&Message { id: Some(id), ..Message::new(MessageType::Ok) }).await.map_err(|e| e.to_string())?;
             let limit = DEFAULT_MAX_DURATION + HANDSHAKE_TIMEOUT + REPORT_TIMEOUT;
             tokio::time::timeout(limit, t.clone().run()).await.unwrap_or_else(|_| Err("test timed out".into()))
         }
@@ -1100,14 +1111,14 @@ async fn run_client(cl: &tailcat::Client, p: Params, on_progress: Option<OnProgr
         MessageType::Ok => {}
         other => bail!("unexpected reply {other:?} to hello"),
     }
-    let id = parse_id(&m.id).ok_or_else(|| anyhow!("server sent a malformed test ID"))?;
+    let id = m.id.ok_or_else(|| anyhow!("server sent no test ID, or a malformed one"))?;
     let (proto, streams) = (p.proto, p.streams);
     let t = Test::new(p, id, false, ctrl, on_progress);
     for i in 0..streams {
         let sc = match proto {
             Proto::Tcp => {
                 let mut dc = cl.dial_tcp_port(PORT).await.map_err(|e| anyhow!("dialing stream {i}: {e}"))?;
-                let hdr = Message { id: m.id.clone(), stream: i, ..Message::new(MessageType::Stream) }.line();
+                let hdr = Message { id: Some(id), stream: i, ..Message::new(MessageType::Stream) }.line();
                 dc.write_all(&hdr).await.map_err(|e| anyhow!("stream {i}: sending header: {e}"))?;
                 let (rd, wr) = tokio::io::split(dc);
                 tcp_stream(Box::new(rd), Box::new(wr))
@@ -1631,8 +1642,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&done).unwrap(), r#"{"type":"done","stats":{"bytes":5,"duration":1000000}}"#);
 
         let ok: Message = serde_json::from_str(r#"{"type":"ok","id":"0102030405060708","extra":1}"#).unwrap();
-        assert_eq!(parse_id(&ok.id), Some([1, 2, 3, 4, 5, 6, 7, 8]));
-        assert_eq!(parse_id("0102"), None);
+        assert_eq!(ok.id, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(ok.line(), b"{\"type\":\"ok\",\"id\":\"0102030405060708\"}\n");
+        let short: Message = serde_json::from_str(r#"{"type":"ok","id":"0102"}"#).unwrap();
+        assert_eq!(short.id, None);
         assert_eq!(Message::error("no").line(), b"{\"type\":\"error\",\"error\":\"no\"}\n");
 
         // A type from a newer peer is kept as sent.
