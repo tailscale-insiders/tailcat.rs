@@ -296,9 +296,7 @@ impl MagicSock {
             derp_tx,
             tasks: Mutex::default(),
         });
-        let mut inner = ms.inner.lock().unwrap();
-        ms.ensure_derp_locked(&mut inner, ms.home_region);
-        drop(inner);
+        ms.ensure_derp(ms.home_region);
         let weak = Arc::downgrade(&ms);
         let mut tasks = vec![tokio::spawn(derp_recv_loop(weak.clone(), derp_rx))];
         for s in [&ms.udp4, &ms.udp6].into_iter().flatten() {
@@ -508,6 +506,13 @@ impl MagicSock {
     fn send_derp_locked(&self, inner: &mut Inner, region: i32, peer: &NodePublic, pkt: &[u8]) -> bool {
         self.ensure_derp_locked(inner, region);
         inner.derp.get(&region).is_some_and(|c| c.send(peer, pkt))
+    }
+
+    /// Connects to DERP region `region`, if not already.
+    fn ensure_derp(&self, region: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        self.ensure_derp_locked(&mut inner, region);
+        drop(inner);
     }
 
     fn ensure_derp_locked(&self, inner: &mut Inner, region: i32) {
