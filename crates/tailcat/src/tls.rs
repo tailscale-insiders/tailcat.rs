@@ -1,5 +1,6 @@
 //! TLS configuration for DERP connections, using the ring crypto provider.
 
+use std::fmt::Display;
 use std::sync::Arc;
 
 use rustls::client::WebPkiServerVerifier;
@@ -16,11 +17,11 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn derp_err(e: impl std::fmt::Display) -> Error {
+fn derp_err(e: impl Display) -> Error {
     Error::Derp(e.to_string())
 }
 
-fn other_err(e: impl std::fmt::Display) -> Error {
+fn other_err(e: impl Display) -> Error {
     Error::other(e.to_string())
 }
 
