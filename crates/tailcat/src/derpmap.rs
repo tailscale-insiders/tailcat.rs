@@ -516,12 +516,12 @@ async fn fetch_fresh(url: &str, mode: FetchMode, cache: &dyn DerpMapCache, stale
         return Ok(dm.clone());
     }
     if !res.status().is_success() {
-        return Err(Error::other(format!("fetching {url}: {}", res.status())));
+        return Err(Error::DerpMapStatus { url: url.into(), status: res.status() });
     }
     let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let body = res.bytes().await?;
     if body.len() > 8 << 20 {
-        return Err(Error::other(format!("DERP map from {url} is too large")));
+        return Err(Error::DerpMapTooLarge { url: url.into() });
     }
     let dm = serde_json::from_slice(&body).map_err(|error| Error::DerpMapJson { url: url.into(), error })?;
     cache.put(url, &body, &etag);
