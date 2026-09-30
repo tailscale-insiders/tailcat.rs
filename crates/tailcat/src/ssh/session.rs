@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::{env, future, io, mem};
 
 use bytes::Bytes;
 use russh::keys::PublicKey;
@@ -112,7 +113,7 @@ impl ConnHandler {
             return session.channel_failure(id);
         };
         let pty = st.pty.take();
-        let client_env = std::mem::take(&mut st.env);
+        let client_env = mem::take(&mut st.env);
         let (winch_tx, winch_rx) = mpsc::unbounded_channel();
         st.winch = Some(winch_tx);
         session.channel_success(id)?;
@@ -324,7 +325,7 @@ async fn pump(mut r: impl AsyncRead + Unpin, mut w: impl AsyncWrite + Unpin) {
 async fn drain<T>(output: impl Future<Output = T>, input: impl Future) -> T {
     let input = async {
         input.await;
-        std::future::pending::<Infallible>().await
+        future::pending::<Infallible>().await
     };
     tokio::select! {
         r = output => r,
@@ -420,7 +421,7 @@ async fn run_pipes(rd: &mut ChannelReadHalf, wr: &Writer, plan: Plan) -> u32 {
     exit_code(drain(exited, input).await)
 }
 
-fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
+fn exit_code(status: io::Result<ExitStatus>) -> u32 {
     let Ok(s) = status else { return 1 };
     if let Some(sig) = killed_by(&s) {
         return 128 + sig as u32;
@@ -430,13 +431,15 @@ fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
 
 /// The signal that ended the process, if one did.
 #[cfg(unix)]
-fn killed_by(s: &std::process::ExitStatus) -> Option<i32> {
-    std::os::unix::process::ExitStatusExt::signal(s)
+fn killed_by(s: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    s.signal()
 }
 
 /// None: there are no signals here.
 #[cfg(not(unix))]
-fn killed_by(_: &std::process::ExitStatus) -> Option<i32> {
+fn killed_by(_: &ExitStatus) -> Option<i32> {
     None
 }
 
@@ -447,6 +450,7 @@ mod pty {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use std::{mem, ptr};
 
     use russh::{ChannelReadHalf, Pty};
     use tokio::io::AsyncWriteExt;
@@ -484,7 +488,7 @@ mod pty {
     /// Applies the client's terminal modes to the PTY.
     fn apply_modes(fd: i32, modes: &[(Pty, u32)]) {
         unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
+            let mut t: libc::termios = mem::zeroed();
             if libc::tcgetattr(fd, &mut t) != 0 {
                 return;
             }
@@ -565,15 +569,8 @@ mod pty {
         let (mut master, mut slave) = (-1, -1);
         let mut ws = winsize(req.cols, req.rows);
         // The winsize parameter is `*const` on Linux and `*mut` on macOS.
-        let r = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::addr_of_mut!(ws),
-            )
-        };
+        let r =
+            unsafe { libc::openpty(&mut master, &mut slave, ptr::null_mut(), ptr::null_mut(), ptr::addr_of_mut!(ws)) };
         if r != 0 {
             say(wr, format!("pty open: {}\r\n", io::Error::last_os_error())).await;
             return 1;
@@ -716,30 +713,24 @@ pub(crate) struct User {
 /// environment.
 #[cfg(unix)]
 pub(crate) fn current_user() -> User {
+    use std::ffi::CStr;
+
     unsafe {
         let uid = libc::getuid();
         let pw = libc::getpwuid(uid);
         if !pw.is_null() {
-            let name = std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
-            let home = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
+            let name = CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
+            let home = CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
             return User { name, home, uid };
         }
-        User {
-            name: std::env::var("USER").unwrap_or_default(),
-            home: std::env::var("HOME").unwrap_or_else(|_| "/".into()),
-            uid,
-        }
+        User { name: env::var("USER").unwrap_or_default(), home: env::var("HOME").unwrap_or_else(|_| "/".into()), uid }
     }
 }
 
 /// The user this process runs as, from the environment.
 #[cfg(not(unix))]
 pub(crate) fn current_user() -> User {
-    User {
-        name: std::env::var("USERNAME").unwrap_or_default(),
-        home: std::env::var("USERPROFILE").unwrap_or_default(),
-        uid: 1,
-    }
+    User { name: env::var("USERNAME").unwrap_or_default(), home: env::var("USERPROFILE").unwrap_or_default(), uid: 1 }
 }
 
 /// The user's login shell: PowerShell.
@@ -752,8 +743,9 @@ fn login_shell(_: &User) -> String {
 /// /bin/sh (as the Go implementation does).
 #[cfg(target_os = "macos")]
 fn login_shell(u: &User) -> String {
-    if let Ok(out) =
-        std::process::Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
+    use std::process::Command;
+
+    if let Ok(out) = Command::new("dscl").args([".", "-read", &format!("/Users/{}", u.name), "UserShell"]).output()
         && let Some(s) = String::from_utf8_lossy(&out.stdout).strip_prefix("UserShell: ")
     {
         return s.trim().to_string();
@@ -771,7 +763,7 @@ fn login_shell(_: &User) -> String {
 /// $SHELL, else /bin/sh.
 #[cfg(not(windows))]
 fn env_shell() -> String {
-    std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
+    env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }
 
 fn default_path(u: &User) -> &'static str {
@@ -786,7 +778,6 @@ fn default_path(u: &User) -> &'static str {
 mod tests {
     use std::env::temp_dir;
     use std::fs;
-    use std::io;
     use std::process::Command;
     use std::time::Duration;
 
@@ -915,6 +906,7 @@ mod tests {
     #[cfg(unix)]
     fn have_pty() -> bool {
         use std::ptr::null_mut;
+
         let (mut m, mut s) = (-1, -1);
         if unsafe { libc::openpty(&mut m, &mut s, null_mut(), null_mut(), null_mut()) } != 0 {
             return false;
