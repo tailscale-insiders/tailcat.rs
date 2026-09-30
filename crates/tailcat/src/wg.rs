@@ -367,8 +367,10 @@ impl Engine {
             PathAddr::Derp(_) => None,
         };
         let mut out: Vec<Vec<u8>> = Vec::new();
+        // Decrypted data goes at the start of `buf`, which then becomes
+        // the packet.
+        let mut buf = vec![0u8; pkt.data.len().max(256) + 64];
         let inbound = {
-            let mut buf = vec![0u8; pkt.data.len().max(256) + 64];
             let mut tunn = peer.tunn.lock().unwrap();
             match tunn.decapsulate(src_ip, &pkt.data, &mut buf) {
                 TunnResult::WriteToNetwork(b) => {
@@ -380,8 +382,8 @@ impl Engine {
                     }
                     None
                 }
-                TunnResult::WriteToTunnelV4(b, src) => Some((b.to_vec(), IpAddr::V4(src))),
-                TunnResult::WriteToTunnelV6(b, src) => Some((b.to_vec(), IpAddr::V6(src))),
+                TunnResult::WriteToTunnelV4(b, src) => Some((b.len(), IpAddr::V4(src))),
+                TunnResult::WriteToTunnelV6(b, src) => Some((b.len(), IpAddr::V6(src))),
                 TunnResult::Err(e) => {
                     trace!(peer = %key.short_string(), "wg: decapsulate: {e:?}");
                     None
@@ -396,8 +398,9 @@ impl Engine {
             Some((_, src)) if !self.owns(&peer, &src) => {
                 trace!(peer = %key.short_string(), "wg: dropping packet from disallowed source {src}");
             }
-            Some((data, _)) if !data.is_empty() => {
-                let _ = self.inbound.send(InboundPacket { peer: key, data }).await;
+            Some((n, _)) if n > 0 => {
+                buf.truncate(n);
+                let _ = self.inbound.send(InboundPacket { peer: key, data: buf }).await;
             }
             _ => {}
         }
