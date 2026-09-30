@@ -323,8 +323,7 @@ async fn closing_resets_open_connections() {
 async fn served_ports_filter_silently() {
     init();
     let dev = DevDerp::start_local().await.unwrap();
-    let only_80 = vec![PortRange::single(80)];
-    let server = builder(&dev).served_tcp_ports(only_80).on_tcp(|_| say(b"ok")).start().await.unwrap();
+    let server = builder(&dev).served_tcp_ports([PortRange::single(80)]).on_tcp(|_| say(b"ok")).start().await.unwrap();
     let client = Client::new(server.tailcat_addr());
     assert_eq!(request(client.dial_tcp_port(80).await.unwrap(), b"").await, "ok");
 

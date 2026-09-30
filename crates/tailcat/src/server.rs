@@ -192,14 +192,14 @@ impl ServerBuilder {
 
     /// Restricts which TCP ports on the server's address the filter
     /// admits, for defense in depth; filtered SYNs get no reply.
-    pub fn served_tcp_ports(mut self, p: Vec<PortRange>) -> Self {
-        self.cfg.served_tcp_ports = Some(p);
+    pub fn served_tcp_ports(mut self, p: impl IntoIterator<Item = PortRange>) -> Self {
+        self.cfg.served_tcp_ports = Some(p.into_iter().collect());
         self
     }
 
     /// Restricts which UDP ports on the server's address are admitted.
-    pub fn served_udp_ports(mut self, p: Vec<PortRange>) -> Self {
-        self.cfg.served_udp_ports = Some(p);
+    pub fn served_udp_ports(mut self, p: impl IntoIterator<Item = PortRange>) -> Self {
+        self.cfg.served_udp_ports = Some(p.into_iter().collect());
         self
     }
 

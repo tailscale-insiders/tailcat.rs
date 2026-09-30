@@ -55,7 +55,7 @@ fn world() -> &'static World {
             let dev = DevDerp::start_local().await.unwrap();
             let server = Server::builder()
                 .region(dev.region.clone())
-                .served_udp_ports(vec![PortRange::single(SERVED)])
+                .served_udp_ports([PortRange::single(SERVED)])
                 .on_udp(|_| {
                     Some(udp_handler(|c| async move {
                         let _ = SINK.lock().unwrap().as_ref().unwrap().send(c);

@@ -362,7 +362,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
         b = b.served_tcp_ports(ps.tcp_ranges(extra.into_iter().flatten()));
     }
     if serve_perf {
-        b = b.served_udp_ports(vec![PortRange::single(PERF_PORT)]);
+        b = b.served_udp_ports([PortRange::single(PERF_PORT)]);
     }
     if let Some(allow) = &flags.allow {
         // An empty set allows no clients.
