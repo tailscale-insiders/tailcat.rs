@@ -84,6 +84,7 @@ pub(crate) struct Shared {
 /// options, trailing garbage, and an empty result.
 pub fn parse_authorized_keys(texts: &[String]) -> Result<HashSet<Vec<u8>>> {
     use russh::keys::ssh_key::authorized_keys::Entry;
+
     let mut allowed = HashSet::new();
     for (ti, text) in texts.iter().enumerate() {
         for (li, line) in text.lines().enumerate() {
@@ -118,6 +119,7 @@ fn ssh_key_dir() -> Result<PathBuf> {
 #[cfg(unix)]
 fn make_private_dir(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
+
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
 }
 
@@ -184,6 +186,7 @@ fn load_or_create_key(path: &Path) -> Result<PrivateKey> {
 fn with_dir_locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     use std::io;
     use std::os::fd::AsRawFd;
+
     let dir = fs::File::open(dir)?;
     if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(io::Error::last_os_error().into());
@@ -243,6 +246,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(unix)]
 fn owner_only(o: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
+
     o.mode(0o600);
 }
 
