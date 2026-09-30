@@ -74,8 +74,11 @@ impl GithubSource {
                 {
                     self.verifier = Some(Verifier::fetch().await?);
                 }
+                // A token is checked as of the upload, which GitHub dates.
+                let published = a.uploaded().unwrap_or_else(unix_now);
                 let admitted = rec.and_then(|r| {
-                    github::admit(&r, run, &self.env, self.scope, self.verifier.as_ref(), &self.audience_prefix)?;
+                    let (v, prefix) = (self.verifier.as_ref(), &self.audience_prefix);
+                    github::admit(&r, run, &self.env, self.scope, v, prefix, published)?;
                     Ok(r)
                 });
                 // Not retried: artifacts don't change.
@@ -162,6 +165,11 @@ fn read(p: &Path) -> Result<Option<NodeRecord>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The time now, in Unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Keeps one record per node key, the first.
@@ -381,6 +389,31 @@ mod tests {
         assert_eq!(keys(&second), keys([&ours, &rerun]), "a re-run run's earlier attempt's records are dropped");
         let third = poll(&mut src).await;
         assert_eq!(keys(&third), keys([&ours]), "a finished run's records are dropped");
+    }
+
+    /// A node that starts late still admits a record whose token was
+    /// valid when it was uploaded, as GitHub dates the upload.
+    #[tokio::test]
+    async fn github_tokens_count_as_of_their_upload() {
+        let s = Signer::new();
+        // Both tokens lapsed at 2023-11-14T22:13:20Z.
+        let (early, late) = (s.rec(json!({"exp": 1_700_000_000})), s.rec(json!({"exp": 1_700_000_000})));
+        let bodies = bodies([("/dl/1", body(&early)), ("/dl/2", body(&late))]);
+        let (base, _) = fake_github(Box::new(move |base, path, _| match path {
+            RUN_100_ARTIFACTS => {
+                let artifact = |id: u64, created: &str| {
+                    let url = format!("{base}/dl/{id}");
+                    json!({"id": id, "name": format!("node-{id}"), "archive_download_url": url, "created_at": created})
+                };
+                let list = [artifact(1, "2023-11-14T22:00:00Z"), artifact(2, "2023-11-14T22:30:00Z")];
+                (200, serde_json::to_vec(&json!({ "artifacts": list })).unwrap())
+            }
+            p => download(&bodies, p),
+        }))
+        .await;
+        let mut src = Source::github(github(base, Scope::Run, "node-").with_verifier(s.verifier()));
+
+        assert_eq!(keys(&poll(&mut src).await), keys([&early]));
     }
 
     #[tokio::test]

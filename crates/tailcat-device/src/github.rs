@@ -98,6 +98,18 @@ pub struct Artifact {
     pub expired: bool,
     #[serde(default)]
     pub workflow_run: Option<ArtifactRun>,
+    /// When it was uploaded, as GitHub recorded it (RFC 3339).
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+impl Artifact {
+    /// When it was uploaded, in Unix seconds, if GitHub says.
+    pub fn uploaded(&self) -> Option<u64> {
+        use time::format_description::well_known::Rfc3339;
+        let t = time::OffsetDateTime::parse(self.created_at.as_deref()?, &Rfc3339).ok()?;
+        u64::try_from(t.unix_timestamp()).ok()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,8 +249,9 @@ impl Verifier {
         Verifier { jwks }
     }
 
-    /// Checks a token's signature, issuer, expiry and audience.
-    pub fn verify(&self, token: &str, audience: &str) -> Result<Claims> {
+    /// Checks a token's signature, issuer and audience, and that it
+    /// hadn't expired at `at`, in Unix seconds.
+    pub fn verify(&self, token: &str, audience: &str, at: u64) -> Result<Claims> {
         let header = jsonwebtoken::decode_header(token).context("decoding the token header")?;
         let kid = header.kid.ok_or_else(|| anyhow!("token has no key ID"))?;
         let jwk = self.jwks.find(&kid).ok_or_else(|| anyhow!("token signed by unknown key {kid:?}"))?;
@@ -247,14 +260,21 @@ impl Verifier {
         v.set_issuer(&[OIDC_ISSUER]);
         v.set_audience(&[audience]);
         v.set_required_spec_claims(&["exp", "iss", "aud"]);
-        Ok(jsonwebtoken::decode::<Claims>(token, &key, &v).context("verifying the token")?.claims)
+        // Checked against `at` below, not the time now.
+        v.validate_exp = false;
+        let c = jsonwebtoken::decode::<Claims>(token, &key, &v).context("verifying the token")?.claims;
+        ensure!(at <= c.exp.saturating_add(v.leeway), "verifying the token: it expired at {}, before {at}", c.exp);
+        Ok(c)
     }
 }
 
 /// Decides whether a record may join, per the scope. `from_run` is the
 /// run whose artifacts held it. A record must say it's from that run,
 /// and if it carries a token, from the attempt the token was minted in:
-/// peers are ranked by the run and attempt a record says it's from.
+/// peers are ranked by the run and attempt a record says it's from. The
+/// token must have been valid at `published`, when the record was, in
+/// Unix seconds: a node can start long after its peers published, and
+/// only jobs of the run could publish then.
 pub fn admit(
     r: &NodeRecord,
     from_run: &str,
@@ -262,6 +282,7 @@ pub fn admit(
     scope: Scope,
     verifier: Option<&Verifier>,
     audience_prefix: &str,
+    published: u64,
 ) -> Result<()> {
     ensure!(r.run_id == from_run, "record says it's from run {:?}, but came from run {from_run}", r.run_id);
     if scope == Scope::Run {
@@ -278,7 +299,7 @@ pub fn admit(
         return Ok(());
     }
     let v = verifier.ok_or_else(|| anyhow!("no OIDC verifier"))?;
-    let c = v.verify(&r.jwt, &audience_for(audience_prefix, &r.nodekey))?;
+    let c = v.verify(&r.jwt, &audience_for(audience_prefix, &r.nodekey), published)?;
     ensure!(
         e.repository_id.is_empty() || c.repository_id == e.repository_id,
         "token is for repository {}, not ours",
@@ -369,7 +390,7 @@ pub(crate) mod tests {
     #[test]
     fn run_scope_admission() {
         let e = genv();
-        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, None, "p:");
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, None, "p:", 0);
         assert!(admit(&rec("1"), "100", Scope::Run).is_ok());
         assert!(admit(&rec(""), "100", Scope::Run).is_ok(), "no attempt recorded");
         assert!(admit(&rec("2"), "100", Scope::Run).is_err(), "stale attempt");
@@ -435,7 +456,7 @@ pub(crate) mod tests {
         let s = Signer::new();
         let v = s.verifier();
         let e = genv();
-        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, Some(&v), P);
+        let admit = |r: &NodeRecord, from_run: &str, scope| admit(r, from_run, &e, scope, Some(&v), P, s.now);
 
         let r = s.rec(json!({}));
         admit(&r, "100", Scope::Run).unwrap();
@@ -468,6 +489,10 @@ pub(crate) mod tests {
         // Expired, forged, keyless and unknown-key tokens fail.
         let expired = s.rec(json!({"exp": s.now - 3600}));
         assert!(admit(&expired, "100", Scope::Run).is_err(), "expired");
+        // What counts is whether it had when the record was published.
+        let published = |at| super::admit(&expired, "100", &e, Scope::Run, Some(&v), P, at);
+        published(s.now - 3700).unwrap();
+        assert!(published(s.now - 3500).is_err(), "published after it expired");
         let misissued = s.rec(json!({"iss": "https://evil.example"}));
         assert!(admit(&misissued, "100", Scope::Run).is_err(), "issuer");
         let forged = NodeRecord { jwt: tampered(&r.jwt), ..r.clone() };
@@ -498,7 +523,7 @@ pub(crate) mod tests {
         r.run_id = tc.draw(runs()).into();
         r.run_attempt = tc.draw(attempts()).into();
 
-        let Ok(()) = admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P) else { return };
+        let Ok(()) = admit(&r, from_run, &genv(), scope, Some(&s.verifier()), P, s.now) else { return };
         assert_eq!(r.run_id, from_run);
         if let Some((run, attempt)) = token {
             assert_eq!((r.run_id.as_str(), r.run_attempt.as_str()), (run, attempt));
@@ -510,7 +535,7 @@ pub(crate) mod tests {
         let s = Signer::new();
         let v = s.verifier();
         let pr = GithubEnv { git_ref: "refs/pull/5/merge".into(), head_ref: "feature".into(), ..genv() };
-        let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, "99", e, Scope::Pr, Some(&v), P);
+        let admit = |r: &NodeRecord, e: &GithubEnv| admit(r, "99", e, Scope::Pr, Some(&v), P, s.now);
 
         let same_pr = s.rec(json!({"run_id": "99", "ref": "refs/pull/5/merge"}));
         admit(&same_pr, &pr).unwrap();

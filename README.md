@@ -327,7 +327,9 @@ whose audience is `tailcat-device:` plus the SHA-256 of the node key,
 binding the key to the repository, ref, and run. `--scope branch` or
 `--scope pr` admit records from other runs of the workflow, which must
 carry a token that checks out: signature, issuer, expiry, audience, then
-`repository_id` and `ref`.
+`repository_id` and `ref`. A token is checked wherever a record has one,
+and its expiry as of when GitHub says the record was uploaded, so a node
+whose job starts long after its peers' still admits them.
 
 ```yaml
 jobs:
