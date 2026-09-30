@@ -38,7 +38,7 @@ macro_rules! text_id {
         $(#[$m])*
         #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
-        pub struct $t(pub String);
+        pub struct $t(String);
 
         impl $t {
             pub fn as_str(&self) -> &str {
@@ -235,7 +235,7 @@ pub async fn sibling_runs(e: &GithubEnv, scope: Scope) -> Result<Vec<(RunId, Att
     let mut runs: Vec<(RunId, Attempt)> = l
         .workflow_runs
         .into_iter()
-        .map(|r| (RunId(r.id.to_string()), Attempt(r.run_attempt.to_string())))
+        .map(|r| (RunId::from(r.id.to_string()), Attempt::from(r.run_attempt.to_string())))
         .filter(|(id, _)| *id != e.run_id)
         .collect();
     runs.push((e.run_id.clone(), e.run_attempt.clone()));
