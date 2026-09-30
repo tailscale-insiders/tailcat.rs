@@ -1,7 +1,6 @@
 //! `tailcat ssh`, `tailcat cp`, `tailcat ls`, and loading the `ssh`
 //! service's authorized keys.
 
-use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tailcat::ssh::parse_authorized_keys;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::args::KeyArg;
+use crate::args::{KeyArg, SshTarget};
 use crate::{Global, usagef};
 
 const MAX_AUTHORIZED_KEYS_SIZE: usize = 1 << 20;
@@ -83,20 +82,6 @@ async fn fetch_github_keys(user: &str) -> Result<String> {
     Ok(limited_text(&b, "GitHub key list")?)
 }
 
-/// Validates the -p value: a port, an IP (meaning port 22), or IP:port.
-fn validated_ssh_port(v: &str) -> Result<String> {
-    if let Ok(p @ 1..) = v.parse::<u16>() {
-        return Ok(p.to_string());
-    }
-    if let Ok(ip) = v.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, 22).to_string());
-    }
-    match v.parse::<SocketAddr>() {
-        Ok(a) if a.port() != 0 => Ok(a.to_string()),
-        _ => Err(usagef!("invalid port or IP:port {v:?}")),
-    }
-}
-
 /// A short, deterministic ssh destination name for an address: the real
 /// address rides in the ProxyCommand, and long names overflow
 /// ControlPath socket paths.
@@ -155,7 +140,7 @@ fn proxy_command_join_windows(args: &[String]) -> Result<String> {
 
 /// The `-o` options for ssh and scp: skip host key checks (the tunnel
 /// authenticates the server) and connect through `tailcat <addr> <port>`.
-fn ssh_opts(g: &Global, addr: &str, port: &str) -> Result<Vec<String>> {
+fn ssh_opts(g: &Global, addr: &str, port: SshTarget) -> Result<Vec<String>> {
     let mut proxy = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
     if g.key != KeyArg::Default {
         proxy.push(format!("--key={}", g.key));
@@ -163,7 +148,7 @@ fn ssh_opts(g: &Global, addr: &str, port: &str) -> Result<Vec<String>> {
     if g.derpmap_url != tailcat::DEFAULT_DERP_MAP_URL {
         proxy.push(format!("--derpmap-url={}", g.derpmap_url));
     }
-    proxy.extend([addr.into(), port.into()]);
+    proxy.extend([addr.into(), port.to_string()]);
     let proxy = proxy_command_join(&proxy)?;
     Ok([
         "UpdateHostKeys no".into(),
@@ -195,18 +180,17 @@ fn exec_replace(argv: Vec<String>) -> Result<ExitCode> {
     Ok(ExitCode::from(cmd.status()?.code().unwrap_or(1) as u8))
 }
 
-pub async fn ssh_mode(g: &Global, port: &str, skip_dns_check: bool, args: Vec<String>) -> Result<ExitCode> {
-    let port = validated_ssh_port(port)?;
+pub async fn ssh_mode(g: &Global, port: SshTarget, skip_dns_check: bool, args: Vec<String>) -> Result<ExitCode> {
     let (dst, rest) = args.split_first().expect("clap requires a destination");
     let (user, addr_str) = dst.split_once('@').map_or((None, dst.as_str()), |(u, a)| (Some(u), a));
     let (addr, via_dns) = crate::addrarg::validated_addr(addr_str).await?;
     if via_dns && !skip_dns_check {
-        refuse_wide_open_dns(g, addr_str, &addr, &port, user).await;
+        refuse_wide_open_dns(g, addr_str, &addr, port, user).await;
     }
     let ssh = crate::serve::which("ssh").ok_or_else(|| anyhow!("no ssh client found in $PATH"))?;
     let host = ssh_dest_host(addr.as_str());
     let mut argv = vec![ssh];
-    argv.extend(ssh_opts(g, addr.as_str(), &port)?);
+    argv.extend(ssh_opts(g, addr.as_str(), port)?);
     argv.push("--".into());
     argv.push(user.map_or(host.clone(), |u| format!("{u}@{host}")));
     argv.extend_from_slice(rest);
@@ -226,11 +210,16 @@ fn scp_supports_sftp_flag(scp: &str) -> bool {
     !["unknown", "illegal", "invalid"].iter().any(|w| msg.contains(&format!("{w} option -- s")))
 }
 
-pub async fn cp_mode(g: &Global, recursive: bool, preserve: bool, port: &str, args: Vec<String>) -> Result<ExitCode> {
+pub async fn cp_mode(
+    g: &Global,
+    recursive: bool,
+    preserve: bool,
+    port: SshTarget,
+    args: Vec<String>,
+) -> Result<ExitCode> {
     if args.len() < 2 {
         return Err(usagef!("cp requires at least one source and a target"));
     }
-    let port = validated_ssh_port(port)?;
     let mut hosts = args.iter().filter_map(|a| split_remote_arg(a)).map(|(h, _)| h);
     let Some(addr) = hosts.next() else {
         return Err(usagef!("no remote <tc-addr>:path argument; nothing to copy through tailcat"));
@@ -245,7 +234,7 @@ pub async fn cp_mode(g: &Global, recursive: bool, preserve: bool, port: &str, ar
     if scp_supports_sftp_flag(&scp) {
         argv.push("-s".into());
     }
-    argv.extend(ssh_opts(g, addr.as_str(), &port)?);
+    argv.extend(ssh_opts(g, addr.as_str(), port)?);
     argv.extend(recursive.then(|| "-r".into()));
     argv.extend(preserve.then(|| "-p".into()));
     argv.push("--".into());
@@ -282,16 +271,16 @@ async fn login_without_credentials(
     Ok((h, ok))
 }
 
-async fn dial(cl: &tailcat::Client, port: &str) -> Result<tailcat::TcpStream> {
-    Ok(match port.parse::<SocketAddr>() {
-        Ok(a) => cl.dial_tcp(a).await?,
-        Err(_) => cl.dial_tcp_port(port.parse().map_err(|_| anyhow!("invalid port {port:?}"))?).await?,
+async fn dial(cl: &tailcat::Client, port: SshTarget) -> Result<tailcat::TcpStream> {
+    Ok(match port {
+        SshTarget::Via(a) => cl.dial_tcp(a).await?,
+        SshTarget::Port(p) => cl.dial_tcp_port(p).await?,
     })
 }
 
 /// Reports whether the server at `addr` lets a stranger (a fresh node
 /// key, no SSH credentials) log in.
-async fn probe_stranger_ssh(g: &Global, addr: &tailcat::Addr, port: &str, user: Option<&str>) -> Result<bool> {
+async fn probe_stranger_ssh(g: &Global, addr: &tailcat::Addr, port: SshTarget, user: Option<&str>) -> Result<bool> {
     let cl = crate::client::new_client(g, addr.clone(), tailcat::NodePrivate::generate());
     let conn = dial(&cl, port).await?;
     let user = user.map_or_else(local_username, String::from);
@@ -300,7 +289,7 @@ async fn probe_stranger_ssh(g: &Global, addr: &tailcat::Addr, port: &str, user: 
     Ok(open)
 }
 
-async fn refuse_wide_open_dns(g: &Global, dns_name: &str, addr: &tailcat::Addr, port: &str, user: Option<&str>) {
+async fn refuse_wide_open_dns(g: &Global, dns_name: &str, addr: &tailcat::Addr, port: SshTarget, user: Option<&str>) {
     match tokio::time::timeout(Duration::from_secs(10), probe_stranger_ssh(g, addr, port, user)).await {
         Ok(Ok(true)) => {}
         Ok(Err(e)) => {
@@ -454,13 +443,6 @@ mod tests {
 
     #[test]
     fn ports_and_hosts() {
-        assert_eq!(validated_ssh_port("22").unwrap(), "22");
-        assert_eq!(validated_ssh_port("10.0.0.1").unwrap(), "10.0.0.1:22");
-        assert_eq!(validated_ssh_port("[fd7a::1]:2222").unwrap(), "[fd7a::1]:2222");
-        for bad in ["0", "10.0.0.1:0", "host:22"] {
-            assert!(validated_ssh_port(bad).is_err(), "{bad:?} validated");
-        }
-
         let host = ssh_dest_host("tcabc");
         assert!(host.starts_with("tailcat-"));
         assert_eq!(host.len(), "tailcat-".len() + 16);

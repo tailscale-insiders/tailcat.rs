@@ -153,7 +153,7 @@ enum Cmd {
     Ssh {
         /// Port number, or ip:port to reach via the server's exit node; a bare IP means port 22 on it.
         #[arg(short = 'p', default_value = "22")]
-        port: String,
+        port: args::SshTarget,
         /// Don't probe a DNS-named destination for whether its server gives SSH access to strangers.
         #[arg(long)]
         skip_dns_safety_check: bool,
@@ -173,7 +173,7 @@ enum Cmd {
         preserve: bool,
         /// Port number of the server's SSH (file service) port.
         #[arg(short = 'P', default_value = "22")]
-        port: String,
+        port: args::SshTarget,
         args: Vec<String>,
     },
     /// list files on a tailcat server
@@ -344,11 +344,11 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
         }
         #[cfg(feature = "ssh")]
         Some(Cmd::Ssh { port, skip_dns_safety_check, args }) => {
-            return ssh::ssh_mode(g, &port, skip_dns_safety_check, args).await;
+            return ssh::ssh_mode(g, port, skip_dns_safety_check, args).await;
         }
         #[cfg(feature = "ssh")]
         Some(Cmd::Cp { recursive, preserve, port, args }) => {
-            return ssh::cp_mode(g, recursive, preserve, &port, args).await;
+            return ssh::cp_mode(g, recursive, preserve, port, args).await;
         }
         #[cfg(feature = "ssh")]
         Some(Cmd::Ls { long, target }) => return ssh::ls_mode(g, long, &target).await,

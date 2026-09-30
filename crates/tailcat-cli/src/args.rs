@@ -2,6 +2,8 @@
 //! types. Grammars `tailcat-device` shares are in `tailcat-args`.
 
 use std::fmt;
+#[cfg(feature = "ssh")]
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -67,6 +69,44 @@ impl fmt::Display for KeyArg {
     }
 }
 
+/// Where `ssh -p` or `cp -P` connects through the server: a port on the
+/// server, or an IP:port its exit node reaches, where a bare IP means
+/// its port 22.
+#[cfg(feature = "ssh")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshTarget {
+    Port(u16),
+    Via(SocketAddr),
+}
+
+#[cfg(feature = "ssh")]
+impl FromStr for SshTarget {
+    type Err = String;
+
+    fn from_str(v: &str) -> Result<Self, String> {
+        if let Ok(p @ 1..) = v.parse::<u16>() {
+            return Ok(SshTarget::Port(p));
+        }
+        if let Ok(ip) = v.parse::<IpAddr>() {
+            return Ok(SshTarget::Via(SocketAddr::new(ip, 22)));
+        }
+        match v.parse::<SocketAddr>() {
+            Ok(a) if a.port() != 0 => Ok(SshTarget::Via(a)),
+            _ => Err(format!("invalid port or IP:port {v:?}")),
+        }
+    }
+}
+
+#[cfg(feature = "ssh")]
+impl fmt::Display for SshTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SshTarget::Port(p) => write!(f, "{p}"),
+            SshTarget::Via(a) => write!(f, "{a}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tailcat::NodePrivate;
@@ -83,6 +123,18 @@ mod tests {
         ] {
             let k: KeyArg = s.parse().unwrap();
             assert_eq!((&k, k.to_string()), (&want, s.to_string()));
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn ssh_targets() {
+        let target = |s: &str| s.parse::<SshTarget>().map(|t| t.to_string());
+        assert_eq!(target("22"), Ok("22".into()));
+        assert_eq!(target("10.0.0.1"), Ok("10.0.0.1:22".into()));
+        assert_eq!(target("[fd7a::1]:2222"), Ok("[fd7a::1]:2222".into()));
+        for bad in ["0", "10.0.0.1:0", "host:22"] {
+            assert!(target(bad).is_err(), "{bad:?} parsed");
         }
     }
 
