@@ -65,6 +65,8 @@ pub mod ssh;
 mod tls;
 
 use std::io::{self, ErrorKind};
+#[cfg(feature = "ssh")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub use addr::{Addr, ConnInfo, PrivateKey};
@@ -132,6 +134,9 @@ pub enum Error {
     Base64(base64::DecodeError),
     #[error("CBOR unmarshal: {0}")]
     Cbor(ciborium::de::Error<io::Error>),
+    #[cfg(feature = "ssh")]
+    #[error("parsing host key {}: {error}", path.display())]
+    HostKey { path: PathBuf, error: russh::keys::Error },
     /// An SFTP request refused with a status.
     #[cfg(feature = "ssh")]
     #[error("SFTP: {0}")]

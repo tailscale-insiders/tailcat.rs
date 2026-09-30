@@ -175,8 +175,7 @@ fn load_or_create_key(path: &Path) -> Result<PrivateKey> {
             Err(e) if e.kind() == ErrorKind::NotFound => install_new_key(path, false)?,
             Err(e) => return Err(e.into()),
         };
-        russh::keys::decode_secret_key(&pem, None)
-            .map_err(|e| Error::other(format!("parsing host key {}: {e}", path.display())))
+        russh::keys::decode_secret_key(&pem, None).map_err(|error| Error::HostKey { path: path.into(), error })
     })
 }
 
