@@ -181,7 +181,7 @@ pub async fn genkey(g: &Global, a: GenkeyArgs) -> Result<()> {
             RegionArg::Auto => ci.region_id = -1,
             RegionArg::Id(n) => ci.region_id = *n,
             RegionArg::Hosts(hosts) => {
-                let nodes = hosts.iter().map(|h| DerpNode { host_name: h.clone(), ..Default::default() });
+                let nodes = hosts.iter().map(|h| DerpNode { host_name: h.as_str().into(), ..Default::default() });
                 ci.region.push(DerpRegion { nodes: nodes.collect(), ..Default::default() });
             }
             RegionArg::Name(n) => match region.find(&dm) {

@@ -1269,10 +1269,10 @@ fn shared_tailscale_derp(r: &tailcat::DerpRegion) -> Option<String> {
     r.nodes
         .iter()
         .find(|n| {
-            let h = n.host_name.trim_end_matches('.').to_lowercase();
+            let h = n.host_name.text().trim_end_matches('.').to_lowercase();
             h.ends_with(".ipn.dev") || h.ends_with(".tailscale.com")
         })
-        .map(|n| n.host_name.clone())
+        .map(|n| n.host_name.to_string())
 }
 
 pub async fn run(g: &Global, a: PerfArgs) -> Result<()> {

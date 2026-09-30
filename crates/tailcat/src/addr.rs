@@ -25,7 +25,7 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::derpmap::{
-    CertName, DerpMap, DerpNode, DerpRegion, FetchOptions, NodeIp, RegionCode, RegionName, is_default,
+    CertName, DerpMap, DerpNode, DerpRegion, FetchOptions, Host, NodeIp, RegionCode, RegionName, is_default,
 };
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::{Error, Result};
@@ -67,7 +67,7 @@ impl Addr {
             }
             for n in &mut r.nodes {
                 if n.name.is_empty() {
-                    n.name = n.host_name.clone();
+                    n.name = n.host_name.to_string();
                 }
                 if n.region_id == 0 {
                     n.region_id = r.region_id;
@@ -181,7 +181,7 @@ impl ConnInfo {
                     .map(|n| {
                         let mut n = n.clone();
                         n.region_id = 0;
-                        if !n.host_name.is_empty() {
+                        if n.host_name != Host::Unset {
                             n.name.clear();
                         }
                         Value::Map(cbor_map(node_fields(&mut n)))
@@ -368,6 +368,15 @@ impl Text for RegionName {
 impl Text for NodeIp {
     fn text(&self) -> Cow<'_, str> {
         NodeIp::text(self)
+    }
+    fn set_text(&mut self, s: String) {
+        *self = s.into();
+    }
+}
+
+impl Text for Host {
+    fn text(&self) -> Cow<'_, str> {
+        Host::text(self)
     }
     fn set_text(&mut self, s: String) {
         *self = s.into();

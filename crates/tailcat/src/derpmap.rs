@@ -242,6 +242,77 @@ impl<'de> Deserialize<'de> for NodeIp {
     }
 }
 
+/// A DERP node's host, which it's dialed by and, unless its
+/// [`CertName`] says otherwise, its certificate is for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Host {
+    /// None given (the empty string). The node can't be dialed.
+    #[default]
+    Unset,
+    /// An IP literal.
+    Ip(std::net::IpAddr),
+    /// A DNS name.
+    Dns(String),
+}
+
+impl Host {
+    /// The text form, as the map has it.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Host::Unset => "".into(),
+            Host::Ip(ip) => ip.to_string().into(),
+            Host::Dns(n) => n.as_str().into(),
+        }
+    }
+
+    /// The name to dial, look up and check a certificate for, if any.
+    pub fn dialable(&self) -> Option<std::borrow::Cow<'_, str>> {
+        (*self != Host::Unset).then(|| self.text())
+    }
+}
+
+impl From<&str> for Host {
+    fn from(s: &str) -> Self {
+        match s {
+            "" => Host::Unset,
+            s => s.parse().map_or_else(|_| Host::Dns(s.into()), Host::Ip),
+        }
+    }
+}
+
+impl From<String> for Host {
+    fn from(s: String) -> Self {
+        match Host::from(s.as_str()) {
+            Host::Dns(_) => Host::Dns(s),
+            h => h,
+        }
+    }
+}
+
+impl PartialEq<&str> for Host {
+    fn eq(&self, other: &&str) -> bool {
+        self.text() == *other
+    }
+}
+
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+impl Serialize for Host {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Host {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(d).map(Host::from)
+    }
+}
+
 /// What a DERP node's TLS certificate is checked against, as the map
 /// gives it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -351,7 +422,7 @@ pub struct DerpNode {
     #[serde(rename = "RegionID", default)]
     pub region_id: i32,
     #[serde(rename = "HostName", default)]
-    pub host_name: String,
+    pub host_name: Host,
     #[serde(rename = "CertName", default, skip_serializing_if = "is_default")]
     pub cert_name: CertName,
     #[serde(rename = "IPv4", default, skip_serializing_if = "is_default")]
@@ -397,8 +468,8 @@ impl DerpNode {
             .collect();
         let looks_up = |v4: bool| if v4 { &self.ipv4 } else { &self.ipv6 } == &NodeIp::Lookup;
         if (looks_up(true) || looks_up(false))
-            && !self.host_name.is_empty()
-            && let Ok(addrs) = tokio::net::lookup_host((self.host_name.as_str(), port)).await
+            && let Some(host) = self.host_name.dialable()
+            && let Ok(addrs) = tokio::net::lookup_host((&*host, port)).await
         {
             for a in addrs.filter(|a| looks_up(a.is_ipv4())) {
                 // A lookup can repeat an address, and not always next to
@@ -625,6 +696,20 @@ mod tests {
         let n = DerpNode { stun_test_ip: parse(r#"{"STUNTestIP":"192.0.2.9"}"#), ..Default::default() };
         assert!(serde_json::to_string(&n).unwrap().contains(r#""STUNTestIP":"192.0.2.9""#));
         assert!(!serde_json::to_string(&DerpNode::default()).unwrap().contains("STUNTestIP"));
+    }
+
+    #[test]
+    fn hosts() {
+        assert_eq!(Host::from(""), Host::Unset);
+        assert_eq!(Host::from("192.0.2.1"), Host::Ip("192.0.2.1".parse().unwrap()));
+        assert_eq!(Host::from("tc302a.ipn.dev"), Host::Dns("tc302a.ipn.dev".into()));
+        assert_eq!(Host::Unset.dialable(), None);
+        assert_eq!(Host::from("derp.example").dialable().as_deref(), Some("derp.example"));
+        // The map always has a HostName, empty for none.
+        let json = serde_json::to_string(&DerpNode::default()).unwrap();
+        assert!(json.contains("\"HostName\":\"\""), "{json}");
+        let n: DerpNode = serde_json::from_str("{\"HostName\":\"\"}").unwrap();
+        assert_eq!(n.host_name, Host::Unset);
     }
 
     #[test]

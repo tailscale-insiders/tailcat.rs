@@ -24,22 +24,28 @@ const OUT_QUEUE: usize = 512;
 
 /// Opens a TLS connection to a DERP node, trying its addresses in turn.
 pub async fn dial_tls(n: &DerpNode) -> Result<TlsStream<TcpStream>> {
-    let mut err = format!("no addresses for DERP node {:?}", n.host_name);
+    let host = node_host(n)?;
+    let mut err = format!("no addresses for DERP node {host:?}");
     for a in n.resolve_addrs(n.derp_port()).await {
         match tokio::time::timeout(DIAL_NODE_TIMEOUT, TcpStream::connect(a)).await {
             Ok(Ok(tcp)) => {
                 let _ = tcp.set_nodelay(true);
                 let connector = tokio_rustls::TlsConnector::from(Arc::new(crate::tls::client_config_for_node(n)?));
                 return connector
-                    .connect(crate::tls::server_name(&n.host_name)?, tcp)
+                    .connect(crate::tls::server_name(&host)?, tcp)
                     .await
-                    .map_err(|e| Error::Derp(format!("TLS handshake with {}: {e}", n.host_name)));
+                    .map_err(|e| Error::Derp(format!("TLS handshake with {host}: {e}")));
             }
             Ok(Err(e)) => err = format!("dial {a}: {e}"),
             Err(_) => err = format!("dial {a}: timeout"),
         }
     }
     Err(Error::Derp(err))
+}
+
+/// The name a node is dialed by, which it can't be without.
+fn node_host(n: &DerpNode) -> Result<std::borrow::Cow<'_, str>> {
+    n.host_name.dialable().ok_or_else(|| Error::Derp(format!("DERP node {:?} has no hostname", n.name)))
 }
 
 /// Performs the HTTP upgrade and DERP login on an established stream,
@@ -173,17 +179,17 @@ type Stream = BufReader<TlsStream<TcpStream>>;
 async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &str) -> Result<(Stream, String)> {
     let mut last = Error::Derp(format!("no nodes in DERP region {}", region.region_id));
     for n in region.nodes.iter().filter(|n| !n.stun_only) {
+        let host = n.host_name.text();
         let attempt = async {
             let mut s = BufReader::new(dial_tls(n).await?);
-            let host =
-                if n.derp_port() == 443 { n.host_name.clone() } else { format!("{}:{}", n.host_name, n.derp_port()) };
-            login(&mut s, &host, key, app_name).await?;
+            let authority = if n.derp_port() == 443 { host.to_string() } else { format!("{host}:{}", n.derp_port()) };
+            login(&mut s, &authority, key, app_name).await?;
             Ok::<_, Error>(s)
         };
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt).await {
-            Ok(Ok(s)) => return Ok((s, n.host_name.clone())),
+            Ok(Ok(s)) => return Ok((s, host.into_owned())),
             Ok(Err(e)) => last = e,
-            Err(_) => last = Error::Derp(format!("timeout connecting to {}", n.host_name)),
+            Err(_) => last = Error::Derp(format!("timeout connecting to {host}")),
         }
     }
     Err(last)
