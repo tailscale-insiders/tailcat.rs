@@ -1,6 +1,6 @@
 //! Where peers' node records come from.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -34,14 +34,14 @@ pub struct GithubSource {
     pub name_prefix: String,
     pub audience_prefix: String,
     verifier: Option<Verifier>,
-    /// Artifacts already fetched, by ID: their run, and their admitted
-    /// record, if any.
-    seen: HashMap<u64, (String, Option<NodeRecord>)>,
+    /// Artifacts already fetched, by ID, so oldest first: their run, and
+    /// their admitted record, if any.
+    seen: BTreeMap<u64, (String, Option<NodeRecord>)>,
 }
 
 impl GithubSource {
     pub fn new(env: GithubEnv, scope: Scope, name_prefix: String, audience_prefix: String) -> Self {
-        GithubSource { env, scope, name_prefix, audience_prefix, verifier: None, seen: HashMap::new() }
+        GithubSource { env, scope, name_prefix, audience_prefix, verifier: None, seen: BTreeMap::new() }
     }
 
     /// Uses `v` to check OIDC tokens instead of fetching GitHub's keys.
@@ -88,21 +88,14 @@ impl GithubSource {
         // here, not when an artifact is first seen, since a run can be
         // re-run between polls. Run scope admits records that name no
         // attempt, as `admit` does. Oldest artifact first, so the result
-        // doesn't depend on hashing.
-        let current = |run: &str, r: &NodeRecord| {
+        // doesn't depend on the order artifacts were listed in.
+        let scope = self.scope;
+        let current = move |run: &str, r: &NodeRecord| {
             runs.iter().any(|(id, attempt)| {
-                id == run && (r.run_attempt == *attempt || self.scope == Scope::Run && r.run_attempt.is_empty())
+                id == run && (r.run_attempt == *attempt || scope == Scope::Run && r.run_attempt.is_empty())
             })
         };
-        let mut live: Vec<(u64, &NodeRecord)> = self
-            .seen
-            .iter()
-            .filter_map(|(id, (run, r))| Some((*id, run, r.as_ref()?)))
-            .filter(|(_, run, r)| current(run, r))
-            .map(|(id, _, r)| (id, r))
-            .collect();
-        live.sort_by_key(|(id, _)| *id);
-        Ok(live.into_iter().map(|(_, r)| r))
+        Ok(self.seen.values().filter_map(move |(run, r)| r.as_ref().filter(|r| current(run, r))))
     }
 }
 
