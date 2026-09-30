@@ -130,14 +130,14 @@ fn write_at(buf: &mut Vec<u8>, off: usize, data: &[u8]) {
 impl Fs {
     fn new(mode: FileServeMode) -> Fs {
         let tmp = TempDir::new();
-        fs::create_dir(tmp.0.join("sub")).unwrap();
-        fs::write(tmp.0.join("a.txt"), "hi").unwrap();
-        fs::write(tmp.0.join("sub/a.txt"), "deep").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.txt"), "hi").unwrap();
+        fs::write(tmp.path().join("sub/a.txt"), "deep").unwrap();
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
-        let sftp = Sftp::new(Some(FileService { dir: tmp.0.clone(), mode })).unwrap();
+        let sftp = Sftp::new(Some(FileService { dir: tmp.path().into(), mode })).unwrap();
         Fs {
             rt,
-            initial: snapshot(&tmp.0),
+            initial: snapshot(tmp.path()),
             tmp,
             mode,
             sftp,
@@ -152,7 +152,7 @@ impl Fs {
     }
 
     fn root(&self) -> PathBuf {
-        self.tmp.0.clone()
+        self.tmp.path().into()
     }
 
     fn write_only(&self) -> bool {

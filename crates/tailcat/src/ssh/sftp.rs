@@ -575,13 +575,17 @@ mod tests {
     }
 
     /// A scratch directory, removed on drop.
-    pub(super) struct TempDir(pub(super) PathBuf);
+    pub(super) struct TempDir(PathBuf);
 
     impl TempDir {
         pub(super) fn new() -> Self {
             let p = temp_dir().join(format!("tailcat-sftp-{}", hex::encode(rand::random::<[u8; 8]>())));
             fs::create_dir(&p).unwrap();
             TempDir(p)
+        }
+
+        pub(super) fn path(&self) -> &Path {
+            &self.0
         }
     }
 
@@ -602,11 +606,11 @@ mod tests {
     /// that the symlinks `out` (absolute) and `up` (relative) point to.
     fn fixture(mode: FileServeMode) -> Fixture {
         let tmp = TempDir::new();
-        let root = tmp.0.join("root");
+        let root = tmp.path().join("root");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("a.txt"), "hi").unwrap();
-        fs::write(tmp.0.join("secret"), "s3cret").unwrap();
-        link_out(&tmp.0, &root);
+        fs::write(tmp.path().join("secret"), "s3cret").unwrap();
+        link_out(tmp.path(), &root);
         let sftp = Sftp::new(Some(FileService { dir: root.clone(), mode })).unwrap();
         Fixture { tmp, root, sftp }
     }
@@ -824,7 +828,7 @@ mod tests {
         denied(sftp.rmdir(0, "d".into()).await);
         // Through a symlink out of the root, where there is one.
         assert!(upload(&mut sftp, "out/escaped", b"x").await.is_err());
-        assert!(!tmp.0.join("escaped").exists());
+        assert!(!tmp.path().join("escaped").exists());
     }
 
     /// An upload to a drop box is visible under its name only once it's
