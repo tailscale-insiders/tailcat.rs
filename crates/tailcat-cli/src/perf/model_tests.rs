@@ -1,8 +1,9 @@
 //! Model-based tests of perf tests run over in-memory pipes, driven by
 //! Hegel. A client and a server [`Test`] run against each other with
 //! generated parameters, while one link, or everything one side has, may
-//! be cut partway through. Both sides must finish promptly, and either
-//! agree on what was delivered or report an error.
+//! be cut partway through, or one side's run cancelled with its links
+//! left up. Both sides must finish promptly, and either agree on what
+//! was delivered or report an error.
 
 use std::io;
 use std::pin::Pin;
@@ -55,41 +56,58 @@ impl AsyncWrite for End {
     }
 }
 
-/// Copies until EOF, then passes the EOF on. With `left` counting down a
-/// byte budget, fires `cut` once it runs out.
-async fn pump(mut r: impl AsyncRead + Unpin, mut w: impl AsyncWrite + Unpin, left: &AtomicUsize, cut: &Flag) {
+/// How a link counts down a byte budget, which links may share: `fired`
+/// fires once it runs out, and then, if the link `cuts`, it's severed.
+#[derive(Clone)]
+struct Budget {
+    left: Arc<AtomicUsize>,
+    fired: Flag,
+    cuts: bool,
+}
+
+impl Budget {
+    /// Takes `n` bytes from the budget, returning how many of them may
+    /// cross, and whether the link is to go on carrying data after.
+    fn take(&self, n: usize) -> (usize, bool) {
+        let had = self.left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(l.saturating_sub(n))).unwrap();
+        if n < had {
+            return (n, true);
+        }
+        self.fired.set();
+        if self.cuts { (had, false) } else { (n, true) }
+    }
+}
+
+/// Copies until EOF, then passes the EOF on, taking what crosses from
+/// `budget`, if any, until it runs out.
+async fn pump(mut r: impl AsyncRead + Unpin, mut w: impl AsyncWrite + Unpin, budget: Option<&Budget>) {
     let mut buf = vec![0u8; 16 << 10];
     loop {
         let Ok(n @ 1..) = r.read(&mut buf).await else {
             let _ = w.shutdown().await;
             return;
         };
-        let had = left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(l.saturating_sub(n))).unwrap();
-        let take = n.min(had);
-        if w.write_all(&buf[..take]).await.is_err() {
-            return;
-        }
-        if take == had {
-            cut.set();
+        let (take, more) = budget.map_or((n, true), |b| b.take(n));
+        if w.write_all(&buf[..take]).await.is_err() || !more {
             return;
         }
     }
 }
 
-/// Carries a link between its ends until both directions close, or its
-/// cut fires. Given a byte budget, which links may share, it fires the
-/// cut once the budget runs out.
-async fn relay(a: DuplexStream, b: DuplexStream, cut: Flag, budget: Option<Arc<AtomicUsize>>) {
-    let left = budget.unwrap_or_else(|| Arc::new(AtomicUsize::new(usize::MAX)));
+/// Carries a link between its ends until both directions close, or `cut`
+/// fires.
+async fn relay(a: DuplexStream, b: DuplexStream, cut: Flag, budget: Option<Budget>) {
     let ((ar, aw), (br, bw)) = (split(a), split(b));
     tokio::select! {
-        _ = async { tokio::join!(pump(ar, bw, &left, &cut), pump(br, aw, &left, &cut)) } => {}
+        _ = async { tokio::join!(pump(ar, bw, budget.as_ref()), pump(br, aw, budget.as_ref())) } => {}
         _ = cut.wait() => {}
     }
 }
 
-/// A link between the client and the server, severed when `cut` fires.
-fn link(cut: Flag, budget: Option<Arc<AtomicUsize>>) -> (End, End) {
+/// A link between the client and the server, counting down `budget`, if
+/// any, and severed once it runs out if it cuts.
+fn link(budget: Option<Budget>) -> (End, End) {
+    let cut = budget.as_ref().filter(|b| b.cuts).map_or_else(Flag::default, |b| b.fired.clone());
     let ((c, rc), (s, rs)) = (duplex(PIPE), duplex(PIPE));
     tokio::spawn(relay(rc, rs, cut.clone(), budget));
     (End { pipe: c, cut: cut.clone() }, End { pipe: s, cut })
@@ -97,7 +115,7 @@ fn link(cut: Flag, budget: Option<Arc<AtomicUsize>>) -> (End, End) {
 
 /// A link that is never cut.
 fn intact_link() -> (End, End) {
-    link(Flag::default(), None)
+    link(None)
 }
 
 fn ctrl(e: End) -> Ctrl {
@@ -110,16 +128,21 @@ fn attach(t: &Test, i: usize, e: End) {
     assert!(t.attach(i, tcp_stream(Box::new(rd), Box::new(wr))));
 }
 
-/// What gets cut, once a byte budget runs out.
+/// What happens once a byte budget runs out.
 #[derive(Debug, Clone, Copy)]
 enum Scenario {
     Nothing,
-    /// The control link (0) or a stream's link (1 and up), counting that
-    /// link's bytes.
+    /// The control link (0) or a stream's link (1 and up) is cut,
+    /// counting that link's bytes.
     Link(usize),
-    /// Every link, and that side stops running: a crash. Counts the
-    /// bytes of all links.
+    /// Every link is cut, and that side stops running: a crash. Counts
+    /// the bytes of all links.
     Crash {
+        server: bool,
+    },
+    /// That side's run is cancelled, as an interrupt or a timeout does,
+    /// and its links stay up. Counts the bytes of all links.
+    Cancel {
         server: bool,
     },
 }
@@ -127,42 +150,51 @@ enum Scenario {
 impl Scenario {
     /// A scenario for a test with `streams` streams.
     fn draw(tc: &TestCase, streams: usize) -> Scenario {
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
+        match tc.draw(gs::integers::<u8>().max_value(5)) {
             0 => Scenario::Nothing,
             1 => Scenario::Link(tc.draw(gs::integers::<usize>().max_value(streams))),
-            n => Scenario::Crash { server: n == 3 },
+            n @ (2 | 3) => Scenario::Crash { server: n == 3 },
+            n => Scenario::Cancel { server: n == 5 },
         }
     }
 
-    /// Whether link `i` (0 for control) is cut once the budget runs out.
-    fn cuts(self, i: usize) -> bool {
+    /// Whether link `i` (0 for control) counts down the budget.
+    fn counts(self, i: usize) -> bool {
         match self {
             Scenario::Nothing => false,
             Scenario::Link(k) => k == i,
-            Scenario::Crash { .. } => true,
+            Scenario::Crash { .. } | Scenario::Cancel { .. } => true,
         }
     }
 
-    /// Whether the server, or else the client, crashes.
-    fn crashes(self, server: bool) -> bool {
-        matches!(self, Scenario::Crash { server: s } if s == server)
+    /// Whether the links are cut once the budget runs out.
+    fn cuts(self) -> bool {
+        !matches!(self, Scenario::Cancel { .. })
+    }
+
+    /// Whether the server, or else the client, stops running.
+    fn stops(self, server: bool) -> bool {
+        match self {
+            Scenario::Crash { server: s } | Scenario::Cancel { server: s } => s == server,
+            _ => false,
+        }
     }
 }
 
 struct Outcome {
-    /// `None` if the side crashed.
+    /// `None` if the side stopped running.
     result: Option<Result<PerfResult, String>>,
     elapsed: Duration,
 }
 
-/// Runs one side's test, abandoning it if `crash` fires, and checks that
+/// Runs one side's test, abandoning it if `stop` fires, and checks that
 /// it doesn't outlive the test, which would hold its connections open.
-async fn side(t: Arc<Test>, crash: Option<Flag>) -> Outcome {
+async fn side(t: Arc<Test>, stop: Option<Flag>) -> Outcome {
     let start = Instant::now();
-    let result = match crash {
-        Some(c) => tokio::select! {
+    let result = match stop {
+        Some(stop) => tokio::select! {
             r = t.clone().run() => Some(r),
-            _ = c.wait() => None,
+            _ = stop.wait() => None,
         },
         None => Some(t.clone().run().await),
     };
@@ -185,14 +217,12 @@ async fn assert_released(t: &Arc<Test>) {
     timeout(Duration::from_secs(1), released).await.expect("the test's tasks outlived it");
 }
 
-/// Runs a client and a server test against each other, over links that
-/// `scenario` cuts once `budget` bytes have crossed them, and returns
-/// how each side came out.
-async fn run_pair(p: &Params, scenario: Scenario, cut: &Flag, budget: usize) -> (Outcome, Outcome) {
-    let budget = Arc::new(AtomicUsize::new(budget));
-    let links: Vec<_> = (0..=p.streams)
-        .map(|i| if scenario.cuts(i) { link(cut.clone(), Some(budget.clone())) } else { intact_link() })
-        .collect();
+/// Runs a client and a server test against each other, playing out
+/// `scenario` once `budget` bytes have crossed the links it counts, and
+/// returns how each side came out; `fired` fires when it plays out.
+async fn run_pair(p: &Params, scenario: Scenario, fired: &Flag, budget: usize) -> (Outcome, Outcome) {
+    let budget = Budget { left: Arc::new(AtomicUsize::new(budget)), fired: fired.clone(), cuts: scenario.cuts() };
+    let links: Vec<_> = (0..=p.streams).map(|i| link(scenario.counts(i).then(|| budget.clone()))).collect();
     let mut links = links.into_iter();
     let (cc, sc) = links.next().unwrap();
     let id = [7; 8];
@@ -202,9 +232,8 @@ async fn run_pair(p: &Params, scenario: Scenario, cut: &Flag, budget: usize) -> 
         attach(&client, i, c);
         attach(&server, i, s);
     }
-    let crash = |server: bool| scenario.crashes(server).then(|| cut.clone());
-    let both =
-        async { tokio::join!(tokio::spawn(side(client, crash(false))), tokio::spawn(side(server, crash(true)))) };
+    let stop = |server: bool| scenario.stops(server).then(|| fired.clone());
+    let both = async { tokio::join!(tokio::spawn(side(client, stop(false))), tokio::spawn(side(server, stop(true)))) };
     let (c, s) = timeout(p.duration + Duration::from_secs(30), both).await.expect("the test hung");
     (c.unwrap(), s.unwrap())
 }
@@ -263,56 +292,28 @@ fn tests_finish_and_agree(tc: TestCase) {
     let p = draw_params(&tc);
     let scenario = Scenario::draw(&tc, p.streams);
     let budget = draw_budget(&tc);
-    tc.note(&format!("{p:?}, cutting {scenario:?} after {budget} bytes"));
+    tc.note(&format!("{p:?}, {scenario:?} after {budget} bytes"));
     let rt = runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-    let cut = Flag::default();
+    let fired = Flag::default();
 
-    let (c, s) = rt.block_on(run_pair(&p, scenario, &cut, budget));
+    let (c, s) = rt.block_on(run_pair(&p, scenario, &fired, budget));
 
     let bound = p.duration + Duration::from_secs(5);
     assert!(c.elapsed <= bound, "the client took {:?}: {:?}", c.elapsed, c.result.map(|_| ()));
     assert!(s.elapsed <= bound, "the server took {:?}: {:?}", s.elapsed, s.result.map(|_| ()));
     let (Some(Ok(cr)), Some(Ok(sr))) = (&c.result, &s.result) else {
         let errs = (c.result.map(|r| r.err()), s.result.map(|r| r.err()));
-        assert!(cut.is_set(), "a test failed with nothing cut: {errs:?}");
+        assert!(fired.is_set(), "a test failed with nothing cut or cancelled: {errs:?}");
         return;
     };
-    let cut = cut.is_set();
+    // Both sides ran to the end, so anything that happened was a cut.
+    let cut = fired.is_set();
     if p.direction != Direction::Download {
         check_transfer(&p, [&cr.client_sent, &cr.server_received], [&sr.client_sent, &sr.server_received], cut);
     }
     if p.direction != Direction::Upload {
         check_transfer(&p, [&cr.server_sent, &cr.client_received], [&sr.server_sent, &sr.client_received], cut);
     }
-}
-
-/// A test cancelled partway, over links that stay up, still ends.
-#[tokio::test]
-async fn a_cancelled_test_ends() {
-    let p = Params {
-        proto: Proto::Tcp,
-        direction: Direction::Bidirectional,
-        duration: Duration::from_secs(10),
-        bytes: 0,
-        streams: 2,
-        length: 1024,
-        bitrate: 0,
-        interval: MIN_INTERVAL,
-    };
-    let (cc, sc) = intact_link();
-    let client = Test::new(p.clone(), [7; 8], false, ctrl(cc), None);
-    let server = Test::new(p.clone(), [7; 8], true, ctrl(sc), None);
-    for i in 0..p.streams {
-        let (c, s) = intact_link();
-        attach(&client, i, c);
-        attach(&server, i, s);
-    }
-    tokio::spawn(server.run());
-
-    let run = timeout(Duration::from_millis(200), client.clone().run()).await;
-    assert!(run.is_err(), "the test ended early");
-
-    assert_released(&client).await;
 }
 
 /// A stream task that panics fails the test, and the others' results
