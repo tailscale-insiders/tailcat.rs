@@ -273,7 +273,10 @@ async fn handle(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
             crate::serve::proxy_and_drain(remote, c).await;
             Ok(())
         }
-        3 => udp_associate(c, d).await,
+        3 => {
+            let client = UdpClient::new(&host, port, c.peer_addr()?);
+            udp_associate(c, d, client).await
+        }
         _ => {
             reply(&mut c, REP_COMMAND_NOT_SUPPORTED, zero).await?;
             bail!("unsupported command {cmd}");
@@ -288,12 +291,44 @@ type Flows = HashMap<(String, u16), mpsc::Sender<Vec<u8>>>;
 /// How many datagrams a flow queues while it opens.
 const FLOW_QUEUE: usize = 64;
 
-/// The client's UDP address, where replies go.
+/// The client's UDP address, where replies go, once it has sent from it.
 type ClientAddr = Arc<Mutex<Option<SocketAddr>>>;
+
+/// Where a UDP association's client sends from, which is the only source
+/// the relay may take datagrams from (RFC 1928 §7): the address in its
+/// request, with the control connection's IP standing in for an
+/// unspecified one (or a hostname), and the first datagram's port for
+/// port 0.
+#[derive(Debug, PartialEq)]
+struct UdpClient {
+    ip: IpAddr,
+    /// 0 until the first datagram, if the request gave none.
+    port: u16,
+}
+
+impl UdpClient {
+    fn new(host: &str, port: u16, control_peer: SocketAddr) -> UdpClient {
+        let ip = match host.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
+            Ok(ip) if !ip.is_unspecified() => ip,
+            _ => control_peer.ip().to_canonical(),
+        };
+        UdpClient { ip, port }
+    }
+
+    /// Whether a datagram from `from` is the client's. The first one
+    /// fixes the port, if the request didn't.
+    fn admit(&mut self, from: SocketAddr) -> bool {
+        if from.ip().to_canonical() != self.ip || self.port != 0 && from.port() != self.port {
+            return false;
+        }
+        self.port = from.port();
+        true
+    }
+}
 
 /// Relays datagrams between the client and tunnel UDP flows for as long
 /// as the control connection stays open.
-async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
+async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>, mut client: UdpClient) -> Result<()> {
     let local_ip = c.local_addr()?.ip();
     let sock = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
     reply(&mut c, REP_SUCCESS, sock.local_addr()?).await?;
@@ -306,12 +341,17 @@ async fn udp_associate(mut c: TcpStream, d: Arc<Dialer>) -> Result<()> {
         loop {
             let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
             while flow_tasks.try_join_next().is_some() {}
+            // Anyone who can reach the relay can send to it; only the
+            // client may use it, and have the replies.
+            if !client.admit(from) {
+                continue;
+            }
+            *client_addr.lock().unwrap() = Some(from);
             // RSV(2), FRAG(1): fragments aren't supported.
             if n < 4 || buf[2] != 0 {
                 continue;
             }
             let Some((dst, payload)) = parse_addr(&buf[3..n]) else { continue };
-            *client_addr.lock().unwrap() = Some(from);
             let tx = match flows.get(&dst) {
                 Some(tx) if !tx.is_closed() => tx.clone(),
                 // No flow yet, or it failed to open or closed: open one.
@@ -422,6 +462,26 @@ mod tests {
         for bad in [&[][..], &[1, 1, 2, 3, 4, 0], &[3, 5, b'a', 0, 1], &[4; 17], &[2, 0, 0], &[3, 1, 0xff, 0, 1]] {
             assert!(parse_addr(bad).is_none(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn udp_clients() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let ctrl = a("127.0.0.1:4000");
+        // An unspecified address (or a hostname) means the control
+        // connection's IP, and port 0 the first datagram's port.
+        for host in ["0.0.0.0", "::", "localhost"] {
+            let mut c = UdpClient::new(host, 0, ctrl);
+            assert!(!c.admit(a("10.0.0.1:5000")), "{host}: another IP admitted");
+            assert!(c.admit(a("127.0.0.1:5000")), "{host}: the client wasn't admitted");
+            assert!(c.admit(a("[::ffff:127.0.0.1]:5000")), "{host}: the mapped client wasn't admitted");
+            assert!(!c.admit(a("127.0.0.1:5001")), "{host}: another port admitted after the first datagram");
+        }
+        // A specific address is the only one admitted.
+        let mut c = UdpClient::new("::ffff:10.0.0.1", 5000, ctrl);
+        assert_eq!(c, UdpClient { ip: "10.0.0.1".parse().unwrap(), port: 5000 });
+        assert!(!c.admit(a("127.0.0.1:5000")) && !c.admit(a("10.0.0.1:5001")));
+        assert!(c.admit(a("10.0.0.1:5000")));
     }
 
     #[tokio::test]
