@@ -811,11 +811,17 @@ impl Drop for TcpStream {
     }
 }
 
+/// The error a stream's read or write gives for its socket's: the
+/// crate's, as the io::Error that AsyncRead and AsyncWrite must return.
+fn stream_error(e: impl Into<Error>) -> io::Error {
+    e.into().into()
+}
+
 impl AsyncRead for TcpStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let n = ready!(self.with_end(|s, end| {
             if s.can_recv() {
-                Poll::Ready(s.recv_slice(buf.initialize_unfilled()).map_err(io::Error::other))
+                Poll::Ready(s.recv_slice(buf.initialize_unfilled()).map_err(stream_error))
             } else if !s.may_recv() {
                 // EOF, if the peer closed the connection rather than
                 // resetting it or timing out.
@@ -838,7 +844,7 @@ impl AsyncWrite for TcpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         let n = ready!(self.with_end(|s, end| {
             if s.can_send() {
-                Poll::Ready(s.send_slice(data).map_err(io::Error::other))
+                Poll::Ready(s.send_slice(data).map_err(stream_error))
             } else if !s.may_send() {
                 let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "connection closed");
                 Poll::Ready(Err(end.and_then(End::error).unwrap_or_else(closed)))

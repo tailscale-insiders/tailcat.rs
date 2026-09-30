@@ -70,6 +70,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
+use smoltcp::socket::tcp::{ConnectError, RecvError, SendError};
+
 pub use addr::{Addr, ConnInfo, PrivateKey};
 pub use client::{Client, ClientOptions, DiscoPingResult, PingResult, Via};
 pub use derpmap::{
@@ -108,7 +110,11 @@ pub enum Error {
     #[error("{0}")]
     Other(String),
     #[error("connect to {remote}: {error}")]
-    Connect { remote: SocketAddr, error: smoltcp::socket::tcp::ConnectError },
+    Connect { remote: SocketAddr, error: ConnectError },
+    #[error("TCP receive: {0}")]
+    Recv(RecvError),
+    #[error("TCP send: {0}")]
+    Send(SendError),
     #[error("DERP: invalid DERP hostname {host:?}: {error}")]
     BadHostname { host: String, error: rustls::pki_types::InvalidDnsNameError },
     #[error("DERP: TLS handshake with {host}: {error}")]
@@ -174,6 +180,8 @@ wraps! {
     Http(reqwest::Error),
     Base64(base64::DecodeError),
     Cbor(ciborium::de::Error<io::Error>),
+    Recv(RecvError),
+    Send(SendError),
 }
 
 #[cfg(feature = "ssh")]
@@ -193,6 +201,8 @@ impl From<Error> for io::Error {
             Error::Io(e) => e,
             Error::Timeout(s) => io::Error::new(ErrorKind::TimedOut, s),
             e @ Error::Connect { .. } => io::Error::new(ErrorKind::InvalidInput, e.to_string()),
+            e @ Error::Recv(RecvError::Finished) => io::Error::new(ErrorKind::UnexpectedEof, e.to_string()),
+            e @ (Error::Recv(_) | Error::Send(_)) => io::Error::new(ErrorKind::NotConnected, e.to_string()),
             e => io::Error::other(e.to_string()),
         }
     }
@@ -230,9 +240,17 @@ mod tests {
     #[test]
     fn a_refused_connect_is_invalid_input() {
         let remote = "192.0.2.1:80".parse().unwrap();
-        let e = Error::Connect { remote, error: smoltcp::socket::tcp::ConnectError::Unaddressable };
+        let e = Error::Connect { remote, error: ConnectError::Unaddressable };
         let io = io::Error::from(e);
         assert_eq!(io.kind(), ErrorKind::InvalidInput);
         assert_eq!(io.to_string(), "connect to 192.0.2.1:80: unaddressable destination");
+    }
+
+    #[test]
+    fn stream_errors_have_their_kinds() {
+        let kind = |e: Error| io::Error::from(e).kind();
+        assert_eq!(kind(RecvError::Finished.into()), ErrorKind::UnexpectedEof);
+        assert_eq!(kind(RecvError::InvalidState.into()), ErrorKind::NotConnected);
+        assert_eq!(kind(SendError::InvalidState.into()), ErrorKind::NotConnected);
     }
 }
