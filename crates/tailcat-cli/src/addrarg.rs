@@ -1,6 +1,8 @@
 //! Destination arguments: a tailcat address, or a DNS name whose
 //! `tailcat=` TXT record holds one.
 
+use std::time::Duration;
+
 use anyhow::{Result, anyhow, bail};
 use tailcat::Addr;
 
@@ -33,7 +35,7 @@ impl AddrArg {
 }
 
 /// Validates the conservative ASCII hostname syntax accepted for lookups.
-pub fn validate_dns_name(name: &str) -> std::result::Result<(), String> {
+pub fn validate_dns_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name is empty".into());
     }
@@ -62,7 +64,7 @@ pub async fn lookup_txt(name: &str) -> Result<Addr> {
     let resolver = hickory_resolver::Resolver::builder_tokio()
         .and_then(|b| b.build())
         .map_err(|e| anyhow!("DNS resolver: {e}"))?;
-    let res = tokio::time::timeout(std::time::Duration::from_secs(5), resolver.txt_lookup(name))
+    let res = tokio::time::timeout(Duration::from_secs(5), resolver.txt_lookup(name))
         .await
         .map_err(|_| anyhow!("looking up TXT record for {name:?}: timeout"))?
         .map_err(|e| anyhow!("looking up TXT record for {name:?}: {e}"))?;
