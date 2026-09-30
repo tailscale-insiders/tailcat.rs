@@ -449,40 +449,51 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+    use std::sync::OnceLock;
+
+    use hegel::TestCase;
+    use hegel::generators as gs;
+    use tokio::runtime;
+    use tokio::time::timeout;
+
     use super::*;
     use crate::derp::server::DevDerp;
     use crate::derpmap::DerpMap;
     use crate::magicsock;
-    use hegel::TestCase;
-    use hegel::generators as gs;
-    use std::net::Ipv4Addr;
-    use std::sync::OnceLock;
+
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn ipnet_contains() {
-        let n: IpNet = "100.64.1.0/24".parse().unwrap();
-        assert!(n.contains(&"100.64.1.9".parse().unwrap()));
-        assert!(!n.contains(&"100.64.2.9".parse().unwrap()));
-        let all: IpNet = "::/0".parse().unwrap();
-        assert!(all.contains(&"fd7a::1".parse().unwrap()));
-        assert!(!all.contains(&"1.2.3.4".parse().unwrap()));
-        let all4: IpNet = "0.0.0.0/0".parse().unwrap();
-        assert!(all4.contains(&"255.255.255.255".parse().unwrap()));
-        assert!(!all4.contains(&"::".parse().unwrap()));
-        let h: IpNet = "fd7a:115c:a1e0::1".parse().unwrap();
-        assert_eq!(h.prefix_len, 128);
-        assert!(h.contains(&"fd7a:115c:a1e0::1".parse().unwrap()));
-        assert!(!h.contains(&"fd7a:115c:a1e0::2".parse().unwrap()));
-        let n: IpNet = "fd7a:115c:a1e0::/48".parse().unwrap();
-        assert!(n.contains(&"fd7a:115c:a1e0:ffff::".parse().unwrap()));
-        assert!(!n.contains(&"fd7a:115c:a1e1::".parse().unwrap()));
+        let cases = [
+            ("100.64.1.0/24", "100.64.1.9", true),
+            ("100.64.1.0/24", "100.64.2.9", false),
+            ("::/0", "fd7a::1", true),
+            ("::/0", "1.2.3.4", false),
+            ("0.0.0.0/0", "255.255.255.255", true),
+            ("0.0.0.0/0", "::", false),
+            ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::1", true),
+            ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", false),
+            ("fd7a:115c:a1e0::/48", "fd7a:115c:a1e0:ffff::", true),
+            ("fd7a:115c:a1e0::/48", "fd7a:115c:a1e1::", false),
+        ];
+        for (n, a, want) in cases {
+            assert_eq!(net(n).contains(&ip(a)), want, "{n} contains {a}");
+        }
+        assert_eq!(net("fd7a:115c:a1e0::1").prefix_len, 128);
         // Host bits in the address don't matter.
-        assert!(IpNet::new("10.1.2.3".parse().unwrap(), 8).contains(&"10.9.9.9".parse().unwrap()));
-        assert_eq!(IpNet::host("10.0.0.1".parse().unwrap()).to_string(), "10.0.0.1/32");
-        assert!("1.2.3.4/33".parse::<IpNet>().is_err());
-        assert!("::/129".parse::<IpNet>().is_err());
-        assert!("1.2.3.4/x".parse::<IpNet>().is_err());
-        assert!("nope/8".parse::<IpNet>().is_err());
+        assert!(IpNet::new(ip("10.1.2.3"), 8).contains(&ip("10.9.9.9")));
+        assert_eq!(IpNet::host(ip("10.0.0.1")).to_string(), "10.0.0.1/32");
+        for bad in ["1.2.3.4/33", "::/129", "1.2.3.4/x", "nope/8"] {
+            assert!(bad.parse::<IpNet>().is_err(), "parsed {bad}");
+        }
     }
 
     /// A minimal IPv4 header plus payload; boringtun only reads the
@@ -504,11 +515,26 @@ mod tests {
         rx: mpsc::Receiver<InboundPacket>,
     }
 
+    impl Node {
+        fn public(&self) -> NodePublic {
+            self.key.public()
+        }
+
+        /// A packet from this node to `to`.
+        fn packet_to(&self, to: &Node, payload: &[u8]) -> Vec<u8> {
+            ipv4(self.ip, to.ip, payload)
+        }
+
+        async fn recv(&mut self) -> InboundPacket {
+            timeout(Duration::from_secs(10), self.rx.recv()).await.unwrap().unwrap()
+        }
+    }
+
     async fn node(dev: &DevDerp, last_octet: u8, peer_config: Option<PeerConfigFn>) -> Node {
         let key = NodePrivate::generate();
         let mut derp_map = DerpMap::default();
         derp_map.regions.insert(1, dev.region.clone());
-        let (ms, wg_rx) = MagicSock::start(magicsock::Config {
+        let cfg = magicsock::Config {
             private_key: key.clone(),
             derp_map,
             home_region: 1,
@@ -517,9 +543,8 @@ mod tests {
             on_derp_recv: None,
             endpoint_filter: None,
             enable_udp: false,
-        })
-        .await
-        .unwrap();
+        };
+        let (ms, wg_rx) = MagicSock::start(cfg).await.unwrap();
         assert!(ms.wait_derp_connected(Duration::from_secs(5)).await);
         let (engine, rx) = Engine::start(&key, ms, wg_rx, peer_config, None);
         Node { key, ip: Ipv4Addr::new(10, 0, 0, last_octet), engine, rx }
@@ -536,7 +561,7 @@ mod tests {
     /// Tells `from`'s magicsock how to reach `to`.
     fn meet(from: &Node, to: &Node) {
         from.engine.ms.upsert_peer(magicsock::PeerConfig {
-            node_key: to.key.public(),
+            node_key: to.public(),
             disco_key: to.key.disco_private().public(),
             home_region: 1,
             endpoints: vec![],
@@ -546,11 +571,7 @@ mod tests {
     /// Makes `to` a WireGuard peer of `from`.
     fn introduce(from: &Node, to: &Node) {
         meet(from, to);
-        from.engine.upsert_peer(to.key.public(), allow(to.ip));
-    }
-
-    async fn recv(n: &mut Node) -> InboundPacket {
-        tokio::time::timeout(Duration::from_secs(10), n.rx.recv()).await.unwrap().unwrap()
+        from.engine.upsert_peer(to.public(), allow(to.ip));
     }
 
     #[tokio::test]
@@ -562,26 +583,30 @@ mod tests {
         introduce(&b, &a);
 
         // The first packet waits for the handshake, then goes through.
-        a.engine.send_ip(&ipv4(a.ip, b.ip, b"one"));
-        let got = recv(&mut b).await;
-        assert_eq!(got.peer, a.key.public());
-        assert_eq!(got.data, ipv4(a.ip, b.ip, b"one"));
-        assert!(a.engine.peer_stats(&b.key.public()).unwrap().0.is_some(), "no handshake");
+        let one = a.packet_to(&b, b"one");
+        a.engine.send_ip(&one);
+        let got = b.recv().await;
+        assert_eq!(got.peer, a.public());
+        assert_eq!(got.data, one);
+        let (last_handshake, ..) = a.engine.peer_stats(&b.public()).unwrap();
+        assert!(last_handshake.is_some(), "no handshake");
 
         // A source outside the sender's allowed IPs is dropped...
-        let spoofed = Ipv4Addr::new(10, 0, 0, 99);
-        a.engine.send_ip_to_peer(&b.key.public(), &ipv4(spoofed, b.ip, b"spoofed"));
+        let spoofed = ipv4(Ipv4Addr::new(10, 0, 0, 99), b.ip, b"spoofed");
+        a.engine.send_ip_to_peer(&b.public(), &spoofed);
         // ...while the next legitimate one arrives, and replies route back.
-        a.engine.send_ip(&ipv4(a.ip, b.ip, b"two"));
-        assert_eq!(recv(&mut b).await.data, ipv4(a.ip, b.ip, b"two"));
-        b.engine.send_ip(&ipv4(b.ip, a.ip, b"back"));
-        assert_eq!(recv(&mut a).await.data, ipv4(b.ip, a.ip, b"back"));
+        let two = a.packet_to(&b, b"two");
+        a.engine.send_ip(&two);
+        assert_eq!(b.recv().await.data, two);
+        let back = b.packet_to(&a, b"back");
+        b.engine.send_ip(&back);
+        assert_eq!(a.recv().await.data, back);
 
         // Destinations nobody routes are dropped without a handshake.
         a.engine.send_ip(&ipv4(a.ip, Ipv4Addr::new(192, 0, 2, 1), b"nowhere"));
-        assert!(a.engine.remove_peer(&b.key.public()));
-        assert!(!a.engine.remove_peer(&b.key.public()));
-        assert!(a.engine.peer_stats(&b.key.public()).is_none());
+        assert!(a.engine.remove_peer(&b.public()));
+        assert!(!a.engine.remove_peer(&b.public()));
+        assert!(a.engine.peer_stats(&b.public()).is_none());
     }
 
     #[tokio::test]
@@ -595,12 +620,12 @@ mod tests {
         // magicsock learns the client from the DERP packet's source.
         introduce(&client, &server);
         meet(&server, &client);
-        assert!(server.engine.peer(&client.key.public()).is_none());
+        assert!(server.engine.peer(&client.public()).is_none());
 
-        client.engine.send_ip(&ipv4(client.ip, server.ip, b"hi"));
-        let got = recv(&mut server).await;
-        assert_eq!(got.peer, client.key.public());
-        assert!(server.engine.peer(&client.key.public()).is_some());
+        client.engine.send_ip(&client.packet_to(&server, b"hi"));
+
+        assert_eq!(server.recv().await.peer, client.public());
+        assert!(server.engine.peer(&client.public()).is_some());
     }
 
     /// An engine on a magicsock with no network, for driving `identify`.
@@ -611,14 +636,19 @@ mod tests {
         (engine, key)
     }
 
+    /// A UDP source address, which vouches for no one.
+    fn udp_src() -> PathAddr {
+        PathAddr::Udp("192.0.2.1:41641".parse().unwrap())
+    }
+
     /// A handshake initiation from `from` to `to`.
     fn handshake_init(from: &NodePrivate, to: &NodePublic) -> Vec<u8> {
         let mut t = Tunn::new(from.x25519(), to.x25519(), None, None, 1, None);
         let mut buf = vec![0u8; 256];
-        match t.format_handshake_initiation(&mut buf, false) {
-            TunnResult::WriteToNetwork(b) => b.to_vec(),
-            _ => panic!("no handshake initiation"),
-        }
+        let TunnResult::WriteToNetwork(b) = t.format_handshake_initiation(&mut buf, false) else {
+            panic!("no handshake initiation");
+        };
+        b.to_vec()
     }
 
     /// A handshake response (type 2), cookie reply (3) or data packet (4)
@@ -642,51 +672,65 @@ mod tests {
     /// for the sender, a packet claiming to be from anyone else is dropped.
     #[hegel::test(test_cases = 100)]
     fn identifies_senders_by_session_or_static_key(tc: TestCase) {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = rt.enter();
         let (engine, key) = offline(None);
         let peers = [NodePrivate::generate(), NodePrivate::generate()];
-        for (i, p) in peers.iter().enumerate() {
-            engine.upsert_peer(p.public(), allow(Ipv4Addr::new(10, 0, 0, i as u8 + 2)));
-        }
+        engine.upsert_peer(peers[0].public(), allow(Ipv4Addr::new(10, 0, 0, 2)));
+        engine.upsert_peer(peers[1].public(), allow(Ipv4Addr::new(10, 0, 0, 3)));
         let stranger = NodePrivate::generate().public();
-        let sender = tc.draw(gs::integers::<usize>().max_value(1));
-        let label = tc.draw(gs::integers::<usize>().max_value(3));
+        let labels = [None, Some(peers[0].public()), Some(peers[1].public()), Some(stranger)];
+
+        let sender = &peers[tc.draw(gs::integers::<usize>().max_value(1))];
+        let label = labels[tc.draw(gs::integers::<usize>().max_value(3))];
         let over_derp = tc.draw(gs::booleans());
         let kind = tc.draw(gs::integers::<u8>().min_value(1).max_value(4));
-        let sender = &peers[sender];
-        let label = [None, Some(peers[0].public()), Some(peers[1].public()), Some(stranger)][label];
         let data = match kind {
             1 => handshake_init(sender, &key.public()),
             kind => addressed_to(kind, engine.peer(&sender.public()).unwrap().index),
         };
-        let src = if over_derp { PathAddr::Derp(1) } else { PathAddr::Udp("192.0.2.1:41641".parse().unwrap()) };
+        let src = if over_derp { PathAddr::Derp(1) } else { udp_src() };
+
         let got = engine.identify(&WireguardPacket { peer: label, src, data }).map(|p| p.key);
+
         let want = (!over_derp || label == Some(sender.public())).then_some(sender.public());
         assert_eq!(got, want);
+    }
+
+    /// An offline engine whose lookup hook first lets the owner `race` it
+    /// on the engine, then configures the peer to allow `lookup_ip`; and a
+    /// handshake initiation, from a client only the hook knows, that
+    /// drives the lookup.
+    fn racing_lookup(
+        race: impl Fn(&Engine, &NodePublic) + Send + Sync + 'static,
+        lookup_ip: Ipv4Addr,
+    ) -> (Arc<Engine>, NodePublic, WireguardPacket) {
+        let slot: Arc<OnceLock<Weak<Engine>>> = Arc::default();
+        let hook_slot = slot.clone();
+        let lookup: PeerConfigFn = Arc::new(move |k| {
+            let engine = hook_slot.get()?.upgrade()?;
+            race(&engine, k);
+            Some(allow(lookup_ip))
+        });
+        let (engine, key) = offline(Some(lookup));
+        slot.set(Arc::downgrade(&engine)).unwrap();
+        let client = NodePrivate::generate();
+        let pkt = WireguardPacket { peer: None, src: udp_src(), data: handshake_init(&client, &key.public()) };
+        (engine, client.public(), pkt)
     }
 
     /// The owner configuring a peer while its handshake is being looked
     /// up wins over the lookup hook's configuration.
     #[tokio::test]
     async fn owner_config_wins_over_a_racing_lookup() {
-        let engine_slot: Arc<OnceLock<Weak<Engine>>> = Arc::default();
-        let slot = engine_slot.clone();
-        let lookup: PeerConfigFn = Arc::new(move |k| {
-            slot.get()?.upgrade()?.upsert_peer(*k, allow(Ipv4Addr::new(10, 0, 0, 2)));
-            Some(allow(Ipv4Addr::new(10, 0, 0, 99)))
-        });
-        let (engine, key) = offline(Some(lookup));
-        engine_slot.set(Arc::downgrade(&engine)).unwrap();
-        let client = NodePrivate::generate();
-        let pkt = WireguardPacket {
-            peer: None,
-            src: PathAddr::Udp("192.0.2.1:41641".parse().unwrap()),
-            data: handshake_init(&client, &key.public()),
-        };
+        let owners_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let (engine, client, pkt) =
+            racing_lookup(move |e, k| e.upsert_peer(*k, allow(owners_ip)), Ipv4Addr::new(10, 0, 0, 99));
+
         let p = engine.identify(&pkt).expect("handshake from a peer the hook knows");
-        assert!(Arc::ptr_eq(&p, &engine.peer(&client.public()).unwrap()), "identified a replaced peer");
-        assert!(p.matches(&Ipv4Addr::new(10, 0, 0, 2).into()).is_some(), "the owner's configuration was overwritten");
+
+        assert!(Arc::ptr_eq(&p, &engine.peer(&client).unwrap()), "identified a replaced peer");
+        assert!(p.matches(&owners_ip.into()).is_some(), "the owner's configuration was overwritten");
     }
 
     /// The owner removing a peer while its handshake is being looked up
@@ -694,21 +738,14 @@ mod tests {
     /// go of, which the owner would never remove again.
     #[tokio::test]
     async fn owner_removal_wins_over_a_racing_lookup() {
-        let engine_slot: Arc<OnceLock<Weak<Engine>>> = Arc::default();
-        let slot = engine_slot.clone();
-        let lookup: PeerConfigFn = Arc::new(move |k| {
-            slot.get()?.upgrade()?.remove_peer(k);
-            Some(allow(Ipv4Addr::new(10, 0, 0, 2)))
-        });
-        let (engine, key) = offline(Some(lookup));
-        engine_slot.set(Arc::downgrade(&engine)).unwrap();
-        let client = NodePrivate::generate();
-        let pkt = WireguardPacket {
-            peer: None,
-            src: PathAddr::Udp("192.0.2.1:41641".parse().unwrap()),
-            data: handshake_init(&client, &key.public()),
+        let remove = |e: &Engine, k: &NodePublic| {
+            e.remove_peer(k);
         };
-        assert!(engine.identify(&pkt).is_none(), "a peer removed during its lookup was taken");
-        assert!(engine.peer(&client.public()).is_none(), "a peer removed during its lookup came back");
+        let (engine, client, pkt) = racing_lookup(remove, Ipv4Addr::new(10, 0, 0, 2));
+
+        let identified = engine.identify(&pkt);
+
+        assert!(identified.is_none(), "a peer removed during its lookup was taken");
+        assert!(engine.peer(&client).is_none(), "a peer removed during its lookup came back");
     }
 }

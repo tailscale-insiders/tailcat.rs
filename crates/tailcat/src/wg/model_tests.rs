@@ -7,14 +7,23 @@
 //! owns its address; the tables are checked against the configuration.
 
 use std::collections::HashMap;
+use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use tokio::runtime::{self, Runtime};
 
 use super::*;
 
 const PEERS: usize = 3;
+
+/// Our address, which remotes send to.
+const US: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
 
 fn prefixes() -> [IpNet; 7] {
     ["10.0.0.1/32", "10.0.0.2/32", "10.0.0.0/30", "10.0.0.0/24", "0.0.0.0/0", "fd00::1/128", "fd00::/64"]
@@ -70,7 +79,7 @@ struct Remote {
 }
 
 struct Mesh {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     engine: Arc<Engine>,
     key: NodePrivate,
     rx: mpsc::Receiver<InboundPacket>,
@@ -88,7 +97,7 @@ struct Mesh {
 
 impl Mesh {
     fn new() -> Mesh {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let key = private(100);
         let (engine, rx) = {
             let _rt = rt.enter();
@@ -108,6 +117,10 @@ impl Mesh {
             delivered: Vec::new(),
             serial: 0,
         }
+    }
+
+    fn public(&self, i: usize) -> NodePublic {
+        self.remotes[i].key.public()
     }
 
     fn draw_remote(tc: &TestCase) -> usize {
@@ -134,7 +147,7 @@ impl Mesh {
 
     /// Remote `i`'s tunnel, made anew if our session for it changed.
     fn tunn(&mut self, i: usize) -> &mut Tunn {
-        let k = self.remotes[i].key.public();
+        let k = self.public(i);
         let index = self.index_of(&k);
         let psk = self.configs.get(&k).map_or(PresharedKey::default(), |c| c.preshared_key);
         let r = &mut self.remotes[i];
@@ -163,8 +176,8 @@ impl Mesh {
         while !to_engine.is_empty() {
             rounds += 1;
             assert!(rounds < 20, "packets bounce forever");
-            for (i, data) in std::mem::take(&mut to_engine) {
-                let pkt = WireguardPacket { peer: Some(self.remotes[i].key.public()), src: PathAddr::Derp(1), data };
+            for (i, data) in mem::take(&mut to_engine) {
+                let pkt = WireguardPacket { peer: Some(self.public(i)), src: PathAddr::Derp(1), data };
                 self.rt.block_on(self.engine.handle(pkt));
             }
             to_engine = self.flush_sent();
@@ -174,7 +187,7 @@ impl Mesh {
     /// Hands the engine's sent packets to their remotes, returning their
     /// replies.
     fn flush_sent(&mut self) -> Vec<(usize, Vec<u8>)> {
-        let sent = std::mem::take(&mut *self.engine.sent.lock().unwrap());
+        let sent = mem::take(&mut *self.engine.sent.lock().unwrap());
         let mut replies = Vec::new();
         for (k, data) in sent {
             let i = self.remotes.iter().position(|r| r.key.public() == k).expect("sent to a stranger");
@@ -183,6 +196,7 @@ impl Mesh {
             match t.decapsulate(None, &data, &mut buf) {
                 TunnResult::WriteToNetwork(b) => {
                     replies.push((i, b.to_vec()));
+                    // Then whatever the tunnel queued behind a handshake.
                     while let TunnResult::WriteToNetwork(b) = t.decapsulate(None, &[], &mut buf) {
                         replies.push((i, b.to_vec()));
                     }
@@ -198,9 +212,16 @@ impl Mesh {
 
     /// The owner configures remote `i`'s peer.
     fn configure(&mut self, i: usize, cfg: PeerConfig) {
-        let k = self.remotes[i].key.public();
+        let k = self.public(i);
         self.engine.upsert_peer(k, cfg.clone());
         self.configs.insert(k, cfg);
+    }
+
+    /// The owner removes remote `i`'s peer, which the engine has if and
+    /// only if it's configured.
+    fn unconfigure(&mut self, i: usize) {
+        let k = self.public(i);
+        assert_eq!(self.engine.remove_peer(&k), self.configs.remove(&k).is_some());
     }
 
     /// The owner sets our own prefixes.
@@ -212,13 +233,14 @@ impl Mesh {
     /// Remote `i` sends a packet from `src`, returning what reached us.
     fn send_from_addr(&mut self, i: usize, src: IpAddr) -> Vec<InboundPacket> {
         let payload = self.next_payload();
-        let pkt = packet(src, "10.9.9.9".parse().unwrap(), &payload);
+        let pkt = packet(src, US, &payload);
         if let Some(wire) = self.encrypt(i, &pkt) {
             self.pump(i, wire);
         }
         let got = self.check_inbound();
-        let k = self.remotes[i].key.public();
-        if self.owner(src) == Some(k) && self.held.iter().all(|(j, _)| *j != i) {
+        let k = self.public(i);
+        let holding = self.held.iter().any(|(j, _)| *j == i);
+        if self.owner(src) == Some(k) && !holding {
             assert!(got.iter().any(|p| p.data == pkt), "a packet from owner {} of {src} was lost", k.short_string());
         }
         got
@@ -226,7 +248,7 @@ impl Mesh {
 
     /// We send a packet to `dst`, returning the remotes it reached.
     fn send_to_addr(&mut self, dst: IpAddr) -> Vec<NodePublic> {
-        let src = if dst.is_ipv4() { IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)) } else { IpAddr::V6(Ipv6Addr::LOCALHOST) };
+        let src = if dst.is_ipv4() { US } else { IpAddr::V6(Ipv6Addr::LOCALHOST) };
         let payload = self.next_payload();
         let pkt = packet(src, dst, &payload);
         self.delivered.clear();
@@ -241,7 +263,7 @@ impl Mesh {
         }
         self.check_inbound();
         let got: Vec<NodePublic> =
-            self.delivered.iter().filter(|(_, p)| *p == pkt).map(|(i, _)| self.remotes[*i].key.public()).collect();
+            self.delivered.iter().filter(|(_, p)| *p == pkt).map(|(i, _)| self.public(*i)).collect();
         assert_eq!(got, Vec::from_iter(owner), "a packet for {dst}");
         got
     }
@@ -287,15 +309,13 @@ impl Mesh {
     #[rule]
     fn set_local_ips(&mut self, tc: TestCase) {
         let mask = tc.draw_named("local", gs::integers::<u8>().max_value((1 << prefixes().len()) - 1));
-        self.set_local(
-            prefixes().into_iter().enumerate().filter(|(b, _)| mask >> b & 1 == 1).map(|(_, p)| p).collect(),
-        );
+        let chosen = prefixes().into_iter().enumerate().filter(|(b, _)| mask >> b & 1 == 1).map(|(_, p)| p);
+        self.set_local(chosen.collect());
     }
 
     #[rule]
     fn remove(&mut self, tc: TestCase) {
-        let k = self.remotes[Self::draw_remote(&tc)].key.public();
-        assert_eq!(self.engine.remove_peer(&k), self.configs.remove(&k).is_some());
+        self.unconfigure(Self::draw_remote(&tc));
     }
 
     /// A remote sends a packet from any address; it arrives if the
@@ -311,7 +331,7 @@ impl Mesh {
         let i = Self::draw_remote(&tc);
         let src = Self::draw_addr(&tc);
         let payload = self.next_payload();
-        if let Some(wire) = self.encrypt(i, &packet(src, "10.9.9.9".parse().unwrap(), &payload)) {
+        if let Some(wire) = self.encrypt(i, &packet(src, US, &payload)) {
             self.held.push((i, wire));
         }
     }
@@ -368,10 +388,14 @@ fn a_peer_cannot_send_from_another_peers_address() {
     let mut m = Mesh::new();
     m.configure(0, allow(&["10.0.0.1/32"]));
     m.configure(1, allow(&["10.0.0.2/32", "10.0.0.0/24"]));
-    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-    assert!(m.send_from_addr(1, ip("10.0.0.1")).is_empty(), "peer 1 spoofed peer 0");
-    assert_eq!(m.send_from_addr(1, ip("10.0.0.3")).len(), 1);
-    assert_eq!(m.send_from_addr(0, ip("10.0.0.1")).len(), 1);
+
+    let spoofed = m.send_from_addr(1, ip("10.0.0.1"));
+    let own_subnet = m.send_from_addr(1, ip("10.0.0.3"));
+    let own_ip = m.send_from_addr(0, ip("10.0.0.1"));
+
+    assert!(spoofed.is_empty(), "peer 1 spoofed peer 0");
+    assert_eq!(own_subnet.len(), 1);
+    assert_eq!(own_ip.len(), 1);
 }
 
 /// A peer routed a prefix around our address can't send from it, and
@@ -380,19 +404,21 @@ fn a_peer_cannot_send_from_another_peers_address() {
 #[test]
 fn our_own_prefixes_are_ours() {
     let mut m = Mesh::new();
-    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
     m.set_local(vec!["10.0.0.1/32".parse().unwrap(), "fd00::/64".parse().unwrap()]);
     m.configure(0, allow(&["10.0.0.0/24", "0.0.0.0/0"]));
     m.configure(1, allow(&["10.0.0.1/32", "fd00::/64", "fd00::2/128"]));
+
     for i in [0, 1] {
         assert!(m.send_from_addr(i, ip("10.0.0.1")).is_empty(), "peer {i} sent from our address");
         assert!(m.send_from_addr(i, ip("fd00::1")).is_empty(), "peer {i} sent from our prefix");
     }
     assert_eq!(m.send_to_addr(ip("10.0.0.1")), []);
     assert_eq!(m.send_to_addr(ip("fd00::1")), []);
+
+    // What isn't ours still routes.
     assert_eq!(m.send_from_addr(0, ip("10.0.0.3")).len(), 1);
     assert_eq!(m.send_from_addr(1, ip("fd00::2")).len(), 1);
-    assert_eq!(m.send_to_addr(ip("fd00::2")), [m.remotes[1].key.public()]);
+    assert_eq!(m.send_to_addr(ip("fd00::2")), [m.public(1)]);
 }
 
 /// Peers routing the same prefix share it by key, not by hash order,
@@ -400,16 +426,16 @@ fn our_own_prefixes_are_ours() {
 #[test]
 fn equal_prefixes_go_to_the_lower_key() {
     let mut m = Mesh::new();
-    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-    let (low, high) = if m.remotes[0].key.public() < m.remotes[1].key.public() { (0, 1) } else { (1, 0) };
-    for i in [high, low] {
-        m.configure(i, allow(&["10.0.0.0/24"]));
-    }
+    let mut by_key = [0, 1];
+    by_key.sort_by_key(|&i| m.public(i));
+    let [low, high] = by_key;
+    m.configure(high, allow(&["10.0.0.0/24"]));
+    m.configure(low, allow(&["10.0.0.0/24"]));
     for _ in 0..4 {
-        assert_eq!(m.send_to_addr(ip("10.0.0.7")), [m.remotes[low].key.public()]);
+        assert_eq!(m.send_to_addr(ip("10.0.0.7")), [m.public(low)]);
+        // Another peer coming and going reshuffles the hash order.
         m.configure(2, allow(&["10.0.1.0/24"]));
-        m.engine.remove_peer(&m.remotes[2].key.public());
-        m.configs.remove(&m.remotes[2].key.public());
+        m.unconfigure(2);
     }
     assert!(m.send_from_addr(high, ip("10.0.0.7")).is_empty());
     assert_eq!(m.send_from_addr(low, ip("10.0.0.7")).len(), 1);
