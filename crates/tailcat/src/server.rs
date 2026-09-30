@@ -799,15 +799,20 @@ mod model_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use std::sync::Barrier;
 
     use hegel::TestCase;
     use hegel::generators as gs;
+    use tokio::io::AsyncReadExt;
+    use tokio::runtime::{self, Handle, Runtime};
+    use tokio::task;
+    use tokio::time::timeout;
 
     use super::*;
-    use crate::KeySet;
     use crate::derp::server::DevDerp;
     use crate::key::DiscoPrivate;
+    use crate::{Client, ClientOptions, KeySet};
 
     /// Whether `k` is a connected client, a WireGuard peer, and a
     /// magicsock peer, which should always agree.
@@ -816,78 +821,88 @@ mod tests {
         (client, s.inner.engine.peer_stats(k).is_some(), s.inner.ms.peer_path(k).is_some())
     }
 
+    fn allowlist(k: NodePublic) -> KeySet {
+        let allow = KeySet::default();
+        allow.add(k);
+        allow
+    }
+
+    /// Waits at `barrier` without blocking the runtime.
+    async fn wait_at(barrier: &Arc<Barrier>) {
+        let barrier = barrier.clone();
+        task::spawn_blocking(move || barrier.wait()).await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_beats_a_pending_allow() {
         let dev = DevDerp::start_local().await.unwrap();
         let k = NodePrivate::generate().public();
-        let allow = KeySet::default();
-        allow.add(k);
+        let allow = allowlist(k);
         // The hook reads the allowlist, then stalls until the test has
         // revoked the key, like a slow lookup.
         let (asked, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
         let (check, hook_asked, hook_resume) = (allow.checker(), asked.clone(), resume.clone());
-        let server = Server::builder()
-            .region(dev.region.clone())
-            .allow_client(move |k| {
-                let ok = check(k);
-                hook_asked.wait();
-                hook_resume.wait();
-                ok
-            })
-            .start()
-            .await
-            .unwrap();
-        let join = tokio::spawn({
+        let slow_hook = move |k| {
+            let ok = check(k);
+            hook_asked.wait();
+            hook_resume.wait();
+            ok
+        };
+        let server = Server::builder().region(dev.region.clone()).allow_client(slow_hook).start().await.unwrap();
+        let meow = tokio::spawn({
             let s = server.clone();
             async move { s.on_meow(k, DiscoPrivate::generate().public()).await }
         });
-        tokio::task::spawn_blocking(move || asked.wait()).await.unwrap();
+        wait_at(&asked).await;
+
         // The documented revocation, while the hook's stale answer is
         // still in flight.
         allow.remove(&k);
         assert!(!server.disconnect_client(&k));
-        tokio::task::spawn_blocking(move || resume.wait()).await.unwrap();
-        assert!(!join.await.unwrap(), "revoked client was acked");
+        wait_at(&resume).await;
+
+        let acked = meow.await.unwrap();
+        assert!(!acked, "revoked client was acked");
         assert_eq!(membership(&server, &k), (false, false, false));
         server.close();
+    }
+
+    /// Asserts that `c` is aborted soon rather than left open.
+    async fn assert_aborted(c: &mut TcpStream) {
+        let read = timeout(Duration::from_secs(5), c.read(&mut [0u8; 1])).await;
+        let read = read.unwrap_or_else(|_| panic!("{c:?}: a revoked client's connection stayed open"));
+        assert_eq!(read.unwrap_err().kind(), ErrorKind::ConnectionAborted, "{c:?}");
     }
 
     /// Revoking a client tears down its connections at once, idle ones
     /// included, whether a handler or a listener holds them.
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_tears_down_connections() {
-        use tokio::io::AsyncReadExt;
-
         let dev = DevDerp::start_local().await.unwrap();
         let key = NodePrivate::generate();
-        let allow = KeySet::default();
-        allow.add(key.public());
+        let allow = allowlist(key.public());
         let (tx, mut handled) = mpsc::unbounded_channel();
-        let server = Server::builder()
-            .region(dev.region.clone())
-            .allow_client(allow.checker())
-            .on_tcp(move |_| {
-                let tx = tx.clone();
-                Some(handler(move |c| {
-                    let _ = tx.send(c);
-                    async {}
-                }))
-            })
-            .start()
-            .await
-            .unwrap();
+        // Every port's connections go to the test.
+        let to_test = move |_| {
+            let tx = tx.clone();
+            Some(handler(move |c| {
+                let _ = tx.send(c);
+                async {}
+            }))
+        };
+        let builder = Server::builder().region(dev.region.clone()).allow_client(allow.checker()).on_tcp(to_test);
+        let server = builder.start().await.unwrap();
         let mut listener = server.listen_tcp(2).unwrap();
-        let opts = crate::ClientOptions { key: Some(key.clone()), ..Default::default() };
-        let client = crate::Client::with_options(server.tailcat_addr(), opts);
+        let opts = ClientOptions { key: Some(key.clone()), ..Default::default() };
+        let client = Client::with_options(server.tailcat_addr(), opts);
         let _held = (client.dial_tcp_port(1).await.unwrap(), client.dial_tcp_port(2).await.unwrap());
         let mut conns = [handled.recv().await.unwrap(), listener.accept().await.unwrap()];
 
         allow.remove(&key.public());
         assert!(server.disconnect_client(&key.public()));
+
         for c in &mut conns {
-            let r = tokio::time::timeout(Duration::from_secs(5), c.read(&mut [0u8; 1])).await;
-            let r = r.unwrap_or_else(|_| panic!("{c:?}: a revoked client's connection stayed open"));
-            assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionAborted, "{c:?}");
+            assert_aborted(c).await;
         }
         server.close();
     }
@@ -896,7 +911,7 @@ mod tests {
     /// once, against one server.
     struct Membership {
         server: Server,
-        rt: tokio::runtime::Handle,
+        rt: Handle,
         keys: [NodePublic; 2],
     }
 
@@ -942,19 +957,23 @@ mod tests {
         }
     }
 
-    #[hegel::test(test_cases = 200)]
-    fn joins_and_disconnects_are_atomic(tc: TestCase) {
-        // One relay and server for every test case; each case uses fresh keys.
-        static WORLD: OnceLock<(tokio::runtime::Runtime, DevDerp, Server)> = OnceLock::new();
-        let (rt, _, server) = WORLD.get_or_init(|| {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    /// One relay and server for every test case; each case uses fresh keys.
+    fn shared_server() -> &'static (Runtime, DevDerp, Server) {
+        static WORLD: OnceLock<(Runtime, DevDerp, Server)> = OnceLock::new();
+        WORLD.get_or_init(|| {
+            let rt = runtime::Builder::new_multi_thread().enable_all().build().unwrap();
             let (dev, server) = rt.block_on(async {
                 let dev = DevDerp::start_local().await.unwrap();
                 let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
                 (dev, server)
             });
             (rt, dev, server)
-        });
+        })
+    }
+
+    #[hegel::test(test_cases = 200)]
+    fn joins_and_disconnects_are_atomic(tc: TestCase) {
+        let (rt, _, server) = shared_server();
         let keys = [(); 2].map(|_| NodePrivate::generate().public());
         let m = Membership { server: server.clone(), rt: rt.handle().clone(), keys };
         hegel::stateful::machine(m).steps(20).max_concurrency(4).run_concurrent(tc);
@@ -976,11 +995,13 @@ mod tests {
 
     #[test]
     fn port_filters() {
-        assert!(PortRange::ALL.contains(0) && PortRange::ALL.contains(65535));
+        assert!(PortRange::ALL.contains(0));
+        assert!(PortRange::ALL.contains(65535));
         assert_eq!(PortRange::coalesce(&[65534, 65535]), vec![PortRange { first: 65534, last: 65535 }]);
         assert!(admits(&None, 1));
         let only_ssh = Some(vec![PortRange::single(22)]);
-        assert!(admits(&only_ssh, 22) && !admits(&only_ssh, 23));
+        assert!(admits(&only_ssh, 22));
+        assert!(!admits(&only_ssh, 23));
         assert!(!admits(&Some(vec![]), 22));
     }
 
@@ -989,7 +1010,8 @@ mod tests {
         assert_eq!(pick_port(80, |_| false).unwrap(), 80);
         assert!(pick_port(80, |p| p == 80).is_err());
         let p = pick_port(0, |p| p % 2 == 0).unwrap();
-        assert!(p % 2 == 1 && (32768..=60999).contains(&p));
+        assert_eq!(p % 2, 1, "picked used port {p}");
+        assert!((32768..=60999).contains(&p), "picked {p}, outside the ephemeral range");
         assert!(pick_port(0, |_| true).is_err());
     }
 }

@@ -12,6 +12,9 @@ use std::collections::HashMap;
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use tokio::runtime::{self, Runtime};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::timeout;
 
 use super::*;
 use crate::derp::server::DevDerp;
@@ -28,17 +31,24 @@ const PORTS: [u16; 2] = [SERVED, UNSERVED];
 type Sink = Mutex<Option<mpsc::UnboundedSender<UdpConn>>>;
 
 struct World {
-    rt: tokio::runtime::Runtime,
+    rt: Runtime,
     server: Server,
-    handled: tokio::sync::Mutex<mpsc::UnboundedReceiver<UdpConn>>,
+    handled: AsyncMutex<mpsc::UnboundedReceiver<UdpConn>>,
     _dev: DevDerp,
+}
+
+impl World {
+    /// Client `k` joins, or refreshes, and is acked.
+    fn meow(&self, k: NodePublic) {
+        assert!(self.rt.block_on(self.server.on_meow(k, DiscoPrivate::generate().public())));
+    }
 }
 
 fn world() -> &'static World {
     static SINK: Sink = Mutex::new(None);
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let rt = runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         *SINK.lock().unwrap() = Some(tx);
         let (dev, server) = rt.block_on(async {
@@ -56,7 +66,7 @@ fn world() -> &'static World {
                 .unwrap();
             (dev, server)
         });
-        World { rt, server, handled: tokio::sync::Mutex::new(rx), _dev: dev }
+        World { rt, server, handled: AsyncMutex::new(rx), _dev: dev }
     })
 }
 
@@ -69,6 +79,22 @@ enum Via {
 struct Flow {
     conn: UdpConn,
     via: Via,
+}
+
+/// Checks that datagram `seq` from `src` reached `port`'s flow.
+async fn expect_datagram(conn: &UdpConn, src: SocketAddr, port: u16, seq: u32) {
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(1), conn.recv(&mut buf)).await;
+    let n = n.unwrap_or_else(|_| panic!("{src} -> {port}: datagram {seq} didn't reach its flow")).unwrap();
+    assert_eq!(buf[..n], seq.to_be_bytes(), "{src} -> {port}: wrong datagram");
+}
+
+/// Checks that a revoked client's flow from `src` to `port` closes.
+async fn expect_closed(conn: &UdpConn, src: SocketAddr, port: u16) {
+    let mut buf = [0u8; 16];
+    let r = timeout(Duration::from_secs(1), conn.recv(&mut buf)).await;
+    let r = r.unwrap_or_else(|_| panic!("{src} -> {port}: a revoked client's flow stayed open"));
+    assert!(r.is_err(), "{src} -> {port}: a revoked client's flow got a datagram");
 }
 
 struct Dispatch {
@@ -93,7 +119,7 @@ impl Dispatch {
         let w = world();
         let keys = [(); 2].map(|_| NodePrivate::generate().public());
         for k in keys {
-            assert!(w.rt.block_on(w.server.on_meow(k, DiscoPrivate::generate().public())));
+            w.meow(k);
         }
         Dispatch {
             w,
@@ -126,7 +152,7 @@ impl Dispatch {
     async fn accepted(&mut self, port: u16, wait: Duration) -> Option<(UdpConn, Via)> {
         let mut handled = self.w.handled.lock().await;
         let listener = self.listeners.get_mut(&port);
-        tokio::time::timeout(wait, async {
+        timeout(wait, async {
             match listener {
                 Some(l) => tokio::select! {
                     c = handled.recv() => (c.unwrap(), Via::Handler),
@@ -139,48 +165,57 @@ impl Dispatch {
         .ok()
     }
 
+    /// Where a new flow from `src` to `port` should go.
+    fn route(&self, src: SocketAddr, port: u16) -> Option<Via> {
+        let revoked = self.srcs.iter().zip(self.revoked).any(|(s, r)| *s == src && r);
+        if revoked {
+            None
+        } else if self.listeners.contains_key(&port) {
+            Some(Via::Listener)
+        } else {
+            (port == SERVED).then_some(Via::Handler)
+        }
+    }
+
+    /// Puts a datagram carrying `seq` straight into the server's stack.
+    fn inject(&self, src: SocketAddr, dst: SocketAddr, seq: u32) {
+        // The stack hands new flows to handlers on the runtime.
+        let _rt = self.w.rt.enter();
+        self.w.server.inner.stack.inject(build_udp(src, dst, &seq.to_be_bytes()).unwrap());
+    }
+
+    /// Checks that datagram `seq`, from `src` to `dst` with no flow yet,
+    /// opens a flow where `route` says, or none.
+    async fn expect_new_flow(&mut self, src: SocketAddr, dst: SocketAddr, seq: u32) {
+        let port = dst.port();
+        let want = self.route(src, port);
+        let wait = Duration::from_millis(if want.is_some() { 2000 } else { 20 });
+        let got = self.accepted(port, wait).await;
+        let (want, (conn, via)) = match (want, got) {
+            (None, None) => return,
+            (Some(want), Some(got)) => (want, got),
+            (want, got) => panic!("{src} -> {port}: wanted a flow via {want:?}, got {:?}", got.map(|g| g.1)),
+        };
+        assert_eq!(via, want, "{src} -> {port}: new flow went to the wrong place");
+        assert_eq!((conn.peer_addr(), conn.local_addr()), (src, dst));
+        let mut buf = [0u8; 16];
+        let n = conn.recv(&mut buf).await.unwrap();
+        assert_eq!(buf[..n], seq.to_be_bytes());
+        self.flows.insert((src, port), Flow { conn, via });
+    }
+
     /// Sends a datagram and checks where it goes.
     fn send(&mut self, src: SocketAddr, port: u16) {
         let seq = self.next;
         self.next += 1;
         let dst = SocketAddr::new(IpAddr::V6(self.w.server.addr()), port);
-        let w = self.w;
-        // The stack hands new flows to handlers on the runtime.
-        let _rt = w.rt.enter();
-        w.server.inner.stack.inject(build_udp(src, dst, &seq.to_be_bytes()).unwrap());
-        w.rt.block_on(async {
-            let mut buf = [0u8; 16];
-            if let Some(f) = self.flows.get(&(src, port)) {
-                // Datagrams for a flow queue on it at once.
-                let n = tokio::time::timeout(Duration::from_secs(1), f.conn.recv(&mut buf)).await;
-                let n = n.unwrap_or_else(|_| panic!("{src} -> {port}: datagram {seq} didn't reach its flow")).unwrap();
-                assert_eq!(buf[..n], seq.to_be_bytes(), "{src} -> {port}: wrong datagram");
-                return;
-            }
-            let revoked = self.srcs.iter().zip(self.revoked).any(|(s, r)| *s == src && r);
-            let want = if revoked {
-                None
-            } else if self.listeners.contains_key(&port) {
-                Some(Via::Listener)
-            } else {
-                (port == SERVED).then_some(Via::Handler)
-            };
-            let wait = Duration::from_millis(if want.is_some() { 2000 } else { 20 });
-            let got = self.accepted(port, wait).await;
-            match (want, got) {
-                (None, None) => {}
-                (Some(want), Some((conn, via))) => {
-                    assert_eq!(via, want, "{src} -> {port}: new flow went to the wrong place");
-                    assert_eq!((conn.peer_addr(), conn.local_addr()), (src, dst));
-                    let n = conn.recv(&mut buf).await.unwrap();
-                    assert_eq!(buf[..n], seq.to_be_bytes());
-                    self.flows.insert((src, port), Flow { conn, via });
-                }
-                (want, got) => {
-                    panic!("{src} -> {port}: wanted a flow via {want:?}, got {:?}", got.map(|g| g.1))
-                }
-            }
-        });
+        self.inject(src, dst, seq);
+        let rt = &self.w.rt;
+        match self.flows.get(&(src, port)) {
+            // Datagrams for a flow queue on it at once.
+            Some(f) => rt.block_on(expect_datagram(&f.conn, src, port, seq)),
+            None => rt.block_on(self.expect_new_flow(src, dst, seq)),
+        }
     }
 }
 
@@ -202,22 +237,16 @@ impl Dispatch {
         self.revoked[i] = true;
         let src = self.srcs[i];
         let gone: Vec<_> = self.flows.extract_if(|(s, _), _| *s == src).collect();
-        self.w.rt.block_on(async {
-            for ((_, port), f) in gone {
-                let mut buf = [0u8; 16];
-                let r = tokio::time::timeout(Duration::from_secs(1), f.conn.recv(&mut buf)).await;
-                let r = r.unwrap_or_else(|_| panic!("{src} -> {port}: a revoked client's flow stayed open"));
-                assert!(r.is_err(), "{src} -> {port}: a revoked client's flow got a datagram");
-            }
-        });
+        for ((_, port), f) in gone {
+            self.w.rt.block_on(expect_closed(&f.conn, src, port));
+        }
     }
 
     /// A revoked client joins again, or a connected one refreshes.
     #[rule]
     fn rejoin(&mut self, tc: TestCase) {
         let i = self.client(&tc);
-        let w = self.w;
-        assert!(w.rt.block_on(w.server.on_meow(self.keys[i], DiscoPrivate::generate().public())));
+        self.w.meow(self.keys[i]);
         self.revoked[i] = false;
     }
 
