@@ -336,10 +336,8 @@ impl Overlay {
 
     /// Returns every peer's status, ordered by index.
     pub fn status(&self) -> Vec<PeerStatus> {
-        let mut out: Vec<PeerStatus> = self
-            .state
-            .lock()
-            .unwrap()
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<PeerStatus> = st
             .peers
             .values()
             .map(|Peer { record: r, .. }| {
@@ -357,6 +355,7 @@ impl Overlay {
                 }
             })
             .collect();
+        drop(st);
         out.sort_by_key(|p| p.index);
         out
     }
