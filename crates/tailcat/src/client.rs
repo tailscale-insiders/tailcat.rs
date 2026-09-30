@@ -180,10 +180,9 @@ impl Running {
         *rejoined = Some(Rejoined { at: Instant::now(), answered: true });
         Ok(())
     }
-}
 
-impl Drop for Running {
-    fn drop(&mut self) {
+    /// Closes the tunnel and stops its tasks, the watchdog included.
+    fn close(&self) {
         close_tunnel(&self.stack, &self.engine, &self.ms);
         for t in &self.tasks {
             t.abort();
@@ -207,7 +206,17 @@ struct ClientInner {
     derp_map_url: Option<String>,
     derp_map_cache: Option<Arc<dyn DerpMapCache>>,
     derp_map: Option<DerpMap>,
-    running: OnceCell<Running>,
+    /// The tunnel, once started. The watchdog shares it, and may hold it
+    /// through a rejoin, so dropping the client closes it explicitly.
+    running: OnceCell<Arc<Running>>,
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        if let Some(r) = self.running.get() {
+            r.close();
+        }
+    }
 }
 
 /// Options for [`Client::with_options`].
@@ -263,10 +272,10 @@ impl Client {
     }
 
     async fn ensure_started(&self) -> Result<&Running> {
-        self.inner.running.get_or_try_init(|| self.start()).await
+        self.inner.running.get_or_try_init(|| self.start()).await.map(Arc::as_ref)
     }
 
-    async fn start(&self) -> Result<Running> {
+    async fn start(&self) -> Result<Arc<Running>> {
         let mut ci = self.inner.server.parse()?;
         if ci.server_disco_public.is_zero() {
             return Err(Error::Addr(
@@ -346,8 +355,7 @@ impl Client {
                 inject.inject(p.data);
             }
         });
-        let watchdog = tokio::spawn(watch_server(Arc::downgrade(&self.inner)));
-        Ok(Running {
+        Ok(Arc::new_cyclic(|running| Running {
             ci,
             server_ip,
             my_ip,
@@ -359,8 +367,8 @@ impl Client {
             rejoined: tokio::sync::Mutex::new(None),
             server_ms,
             server_wg,
-            tasks: [task, watchdog],
-        })
+            tasks: [task, tokio::spawn(watch_server(running.clone()))],
+        }))
     }
 
     /// Starts the client if needed, then announces it to the server over
@@ -445,13 +453,14 @@ impl Client {
 /// Joins again whenever data sent to the server goes unanswered, which
 /// is how the client notices a server that lost track of it while no
 /// dial is waiting (say, a UDP flow's).
-async fn watch_server(client: Weak<ClientInner>) {
+async fn watch_server(running: Weak<Running>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut stall = Stall::default();
     loop {
         tick.tick().await;
-        let Some(inner) = client.upgrade() else { return };
-        let Some(r) = inner.running.get() else { continue };
+        // Not up yet: `start` is still making it. Closing the tunnel
+        // aborts this task, so it never outlives it.
+        let Some(r) = running.upgrade() else { continue };
         let server = r.ci.server_public;
         let (_, tx, rx) = r.engine.peer_stats(&server).unwrap_or_default();
         let path = r.ms.peer_path(&server);
@@ -505,7 +514,11 @@ impl Stall {
 
 #[cfg(test)]
 mod tests {
+    use tokio::time::{sleep, timeout};
+
     use super::*;
+    use crate::Server;
+    use crate::derp::server::DevDerp;
 
     /// Feeds `stall` one sample a second for `secs` seconds from `t0`,
     /// with `sample` giving (tx, rx, last send, last receive) in seconds.
@@ -523,6 +536,31 @@ mod tests {
     }
 
     const NEVER: &[u64] = &[];
+
+    /// Dropping the client closes its tunnel at once, even while the
+    /// watchdog holds it through a rejoin the server doesn't answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_client_beats_a_rejoin() {
+        let dev = DevDerp::start_local().await.unwrap();
+        let server = Server::builder().region(dev.region.clone()).start().await.unwrap();
+        let client = Client::new(server.tailcat_addr());
+        client.ping().await.unwrap();
+        server.close();
+        let key = client.public_key();
+        // Holding the tunnel as the watchdog does, on a stall.
+        let running = client.inner.running.get().unwrap().clone();
+        let rejoin = tokio::spawn(async move { running.rejoin().await });
+
+        drop(client);
+        let gone = async {
+            while dev.server.is_client_connected(&key) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let closed = timeout(Duration::from_secs(5), gone).await.is_ok();
+        rejoin.abort();
+        assert!(closed, "the dropped client's tunnel stayed up for the rejoin");
+    }
 
     #[test]
     fn answered_data_never_stalls() {
