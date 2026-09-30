@@ -110,13 +110,13 @@ impl GithubSource {
 
 impl Source {
     /// Every `*.json` file in a directory.
-    pub fn dir(d: PathBuf) -> Source {
-        Source { kind: Kind::Dir(d), last: HashMap::new() }
+    pub fn dir(d: impl Into<PathBuf>) -> Source {
+        Source { kind: Kind::Dir(d.into()), last: HashMap::new() }
     }
 
     /// Specific files.
-    pub fn files(fs: Vec<PathBuf>) -> Source {
-        Source { kind: Kind::Files(fs), last: HashMap::new() }
+    pub fn files(fs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Source {
+        Source { kind: Kind::Files(fs.into_iter().map(Into::into).collect()), last: HashMap::new() }
     }
 
     /// GitHub Actions run artifacts.
@@ -442,9 +442,9 @@ mod tests {
         write("d.json", &NodeRecord { index: 9, ..a.clone() }); // a duplicate key
         fs::write(dir.join("e.json"), HALF_WRITTEN).unwrap();
 
-        let listed = poll(&mut Source::dir(dir.into())).await;
+        let listed = poll(&mut Source::dir(dir)).await;
         assert_eq!(listed, [a, b.clone()], "sorted by file name, first record per key wins");
-        let named = poll(&mut Source::files(vec![dir.join("missing.json"), dir.join("b.json")])).await;
+        let named = poll(&mut Source::files([dir.join("missing.json"), dir.join("b.json")])).await;
         assert_eq!(named, [b]);
         let missing = poll(&mut Source::dir(dir.join("missing"))).await;
         assert!(missing.is_empty());
@@ -457,7 +457,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (a, b) = (rec("1"), rec("1"));
         let (pa, pb) = (d.path().join("a.json"), d.path().join("b.json"));
-        for mut src in [Source::dir(d.path().into()), Source::files(vec![pa.clone(), pb.clone()])] {
+        for mut src in [Source::dir(d.path()), Source::files([&pa, &pb])] {
             a.write(&pa).unwrap();
             b.write(&pb).unwrap();
             assert_eq!(poll(&mut src).await, [a.clone(), b.clone()]);
