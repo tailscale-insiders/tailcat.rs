@@ -236,8 +236,8 @@ enum Cmd {
 pub struct UsageError(String);
 
 impl UsageError {
-    pub fn new(msg: String) -> Self {
-        UsageError(msg)
+    pub fn new(msg: impl Into<String>) -> Self {
+        UsageError(msg.into())
     }
 }
 
