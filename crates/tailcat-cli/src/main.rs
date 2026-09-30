@@ -196,7 +196,7 @@ enum Cmd {
         open_browser: bool,
         addr: String,
         #[arg(required = true)]
-        mappings: Vec<String>,
+        mappings: Vec<args::ForwardArg>,
     },
     /// open a web browser to a tailcat server's port 80
     Browse { addr: String },
@@ -364,7 +364,10 @@ async fn run(cli: Cli, has_separator: bool) -> anyhow::Result<ExitCode> {
             }
             forward::run_forward(g, &bind, &addr, &mappings, open_browser).await?;
         }
-        Some(Cmd::Browse { addr }) => forward::run_forward(g, "127.0.0.1", &addr, &["0:80".into()], true).await?,
+        Some(Cmd::Browse { addr }) => {
+            let port_80 = args::ForwardArg { local: 0, remote: args::Dest::Port(80) };
+            forward::run_forward(g, "127.0.0.1", &addr, &[port_80], true).await?
+        }
         Some(Cmd::Parse { addr }) => {
             let v = tailcat::Addr::new(addr).parse_raw_json()?;
             print!("{}", tailcat::addr::to_go_indented_json(&v));
