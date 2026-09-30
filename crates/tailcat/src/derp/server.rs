@@ -120,7 +120,7 @@ impl Server {
         let msg =
             self.key.open_from(&client, sealed).ok_or_else(|| Error::Derp("cannot open client info box".into()))?;
         let info: ClientInfo = serde_json::from_slice(&msg).map_err(|e| Error::Derp(format!("client info: {e}")))?;
-        if !super::valid_app_name(&info.app_name) {
+        if !info.app_name.is_valid() {
             return Err(Error::Derp("invalid app name".into()));
         }
 
@@ -342,10 +342,10 @@ mod tests {
         let (a_tx, mut a_rx) = mpsc::channel(16);
         let (b_tx, mut b_rx) = mpsc::channel(16);
         let (ka, kb) = (NodePrivate::generate(), NodePrivate::generate());
-        let a = DerpClient::spawn(dev.region.clone(), ka.clone(), "test-a", true, a_tx);
+        let a = DerpClient::spawn(dev.region.clone(), ka.clone(), &"test-a".into(), true, a_tx);
         // Nothing is queued before the connection is up.
         assert!(!a.send(&kb.public(), b"too early"));
-        let b = DerpClient::spawn(dev.region.clone(), kb.clone(), "test-b", true, b_tx);
+        let b = DerpClient::spawn(dev.region.clone(), kb.clone(), &"test-b".into(), true, b_tx);
         assert!(a.wait_connected(T).await);
         assert!(b.wait_connected(T).await);
         assert!(dev.wait_for_client(&kb.public(), T).await);
@@ -445,7 +445,7 @@ mod tests {
     async fn answers_pings_and_reports_absent_peers() {
         let (server, mut c) = http("").await;
         let key = NodePrivate::generate();
-        assert_eq!(login(&mut c, "T", &key, "test").await.unwrap(), server.public_key());
+        assert_eq!(login(&mut c, "T", &key, &"test".into()).await.unwrap(), server.public_key());
         let (t, sealed) = next_frame(&mut c).await;
         assert_eq!(t, FrameType::ServerInfo as u8);
         let opened = key.open_from(&server.public_key(), &sealed).unwrap();
@@ -471,7 +471,7 @@ mod tests {
     /// Connects to `server` and logs in as `key`.
     async fn logged_in(server: &Arc<Server>, key: &NodePrivate) -> Conn {
         let mut c = connect(server, "").await;
-        login(&mut c, "T", key, "test").await.unwrap();
+        login(&mut c, "T", key, &"test".into()).await.unwrap();
         let (t, _) = next_frame(&mut c).await;
         assert_eq!(t, FrameType::ServerInfo as u8);
         c

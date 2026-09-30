@@ -140,6 +140,23 @@ pub struct ReceivedPacket {
     pub data: Vec<u8>,
 }
 
+known_strings! {
+    /// What a DERP client says it is, which the relay may log: tailcat's
+    /// own are variants.
+    AppName {
+        Client => "tailcat-client",
+        Server => "tailcat-server",
+        Device => "tailcat-device",
+    }
+}
+
+impl AppName {
+    /// Whether it's one a relay takes: at most 32 bytes of printable ASCII.
+    pub fn is_valid(&self) -> bool {
+        valid_app_name(self.as_str())
+    }
+}
+
 /// The client's self-description, sealed to the server at login.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClientInfo {
@@ -151,8 +168,8 @@ pub struct ClientInfo {
     pub can_ack_pings: bool,
     #[serde(rename = "IsProber", default, skip_serializing_if = "std::ops::Not::not")]
     pub is_prober: bool,
-    #[serde(rename = "AppName", default, skip_serializing_if = "String::is_empty")]
-    pub app_name: String,
+    #[serde(rename = "AppName", default, skip_serializing_if = "AppName::is_empty")]
+    pub app_name: AppName,
 }
 
 /// The server's self-description, sealed to the client at login.
@@ -218,5 +235,7 @@ mod tests {
         assert!(!valid_app_name(&"x".repeat(33)));
         assert!(!valid_app_name("tab\there"));
         assert!(!valid_app_name("caf\u{e9}"));
+        assert!(matches!(AppName::from("tailcat-device"), AppName::Device));
+        assert!(AppName::Device.is_valid() && !AppName::from("x".repeat(33)).is_valid());
     }
 }

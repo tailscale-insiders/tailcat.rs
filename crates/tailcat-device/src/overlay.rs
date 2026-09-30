@@ -138,7 +138,7 @@ impl Overlay {
             private_key: private.clone(),
             derp_map,
             home_region,
-            derp_app_name: "tailcat-device".into(),
+            derp_app_name: tailcat::derp::AppName::Device,
             listen_port,
             on_derp_recv: None,
             endpoint_filter: Some(Arc::new(move |ip| !overlay_prefix.contains(&ip))),

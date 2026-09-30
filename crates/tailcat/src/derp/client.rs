@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, trace, warn};
 
-use super::{ClientInfo, FrameType, MAGIC, MAX_FRAME_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION, ReceivedPacket};
+use super::{AppName, ClientInfo, FrameType, MAGIC, MAX_FRAME_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION, ReceivedPacket};
 use crate::derpmap::{DerpNode, DerpRegion};
 use crate::key::{NodePrivate, NodePublic};
 use crate::{Error, Result};
@@ -54,7 +54,7 @@ pub(crate) async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut BufReader<S>,
     host: &str,
     key: &NodePrivate,
-    app_name: &str,
+    app_name: &AppName,
 ) -> Result<NodePublic> {
     let req = format!(
         "GET /derp HTTP/1.1\r\nHost: {host}\r\nUser-Agent: tailcat-rs\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"
@@ -82,12 +82,8 @@ pub(crate) async fn login<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|_| t == FrameType::ServerKey as u8)
         .ok_or_else(|| Error::Derp("invalid DERP server greeting".into()))?;
 
-    let info = ClientInfo {
-        version: PROTOCOL_VERSION,
-        can_ack_pings: true,
-        app_name: app_name.to_string(),
-        ..Default::default()
-    };
+    let info =
+        ClientInfo { version: PROTOCOL_VERSION, can_ack_pings: true, app_name: app_name.clone(), ..Default::default() };
     let sealed = key.seal_to(&server_key, &serde_json::to_vec(&info).expect("ClientInfo serializes"));
     super::write_frame(s.get_mut(), FrameType::ClientInfo, &[key.public().as_bytes(), &sealed]).await?;
     Ok(server_key)
@@ -113,13 +109,13 @@ impl DerpClient {
     pub fn spawn(
         region: DerpRegion,
         key: NodePrivate,
-        app_name: &str,
+        app_name: &AppName,
         preferred: bool,
         recv: mpsc::Sender<ReceivedPacket>,
     ) -> Self {
         let (out, out_rx) = mpsc::channel(OUT_QUEUE);
         let (conn_tx, connected) = watch::channel(false);
-        let app_name = if super::valid_app_name(app_name) { app_name } else { "" }.to_string();
+        let app_name = if app_name.is_valid() { app_name.clone() } else { AppName::Unset };
         let task = tokio::spawn(run(region, key, app_name, preferred, recv, out_rx, conn_tx));
         DerpClient { out, connected, task }
     }
@@ -144,7 +140,7 @@ impl DerpClient {
 async fn run(
     region: DerpRegion,
     key: NodePrivate,
-    app_name: String,
+    app_name: AppName,
     preferred: bool,
     recv: mpsc::Sender<ReceivedPacket>,
     mut out: mpsc::Receiver<Vec<u8>>,
@@ -176,7 +172,7 @@ async fn run(
 
 type Stream = BufReader<TlsStream<TcpStream>>;
 
-async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &str) -> Result<(Stream, String)> {
+async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &AppName) -> Result<(Stream, String)> {
     let mut last = Error::Derp(format!("no nodes in DERP region {}", region.region_id));
     for n in region.nodes.iter().filter(|n| !n.stun_only) {
         let host = n.host_name.text();

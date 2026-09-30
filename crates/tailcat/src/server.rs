@@ -427,7 +427,7 @@ impl Server {
             private_key: key.clone(),
             derp_map: dm,
             home_region: region.region_id,
-            derp_app_name: "tailcat-server".into(),
+            derp_app_name: crate::derp::AppName::Server,
             listen_port: b.listen_port,
             on_derp_recv: Some(hook),
             endpoint_filter: None,

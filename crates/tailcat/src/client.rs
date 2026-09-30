@@ -283,7 +283,7 @@ impl Client {
             private_key: self.inner.key.clone(),
             derp_map: dm,
             home_region: region.region_id,
-            derp_app_name: "tailcat-client".into(),
+            derp_app_name: crate::derp::AppName::Client,
             listen_port: 0,
             on_derp_recv: Some(hook),
             endpoint_filter: None,

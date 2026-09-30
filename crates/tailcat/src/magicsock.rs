@@ -22,8 +22,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
-use crate::derp::ReceivedPacket;
 use crate::derp::client::DerpClient;
+use crate::derp::{AppName, ReceivedPacket};
 use crate::derpmap::{DERP_MAGIC_IP, DerpMap, DerpRegion};
 use crate::disco::{self, Message, TxId};
 use crate::key::{DiscoPrivate, DiscoPublic, DiscoShared, NodePrivate, NodePublic};
@@ -89,7 +89,7 @@ pub struct Config {
     /// The region this node stays connected to and advertises.
     pub home_region: i32,
     /// An app name reported to DERP servers for their stats.
-    pub derp_app_name: String,
+    pub derp_app_name: AppName,
     /// The UDP port to listen on (0 picks one).
     pub listen_port: u16,
     pub on_derp_recv: Option<DerpRecvHook>,
@@ -246,7 +246,7 @@ pub struct MagicSock {
     disco_private: DiscoPrivate,
     disco_public: DiscoPublic,
     home_region: i32,
-    app_name: String,
+    app_name: AppName,
     enable_udp: bool,
     endpoint_filter: Option<EndpointFilter>,
     on_derp_recv: Option<DerpRecvHook>,
