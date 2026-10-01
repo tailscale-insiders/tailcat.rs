@@ -81,6 +81,7 @@ impl ConnHandler {
         if !opts.exec.is_empty() {
             // On top of our own environment, which the command inherits.
             let env = crate::exec::peer_env(self.local, self.remote, peer)
+                .chain(ssh_env(self.local, self.remote))
                 .chain(client_env)
                 .chain(raw_cmd.map(|c| ("SSH_ORIGINAL_COMMAND".into(), c)))
                 .collect();
@@ -102,6 +103,7 @@ impl ConnHandler {
             ("HOME".to_string(), user.home.clone()),
             ("PATH".to_string(), default_path(&user).into()),
         ];
+        env.extend(ssh_env(self.local, self.remote));
         env.extend(client_env);
         // The tunnel authenticated the peer by this key.
         env.extend(peer.map(|k| ("TAILCAT_PEER_KEY".into(), k.to_string())));
@@ -445,9 +447,10 @@ fn killed_by(_: &ExitStatus) -> Option<i32> {
 
 #[cfg(unix)]
 mod pty {
+    use std::ffi::CStr;
     use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use std::{mem, ptr};
@@ -459,6 +462,14 @@ mod pty {
     use tokio::sync::mpsc;
 
     use super::{INTERACTIVE_MOTD, Input, Plan, PtyReq, Writer, drain, exit_code, next_input, say};
+
+    /// The path of the terminal open on `fd`.
+    fn tty_name(fd: RawFd) -> Option<String> {
+        let mut buf = [0 as libc::c_char; 256];
+        // SAFETY: ttyname_r writes a NUL-terminated name within `buf`.
+        let r = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) };
+        (r == 0).then(|| unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
+    }
 
     /// Once the command exits, output stops when the terminal has had
     /// nothing to read for this long...
@@ -580,6 +591,9 @@ mod pty {
 
         let motd = plan.motd;
         let mut cmd = plan.command();
+        if let Some(name) = tty_name(slave.as_raw_fd()) {
+            cmd.env("SSH_TTY", name);
+        }
         let (Ok(i), Ok(o), Ok(e)) = (slave.try_clone(), slave.try_clone(), slave.try_clone()) else {
             say(wr, "pty dup failed\r\n").await;
             return 1;
@@ -764,6 +778,17 @@ fn login_shell(_: &User) -> String {
 #[cfg(not(windows))]
 fn env_shell() -> String {
     env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
+}
+
+/// SSH_CLIENT and SSH_CONNECTION, as OpenSSH's sshd sets them. Scripts
+/// check them to tell a remote session, and NixOS's /etc/bashrc to set
+/// up a non-interactive shell's PATH.
+fn ssh_env(local: SocketAddr, remote: SocketAddr) -> [(String, String); 2] {
+    let (lip, lport, rip, rport) = (local.ip(), local.port(), remote.ip(), remote.port());
+    [
+        ("SSH_CLIENT".into(), format!("{rip} {rport} {lport}")),
+        ("SSH_CONNECTION".into(), format!("{rip} {rport} {lip} {lport}")),
+    ]
 }
 
 fn default_path(u: &User) -> &'static str {
@@ -999,10 +1024,12 @@ mod tests {
 
         // Builtins only: sessions get a fixed PATH, which on some systems
         // (NixOS, a build sandbox) holds no coreutils.
-        let script = "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; read -r l; echo \"$l\"; echo oops >&2; exit 3";
+        let script = "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; echo \"$SSH_CLIENT|$SSH_CONNECTION|$SSH_TTY\"; \
+                      read -r l; echo \"$l\"; echo oops >&2; exit 3";
         let o = run(ch, script, b"in\n").await;
 
-        assert_eq!(o.out, format!("{} yes []\nin\n", peer_key()));
+        let ssh = "fd7a:115c:a1e0::2 4242 22|fd7a:115c:a1e0::2 4242 fd7a:115c:a1e0::1 22|";
+        assert_eq!(o.out, format!("{} yes []\n{ssh}\nin\n", peer_key()));
         assert_eq!(o.err, "oops\n");
         assert_eq!(o.code, Some(3));
 
@@ -1027,12 +1054,14 @@ mod tests {
         let (Some(stty), Some(tty)) = (which("stty"), which("tty")) else {
             return;
         };
-        let o = run(ch, &format!("{stty} size; echo $TERM; {tty} -s && echo tty"), b"").await;
+        let script =
+            format!("{stty} size; echo $TERM; {tty} -s && echo tty; [ \"$SSH_TTY\" = \"$({tty})\" ] && echo named");
+        let o = run(ch, &script, b"").await;
 
         if o.err.starts_with("pty open:") || o.err.starts_with("start:") {
             return; // No PTYs in this sandbox.
         }
-        assert_eq!(o.out, "50 100\r\nxterm\r\ntty\r\n");
+        assert_eq!(o.out, "50 100\r\nxterm\r\ntty\r\nnamed\r\n");
         assert_eq!(o.code, Some(0));
     }
 
