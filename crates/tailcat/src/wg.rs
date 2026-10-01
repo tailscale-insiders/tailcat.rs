@@ -298,6 +298,18 @@ impl Engine {
         }
     }
 
+    /// Starts a new handshake with peer `key`: for a peer that may still
+    /// be sending on a session we've dropped, which it would otherwise
+    /// keep doing until its own handshake timers fire.
+    pub fn initiate_handshake(&self, key: &NodePublic) {
+        let Some(peer) = self.peer(key) else { return };
+        let mut buf = vec![0u8; 256];
+        let res = peer.tunn.lock().unwrap().format_handshake_initiation(&mut buf, false);
+        if let TunnResult::WriteToNetwork(b) = res {
+            self.send(&peer.key, b);
+        }
+    }
+
     /// Encrypts and sends an IP packet to a specific peer.
     pub fn send_ip_to_peer(&self, key: &NodePublic, pkt: &[u8]) {
         if let Some(peer) = self.peer(key) {
