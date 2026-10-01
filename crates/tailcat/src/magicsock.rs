@@ -21,7 +21,7 @@ use std::{fmt, iter, mem};
 use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::derp::client::DerpClient;
 use crate::derp::{AppName, ReceivedPacket};
@@ -171,6 +171,8 @@ struct Peer {
     last_upgrade: Option<Instant>,
     /// The region we last heard from this peer over.
     derp_seen: Option<i32>,
+    /// The direct path last logged as the one in use; `None` for DERP.
+    logged_path: Option<SocketAddr>,
 }
 
 impl Peer {
@@ -188,11 +190,28 @@ impl Peer {
             last_call_me_maybe: None,
             last_upgrade: None,
             derp_seen: None,
+            logged_path: None,
         }
     }
 
     fn trusted(&self, now: Instant) -> bool {
         self.best.is_some() && self.trust_until.is_some_and(|t| now < t)
+    }
+
+    /// Logs a change of the path in use, direct or over DERP.
+    fn log_path_change(&mut self, key: &NodePublic, now: Instant) {
+        let path = self.best.filter(|_| self.trusted(now));
+        if path.map(|b| b.0) == self.logged_path {
+            return;
+        }
+        let peer = key.short_string();
+        match (self.logged_path, path) {
+            (None, Some((to, lat))) => info!(peer, "magicsock: path is now direct: {to} ({lat:?})"),
+            (Some(from), Some((to, lat))) => info!(peer, "magicsock: direct path moved: {from} -> {to} ({lat:?})"),
+            (Some(from), None) => info!(peer, "magicsock: direct path {from} lost; now over DERP"),
+            (None, None) => {}
+        }
+        self.logged_path = path.map(|b| b.0);
     }
 
     fn derp_region(&self) -> i32 {
@@ -696,6 +715,7 @@ impl MagicSock {
                         p.best = Some((to, latency));
                         p.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
                     }
+                    p.log_path_change(&peer_key, now);
                 }
             }
             Message::CallMeMaybe { mut endpoints } => {
@@ -850,11 +870,14 @@ impl MagicSock {
         }
         let keys: Vec<NodePublic> = inner.peers.keys().copied().collect();
         for k in keys {
-            let p = &inner.peers[&k];
+            let p = inner.peers.get_mut(&k).unwrap();
             let active = p.last_send.is_some_and(|t| now - t < SESSION_ACTIVE_TIMEOUT);
             if !active {
                 continue;
             }
+            // Only while in use: an idle peer's path lapses quietly.
+            p.log_path_change(&k, now);
+            let p = &inner.peers[&k];
             if let Some((best, lat)) = p.best {
                 let needs_upgrade =
                     lat > GOOD_ENOUGH_LATENCY && p.last_upgrade.is_none_or(|t| now - t > UPGRADE_INTERVAL);
