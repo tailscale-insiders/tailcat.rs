@@ -4,7 +4,8 @@
 //! silent for good, while our side writes, half-closes, aborts and drops
 //! streams, closes the stack, and lets time pass on a paused clock. Every
 //! stream is checked against what the remote sent and how the connection
-//! ended, and the stack's flow table against its sockets.
+//! ended, and the stack's flow table against its sockets. Connections
+//! from one source port wait on a deferred decision the model makes.
 
 use std::collections::HashSet;
 use std::future::poll_fn;
@@ -20,6 +21,7 @@ use hegel::TestCase;
 use hegel::generators as gs;
 use smoltcp::wire::{TcpControl, TcpSeqNumber};
 use tokio::runtime::{self, Runtime};
+use tokio::sync::oneshot;
 use tokio::task::yield_now;
 use tokio::time::{self, Instant};
 
@@ -30,7 +32,9 @@ use super::*;
 const SERVICE: u16 = 80;
 const DIALED: u16 = 443;
 /// The remote's source ports for inbound connections.
-const SOURCE_PORTS: [u16; 2] = [1000, 1001];
+const SOURCE_PORTS: [u16; 3] = [1000, 1001, DEFERRED];
+/// The source port whose connections wait on a deferred decision.
+const DEFERRED: u16 = 1002;
 /// Leeway for timeouts: the stack notices them on its next poll.
 const SLACK: Duration = Duration::from_secs(5);
 
@@ -64,6 +68,26 @@ fn accept_into(accepted: Arc<Mutex<Vec<TcpStream>>>) -> TcpPolicy {
     })
 }
 
+/// Deferred decisions waiting on the model, by flow.
+type Decisions = Arc<Mutex<HashMap<FlowKey, oneshot::Sender<bool>>>>;
+
+/// Like [`accept_into`], except that connections from [`DEFERRED`] wait
+/// for the model's decision in `decisions`.
+fn accept_or_defer(accepted: Arc<Mutex<Vec<TcpStream>>>, decisions: Decisions) -> TcpPolicy {
+    let accept = accept_into(accepted);
+    Arc::new(move |src, dst| {
+        let decision = accept(src, dst);
+        if src.port() != DEFERRED {
+            return decision;
+        }
+        let TcpDecision::Accept(h) = decision else { unreachable!() };
+        let (tx, rx) = oneshot::channel();
+        let old = decisions.lock().unwrap().insert((dst, src), tx);
+        assert!(old.is_none_or(|t| t.is_closed()), "asked again about {src} -> {dst} while deciding");
+        TcpDecision::Defer(Box::pin(async move { rx.await.ok()?.then_some(h) }))
+    })
+}
+
 /// Polls `f` once, with a waker that does nothing.
 fn poll_once<F: Future + ?Sized>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
@@ -88,6 +112,8 @@ struct Conn {
     isn: TcpSeqNumber,
     /// The stack's initial sequence number, from its SYN or SYN-ACK.
     stack_isn: Option<TcpSeqNumber>,
+    /// Since when the remote's SYN has waited on a deferred decision.
+    deferred: Option<Instant>,
     /// Whether the remote has completed the handshake: acked the stack's
     /// SYN-ACK, or answered its SYN with one.
     established: bool,
@@ -129,6 +155,7 @@ impl Conn {
             dialed,
             isn,
             stack_isn: None,
+            deferred: None,
             established: false,
             sent: Vec::new(),
             fin: false,
@@ -287,6 +314,7 @@ struct Net {
     stack: Stack,
     out: Arc<Mutex<Vec<Vec<u8>>>>,
     accepted: Arc<Mutex<Vec<TcpStream>>>,
+    decisions: Decisions,
     conns: Vec<Conn>,
     /// The latest connection on each 4-tuple, as an index into `conns`.
     live: HashMap<FlowKey, usize>,
@@ -302,8 +330,11 @@ impl Net {
         let accepted: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
         let o = out.clone();
         let emit: Output = Arc::new(move |p| o.lock().unwrap().push(p));
-        let stack = Stack::new(stack_config(), emit, Some(accept_into(accepted.clone())), None);
-        Net { rt, stack, out, accepted, conns: Vec::new(), live: HashMap::new(), next_isn: 1000, closed: false }
+        let decisions = Decisions::default();
+        let policy = accept_or_defer(accepted.clone(), decisions.clone());
+        let stack = Stack::new(stack_config(), emit, Some(policy), None);
+        let (conns, live) = (Vec::new(), HashMap::new());
+        Net { rt, stack, out, accepted, decisions, conns, live, next_isn: 1000, closed: false }
     }
 
     /// Feeds a segment to the stack, on the paused clock.
@@ -471,6 +502,10 @@ impl Net {
             // paused clock from moving on by itself.
             self.rt.block_on(time::advance(step));
             self.settle();
+            // A decision that took too long was a refusal.
+            for c in self.conns.iter_mut().filter(|c| c.got_rst) {
+                c.deferred = None;
+            }
         }
     }
 
@@ -495,7 +530,7 @@ impl Net {
 /// The steps the state machine takes, for directed tests too.
 impl Net {
     /// A remote opens a connection to us from `port`, and gets a SYN-ACK
-    /// unless the stack is closed.
+    /// unless the stack is closed or the connection waits on a decision.
     fn open(&mut self, port: u16) -> usize {
         let key = inbound(port);
         let (local, remote) = key;
@@ -508,11 +543,54 @@ impl Net {
         self.live.insert(key, i);
         self.inject(segment(remote, local, TcpControl::Syn, isn, None, &[]));
         self.settle();
-        let c = &self.conns[i];
-        if !self.closed {
+        let c = &mut self.conns[i];
+        if self.closed {
+        } else if port == DEFERRED {
+            assert!(c.stack_isn.is_none() && !c.got_rst, "{}'s SYN was answered while deciding", c.name());
+            c.deferred = Some(now);
+        } else {
             assert!(c.stack_isn.is_some() && !c.got_rst, "{} got no SYN-ACK (RST: {})", c.name(), c.got_rst);
         }
         i
+    }
+
+    /// Whether connection `i`'s SYN waits on a decision still to be made.
+    fn deciding(&self, i: usize) -> bool {
+        let c = &self.conns[i];
+        let open = |key| self.decisions.lock().unwrap().get(key).is_some_and(|tx| !tx.is_closed());
+        c.deferred.is_some() && c.key.as_ref().is_some_and(open)
+    }
+
+    /// The deferred decision on connection `i` comes in: a SYN-ACK if it
+    /// accepts, a RST if not (unless the stack is closed).
+    fn decide(&mut self, i: usize, accept: bool) {
+        let key = self.conns[i].key.unwrap();
+        let tx = self.decisions.lock().unwrap().remove(&key).unwrap();
+        let now = self.now();
+        let c = &mut self.conns[i];
+        c.deferred = None;
+        // The handshake starts now.
+        c.started = now;
+        tx.send(accept).unwrap();
+        self.settle();
+        let c = &self.conns[i];
+        if self.closed {
+        } else if accept {
+            assert!(c.stack_isn.is_some() && !c.got_rst, "{} got no SYN-ACK once accepted", c.name());
+        } else {
+            assert!(c.stack_isn.is_none() && c.got_rst, "{} got no RST once refused", c.name());
+        }
+    }
+
+    /// The remote retransmits its SYN while connection `i` waits on a
+    /// decision: it goes unanswered, and the policy isn't asked again.
+    fn resend_syn(&mut self, i: usize) {
+        let c = &self.conns[i];
+        let (local, remote) = c.key.unwrap();
+        self.inject(segment(remote, local, TcpControl::Syn, c.isn, None, &[]));
+        self.settle();
+        let c = &self.conns[i];
+        assert!(c.stack_isn.is_none() && !c.got_rst, "{}'s SYN was answered while deciding", c.name());
     }
 
     /// A remote that got our SYN-ACK completes the handshake.
@@ -769,6 +847,19 @@ impl Net {
     }
 
     #[rule]
+    fn decide_rule(&mut self, tc: TestCase) {
+        let i = self.pick_where(&tc, |i| self.deciding(i));
+        let accept = tc.draw(gs::booleans());
+        self.decide(i, accept);
+    }
+
+    #[rule]
+    fn resend_syn_rule(&mut self, tc: TestCase) {
+        let i = self.pick_where(&tc, |i| self.deciding(i));
+        self.resend_syn(i);
+    }
+
+    #[rule]
     fn complete_rule(&mut self, tc: TestCase) {
         let i = self.pick(&tc, Conn::awaiting_ack);
         self.complete(i);
@@ -978,6 +1069,26 @@ impl Net {
             if alive {
                 assert_ne!(st.end(h), Some(End::TimedOut), "{name}: a live remote timed out ({state})");
             }
+        }
+    }
+
+    /// A SYN waiting on a decision has no socket, and is reset once the
+    /// decision is overdue.
+    #[invariant(always_run)]
+    fn deferred_syns_wait(&self, _: TestCase) {
+        if self.closed {
+            return;
+        }
+        let now = self.now();
+        let st = self.stack.shared.lock();
+        let waiting: HashSet<FlowKey> =
+            self.conns.iter().filter(|c| c.deferred.is_some()).filter_map(|c| c.key).collect();
+        assert!(st.deciding.is_subset(&waiting), "the stack is deciding {:?}, the model {waiting:?}", st.deciding);
+        for c in self.conns.iter().filter(|c| c.deferred.is_some()) {
+            let key = c.key.unwrap();
+            assert!(!st.tuples.contains_key(&key), "{} has a socket while deciding", c.name());
+            let waited = now - c.deferred.unwrap();
+            assert!(waited <= DECIDE_TIMEOUT + SLACK, "{} waited {waited:?} on a decision without a RST", c.name());
         }
     }
 

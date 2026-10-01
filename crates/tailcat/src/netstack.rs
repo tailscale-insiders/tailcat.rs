@@ -39,6 +39,8 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an accepted socket may wait for its SYN: the SYN didn't
 /// take, or the handshake was reset.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a deferred decision may hold a SYN before it's reset.
+pub const DECIDE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Abort a connection whose peer stops answering for this long.
 const TCP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Probe an idle connection this often: smoltcp's timeout counts from
@@ -47,14 +49,22 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// The ephemeral port range for outbound flows.
 const EPHEMERAL: RangeInclusive<u16> = 32768..=60999;
 
+/// Takes an accepted inbound TCP connection.
+pub type TcpAccept = Box<dyn FnOnce(TcpStream) + Send>;
+
 /// What to do with a new inbound TCP connection.
 pub enum TcpDecision {
     /// Complete the handshake and pass the connection to this function.
-    Accept(Box<dyn FnOnce(TcpStream) + Send>),
+    Accept(TcpAccept),
     /// Answer with a RST.
     Reset,
     /// Drop the SYN silently.
     Drop,
+    /// Hold the SYN, unanswered, until the future decides: a handler
+    /// accepts the connection, and `None` (or no answer within
+    /// [`DECIDE_TIMEOUT`]) resets it. This lets a proxy dial its backend
+    /// first, so a backend that refuses refuses the client too.
+    Defer(BoxFuture<Option<TcpAccept>>),
 }
 
 /// Decides the fate of inbound TCP SYNs, given (source, destination).
@@ -126,7 +136,7 @@ type FlowKey = (SocketAddr, SocketAddr); // (local, remote)
 
 struct PendingAccept {
     flow: FlowKey,
-    handler: Box<dyn FnOnce(TcpStream) + Send>,
+    handler: TcpAccept,
     since: tokio::time::Instant,
 }
 
@@ -176,6 +186,9 @@ struct State {
     device: QueueDevice,
     /// Inbound connections still completing their handshake.
     accepting: HashMap<SocketHandle, PendingAccept>,
+    /// Flows whose SYN waits on a deferred decision; their packets,
+    /// SYN retransmits included, are dropped meanwhile.
+    deciding: HashSet<FlowKey>,
     /// Every TCP socket's 4-tuple, to route SYN retransmits correctly. A
     /// closed socket a stream still holds gives its up to a new connection.
     tuples: HashMap<FlowKey, SocketHandle>,
@@ -361,6 +374,30 @@ fn tcp_flow(pkt: &[u8]) -> Option<(FlowKey, bool, Option<TcpSeqNumber>)> {
     Some((key, opens(&tcp) && !tcp.rst(), fin_end))
 }
 
+/// Queues the opening SYN `pkt` of `flow` for smoltcp, with a socket to
+/// take it if there's a `handler`; without one, smoltcp resets it.
+fn admit_syn(shared: &Shared, pkt: Vec<u8>, flow: FlowKey, mut handler: Option<TcpAccept>) {
+    // A handler the stack doesn't keep is dropped after the lock is
+    // released (parameters outlive locals): dropping one may lock it.
+    let mut st = shared.lock();
+    if st.closed {
+        return;
+    }
+    // The socket stays closed until the poll loop gets to this SYN; see
+    // State::ingress.
+    if !st.tuples.contains_key(&flow)
+        && let Some(handler) = handler.take()
+    {
+        let h = st.sockets.add(new_tcp_socket());
+        st.tuples.insert(flow, h);
+        let pa = PendingAccept { flow, handler, since: tokio::time::Instant::now() };
+        st.accepting.insert(h, pa);
+    }
+    st.device.rx.push_back(pkt);
+    drop(st);
+    shared.wake.notify_one();
+}
+
 /// Whether a segment is a SYN that opens a connection, not a SYN-ACK
 /// answering one.
 fn opens<T: AsRef<[u8]>>(tcp: &TcpPacket<T>) -> bool {
@@ -426,6 +463,7 @@ impl Stack {
                 sockets: SocketSet::new(Vec::new()),
                 device,
                 accepting: HashMap::new(),
+                deciding: HashSet::new(),
                 tuples: HashMap::new(),
                 ends: HashMap::new(),
                 fins: HashMap::new(),
@@ -462,9 +500,6 @@ impl Stack {
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {}
             _ => return trace!("netstack: dropping protocol {proto}"),
         }
-        // Declared before the lock, so a handler the stack doesn't keep
-        // is dropped after it's released: dropping one may lock it.
-        let mut handler;
         let mut st = self.shared.lock();
         if st.closed {
             return;
@@ -492,6 +527,9 @@ impl Stack {
                     st.tuples.remove(&(d, s));
                 }
             }
+            if st.deciding.contains(&(d, s)) {
+                return;
+            }
             if !st.tuples.contains_key(&(d, s)) {
                 if !opens(&tcp) {
                     // Not part of any connection we know; let smoltcp RST it
@@ -502,32 +540,39 @@ impl Stack {
                 } else {
                     // The policy may block briefly; don't hold the lock.
                     drop(st);
-                    handler = match self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d)) {
-                        TcpDecision::Drop => return,
-                        TcpDecision::Reset => None, // smoltcp answers unmatched SYNs with RST
-                        TcpDecision::Accept(_) if d.port() == 0 => return,
-                        TcpDecision::Accept(h) => Some(h),
+                    let decision = self.shared.tcp_policy.as_ref().map_or(TcpDecision::Reset, |p| p(s, d));
+                    return match decision {
+                        TcpDecision::Drop => {}
+                        TcpDecision::Accept(_) | TcpDecision::Defer(_) if d.port() == 0 => {}
+                        // smoltcp answers unmatched SYNs with RST.
+                        TcpDecision::Reset => admit_syn(&self.shared, pkt, (d, s), None),
+                        TcpDecision::Accept(h) => admit_syn(&self.shared, pkt, (d, s), Some(h)),
+                        TcpDecision::Defer(fut) => self.defer_syn(pkt, (d, s), fut),
                     };
-                    st = self.shared.lock();
-                    if st.closed {
-                        return;
-                    }
-                    // The socket stays closed until the poll loop gets to
-                    // this SYN; see State::ingress.
-                    if !st.tuples.contains_key(&(d, s))
-                        && let Some(handler) = handler.take()
-                    {
-                        let h = st.sockets.add(new_tcp_socket());
-                        st.tuples.insert((d, s), h);
-                        let pa = PendingAccept { flow: (d, s), handler, since: tokio::time::Instant::now() };
-                        st.accepting.insert(h, pa);
-                    }
                 }
             }
         }
         st.device.rx.push_back(pkt);
         drop(st);
         self.shared.wake.notify_one();
+    }
+
+    /// Holds the opening SYN `pkt` of `flow` until `fut` decides it.
+    fn defer_syn(&self, pkt: Vec<u8>, flow: FlowKey, fut: BoxFuture<Option<TcpAccept>>) {
+        {
+            let mut st = self.shared.lock();
+            // Another SYN for the flow may have got here first.
+            if st.closed || st.tuples.contains_key(&flow) || !st.deciding.insert(flow) {
+                return;
+            }
+        }
+        let shared = Arc::downgrade(&self.shared);
+        tokio::spawn(async move {
+            let handler = tokio::time::timeout(DECIDE_TIMEOUT, fut).await.ok().flatten();
+            let Some(shared) = shared.upgrade() else { return };
+            shared.lock().deciding.remove(&flow);
+            admit_syn(&shared, pkt, flow, handler);
+        });
     }
 
     /// Delivers the UDP datagram at `off` in `pkt`.
@@ -1051,6 +1096,7 @@ mod udp_model_tests;
 #[cfg(test)]
 mod tests {
     use std::pin::pin;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc as std_mpsc;
     use std::task::Waker;
     use std::thread;
@@ -1180,6 +1226,47 @@ mod tests {
 
         drop(c);
         assert!(a.drain_tcp(WAIT).await);
+    }
+
+    /// A deferred decision holds the SYN unanswered: a handler accepts
+    /// the connection and `None` refuses it, each asked once however
+    /// often the client retransmits meanwhile.
+    #[tokio::test]
+    async fn deferred_decisions() {
+        let a_ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let b_ip: IpAddr = "fd7a:115c:a1e0::2".parse().unwrap();
+        let b_port = |port| SocketAddr::new(b_ip, port);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let policy: TcpPolicy = {
+            let asked = asked.clone();
+            Arc::new(move |src, dst| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                let accept = dst.port() == 80;
+                let decision = async move {
+                    // Long enough for the client to retransmit its SYN.
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let ok = tcp_policy()(src, dst);
+                    match ok {
+                        TcpDecision::Accept(h) if accept => Some(h),
+                        _ => None,
+                    }
+                };
+                TcpDecision::Defer(Box::pin(decision))
+            })
+        };
+        let (a, _b) = back_to_back(a_ip, b_ip, Some(policy), None);
+
+        let mut c = a.dial_tcp(a_ip, b_port(80)).await.unwrap();
+        c.write_all(b"hi").await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"got: hi");
+        assert_eq!(asked.swap(0, Ordering::Relaxed), 1);
+
+        let refused = a.dial_tcp(a_ip, b_port(81)).await;
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
