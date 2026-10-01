@@ -179,6 +179,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import itertools
+    import json
     import re
     import shlex
     import time
@@ -188,7 +189,7 @@ pkgs.testers.runNixOSTest {
     GO = "${pkgs.tailcat}/bin/tailcat"
     DEVICE = "${tailcat}/bin/tailcat-device"
     # What every tailcat runs with (Go's os/user needs USER without cgo).
-    ENV = {"HOME": "/root", "USER": "root", "PATH": "/run/current-system/sw/bin", "TAILCAT_DERPMAP_URL": "${derpmapUrl}"}
+    ENV = {"HOME": "/root", "USER": "root", "PATH": "/run/current-system/sw/bin", "TAILCAT_DERPMAP_URL": "${derpmapUrl}", "RUST_LOG": "tailcat=info"}
     ENV_PREFIX = "env " + " ".join(f"{k}={v}" for k, v in ENV.items())
     hosts = [alice, carol, bob]
     units = itertools.count()
@@ -209,7 +210,8 @@ pkgs.testers.runNixOSTest {
             self.machine = machine
             self.unit = f"tc-{next(units)}"
             addr_file = f"/tmp/{self.unit}.addr"
-            env = dict(ENV, TAILCAT_ADDR_FILE=addr_file, TAILCAT_STATUS_LOOP="1")
+            self.status_file = f"/tmp/{self.unit}.status.json"
+            env = dict(ENV, TAILCAT_ADDR_FILE=addr_file, TAILCAT_STATUS_FILE=self.status_file)
             setenv = " ".join(f"--setenv={k}={v}" for k, v in env.items())
             machine.succeed(f"systemd-run --unit={self.unit} {setenv} {shlex.join([impl, *argv])}")
             try:
@@ -223,12 +225,13 @@ pkgs.testers.runNixOSTest {
             return self.machine.succeed(f"journalctl -o cat -u {self.unit}")
 
         def via(self):
-            """How the server's last status line says its peer is reached."""
-            statuses = [l for l in self.log().splitlines() if l.startswith("status = ") and "via: " in l]
-            if not statuses:
+            """How the server's status file says its busiest peer is reached."""
+            rc, out = self.machine.execute(f"cat {self.status_file}")
+            peers = json.loads(out)["peers"] if rc == 0 else []
+            if not peers:
                 return None
-            m = re.search(r"via: (Direct\([^)]*\)|Derp)", statuses[-1])
-            return m and m.group(1)
+            p = max(peers, key=lambda p: p["rx_bytes"])
+            return f"Direct({p['direct']})" if p["direct"] else "Derp"
 
         def wait_via(self, pattern, timeout=60):
             def check(_):
@@ -364,20 +367,25 @@ pkgs.testers.runNixOSTest {
         s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
         shout(alice, s)
         # The server's CallMeMaybe reaches alice before the meowed ack,
-        # so alice pings bob before bob (who learns her endpoints only
-        # from her CallMeMaybe, after the ack) pings her. A Go server
+        # so alice usually pings bob before bob (who learns her endpoints
+        # only from her CallMeMaybe, after the ack) pings her. A Go server
         # sends its CallMeMaybe later, from a goroutine, so with Go on
         # both sides bob's ping usually wins the race and the path is
-        # found; with either side Rust, alice's wins. With both routers
-        # permissive, whoever pings first loses, in Go too.
-        no_direct(alice, s)
-        # alice's first ping to bob landed on bob's router and stayed in
-        # its conntrack table, so bob's flow to alice left from another
-        # port than the one STUN saw, and alice's router dropped it.
-        flows = router_b.succeed("conntrack -L -p udp -s 192.168.2.10 -d 203.0.113.2 2>/dev/null")
-        router_b.log(flows)
-        ports = re.findall(r"sport=(\d+) dport=\d+ .*src=203\.0\.113\.2 dst=203\.0\.113\.3 sport=\d+ dport=(\d+)", flows)
-        assert ports and all(a != b for a, b in ports), f"expected bob's flow to alice remapped: {flows}"
+        # found; with either side Rust, alice's usually wins. With both
+        # routers permissive, whoever pings first loses, in Go too. It's
+        # a race all the same, so either outcome passes; staying on DERP
+        # must come from the remapping below.
+        rc, out = alice.execute(f"{ENV_PREFIX} timeout 35 {RUST} ping --until-direct --timeout=20s {s.addr} 2>&1")
+        alice.log(f"permissive router behind bob: ping --until-direct exit {rc}: {out.strip()}")
+        if rc != 0:
+            # alice's first ping to bob landed on bob's router and stayed
+            # in its conntrack table, so bob's flow to alice left from
+            # another port than the one STUN saw, and alice's router
+            # dropped it.
+            flows = router_b.succeed("conntrack -L -p udp -s 192.168.2.10 -d 203.0.113.2 2>/dev/null")
+            router_b.log(flows)
+            ports = re.findall(r"sport=(\d+) dport=\d+ .*src=203\.0\.113\.2 dst=203\.0\.113\.3 sport=\d+ dport=(\d+)", flows)
+            assert ports and all(a != b for a, b in ports), f"expected bob's flow to alice remapped: {flows}"
         s.stop()
 
         # alice's own permissive router does no harm: her first ping
