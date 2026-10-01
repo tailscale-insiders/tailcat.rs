@@ -61,3 +61,25 @@ tailcat.rs adds:
   DERP. These appear on both clients and servers.
 
 Visible to Go peers: no.
+
+# Known differences that aren't deliberate
+
+## Which side's hole-punching ping goes out first
+
+A Rust server sends its CallMeMaybe before its "meowed" ack
+(`crates/tailcat/src/server.rs`), so a client pings the server's
+endpoints before the server pings the client's. A Go server sends its
+CallMeMaybe later, from a goroutine, so with Go on both sides the server
+usually pings first. The order is a race in Go and fixed in Rust.
+
+It matters only behind a router that accepts unsolicited WAN packets
+without forwarding them to a host. Linux delivers such a packet to the
+router itself, and conntrack keeps its 4-tuple. If the peer's ping
+arrives before the host behind that router has pinged out, the host's
+own flow toward the peer is remapped to a port the peer never learns,
+and the path stays on DERP. So against a server behind such a router,
+Go↔Go usually goes direct and Rust (either side) stays on DERP. Against
+a client behind one, Rust goes direct. When both routers are permissive,
+whoever pings first loses, in Go too. Any fixed order fixes one case and
+breaks the other. The `permissive` and `dmz` scenarios in
+`tests/nat.nix` cover this.
