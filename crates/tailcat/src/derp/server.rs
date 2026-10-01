@@ -338,7 +338,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::*;
-    use crate::derp::client::{DerpClient, login};
+    use crate::derp::client::{DerpClient, accepted, login};
     use crate::derp::{MAX_PACKET_SIZE, read_frame};
 
     const T: Duration = Duration::from_secs(5);
@@ -508,6 +508,22 @@ mod tests {
         // Hanging up unregisters the client.
         drop(c);
         wait_until_gone(&server, &key.public()).await;
+    }
+
+    /// A login the relay takes gets a server info frame, and one it turns
+    /// away a closed connection, which the client tells apart.
+    #[tokio::test]
+    async fn the_client_learns_whether_its_login_was_accepted() {
+        let key = NodePrivate::generate();
+        let (_server, mut c) = http("").await;
+        login(&mut c, "T", &key, &"test".into()).await.unwrap();
+        accepted(&mut c).await.unwrap();
+
+        let (server, mut c) = http("").await;
+        login(&mut c, "T", &key, &"x".repeat(33).into()).await.unwrap();
+        let err = accepted(&mut c).await.unwrap_err();
+        assert!(err.to_string().contains("not accepted"), "{err}");
+        assert!(!server.is_client_connected(&key.public()));
     }
 
     #[tokio::test]

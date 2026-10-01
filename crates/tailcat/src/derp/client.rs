@@ -95,6 +95,17 @@ pub(crate) async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(server_key)
 }
 
+/// Waits for the relay's answer to a login: the server info frame, which
+/// says it took the client. A relay that turns a client away (a bad app
+/// name, or a key it won't serve) closes the connection instead.
+pub(crate) async fn accepted<S: AsyncRead + Unpin>(s: &mut S) -> Result<()> {
+    match super::read_frame(s, MAX_FRAME_SIZE).await {
+        Ok((t, _)) if t == FrameType::ServerInfo as u8 => Ok(()),
+        Ok((t, _)) => Err(Error::Derp(format!("DERP login answered with frame type {t:#x}"))),
+        Err(e) => Err(Error::Derp(format!("DERP login not accepted: {e}"))),
+    }
+}
+
 /// A handle to a background task that keeps a DERP connection to one
 /// region alive. Dropping it closes the connection.
 pub struct DerpClient {
@@ -186,6 +197,7 @@ async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &AppNa
             let mut s = BufReader::new(dial_tls(n).await?);
             let authority = if n.derp_port() == 443 { host.to_string() } else { format!("{host}:{}", n.derp_port()) };
             login(&mut s, &authority, key, app_name).await?;
+            accepted(&mut s).await?;
             Ok::<_, Error>(s)
         };
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt).await {
