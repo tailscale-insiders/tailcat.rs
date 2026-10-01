@@ -279,6 +279,23 @@ pkgs.testers.runNixOSTest {
         assert out.strip() == "MEOW", f"exec round trip: got {out!r}"
 
 
+    def relay_conn(server):
+        """The server's main PID, and the local port of its relay connection."""
+        pid = server.machine.succeed(f"systemctl show -p MainPID --value {server.unit}").strip()
+        conn = server.machine.succeed(f"ss -Htnp state established dst ${relayIp}:443 | grep 'pid={pid},'")
+        return pid, conn.split()[2].rsplit(":", 1)[1]
+
+
+    def blackhole(router, host, port):
+        """Has `router` drop, without a reset, everything on `host`'s TCP connection from `port`."""
+        router.succeed(
+            "nft add table inet blackhole"
+            " && nft add chain inet blackhole drops '{ type filter hook forward priority -5; policy accept; }'"
+            f" && nft add rule inet blackhole drops ip saddr {host} tcp sport {port} drop"
+            f" && nft add rule inet blackhole drops ip daddr {host} tcp dport {port} drop"
+        )
+
+
     def start_transfer(client, server, seconds):
         """Starts a slow upload to a `sha256sum` exec server, lasting about `seconds`."""
         client.succeed("rm -f /tmp/sent /tmp/got")
@@ -467,15 +484,8 @@ pkgs.testers.runNixOSTest {
         # Bob's router drops, without a reset, everything on his relay
         # connection, as a NAT or firewall that forgot it would. Bob is
         # idle, so only his relay client's pings can tell.
-        pid = bob.succeed(f"systemctl show -p MainPID --value {s.unit}").strip()
-        conn = bob.succeed(f"ss -Htnp state established dst ${relayIp}:443 | grep 'pid={pid},'")
-        port = conn.split()[2].rsplit(":", 1)[1]
-        router_b.succeed(
-            "nft add table inet blackhole"
-            " && nft add chain inet blackhole drops '{ type filter hook forward priority -5; policy accept; }'"
-            f" && nft add rule inet blackhole drops ip saddr 192.168.2.10 tcp sport {port} drop"
-            f" && nft add rule inet blackhole drops ip daddr 192.168.2.10 tcp dport {port} drop"
-        )
+        pid, port = relay_conn(s)
+        blackhole(router_b, "192.168.2.10", port)
         start = time.monotonic()
         # Well before the 130s a read timeout alone would take.
         alice.wait_until_succeeds(
@@ -483,6 +493,33 @@ pkgs.testers.runNixOSTest {
         )
         alice.log(f"bob reachable again {time.monotonic() - start:.1f}s after his relay connection went silent")
         router_b.succeed("nft delete table inet blackhole")
+        s.stop()
+
+    with subtest("a client whose relay connection silently stops, and who never comes back: the relay lets it go"):
+        nat(router_a, "hard")
+        nat(router_b, "hard")
+        s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
+        shout(alice, s)
+        pid, port = relay_conn(s)
+        # The relay sees bob's connection from his router, at the port its
+        # hard NAT picked.
+        conns = relay.succeed("ss -Htn state established '( sport = :443 )' dst 203.0.113.3").splitlines()
+        assert len(conns) == 1, conns
+        nat_port = conns[0].split()[3].rsplit(":", 1)[1]
+        # Frozen, bob can't redial to replace the connection, so only the
+        # relay can tell he's gone.
+        bob.succeed(f"kill -STOP {pid}")
+        blackhole(router_b, "192.168.2.10", port)
+        start = time.monotonic()
+        # Within a keepalive interval (60s) and the time the relay gives one
+        # to be acknowledged (15s), not the 17 minutes TCP keeps retrying.
+        relay.wait_until_succeeds(
+            f"! ss -Htn state established '( sport = :443 and dport = :{nat_port} )' dst 203.0.113.3 | grep -q .",
+            timeout=timedelta(seconds=120),
+        )
+        relay.log(f"the relay let bob go {time.monotonic() - start:.1f}s after his relay connection went silent")
+        router_b.succeed("nft delete table inet blackhole")
+        bob.succeed(f"kill -CONT {pid}")
         s.stop()
 
     with subtest("Go and Rust tailcat find direct paths to each other across NATs"):
