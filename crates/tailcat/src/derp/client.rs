@@ -19,8 +19,13 @@ use crate::{Error, Result};
 
 const DIAL_NODE_TIMEOUT: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// The server sends keepalives every 60s; missing two means it's gone.
-const READ_TIMEOUT: Duration = Duration::from_secs(130);
+/// How long the relay may stay silent before we ping it. Relays send
+/// keepalives only every 60s, and a connection that a NAT or firewall
+/// has started dropping, without a reset, is just as quiet.
+const PING_AFTER_IDLE: Duration = Duration::from_secs(20);
+/// How long after that ping we wait for any frame before giving up on
+/// the connection and dialing a new one.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const OUT_QUEUE: usize = 512;
 
 /// Opens a TLS connection to a DERP node, trying its addresses in turn.
@@ -194,8 +199,8 @@ async fn connect_region(region: &DerpRegion, key: &NodePrivate, app_name: &AppNa
 
 /// Runs a logged-in connection until it fails (`Err`) or the packet
 /// receiver is dropped (`Ok`).
-async fn serve(
-    stream: Stream,
+async fn serve<S: AsyncRead + AsyncWrite>(
+    stream: BufReader<S>,
     region_id: i32,
     preferred: bool,
     recv: &mpsc::Sender<ReceivedPacket>,
@@ -207,12 +212,11 @@ async fn serve(
         super::write_frame(&mut wr, FrameType::NotePreferred, &[&[1]]).await?;
     }
     let (pong_tx, mut pong_rx) = mpsc::channel::<[u8; 8]>(8);
+    let (ping_tx, mut ping_rx) = mpsc::channel::<[u8; 8]>(1);
 
     let reader = async {
         loop {
-            let (t, mut payload) = tokio::time::timeout(READ_TIMEOUT, super::read_frame(&mut rd, MAX_FRAME_SIZE))
-                .await
-                .map_err(|_| Error::Derp("read timeout".into()))??;
+            let (t, mut payload) = read_frame_or_ping(&mut rd, &ping_tx).await?;
             match FrameType::from_u8(t) {
                 Some(FrameType::RecvPacket) => {
                     let (src, _) =
@@ -249,6 +253,7 @@ async fn serve(
                     super::write_queued(&mut wr, f, out).await?;
                 }
                 Some(p) = pong_rx.recv() => super::write_frame(&mut wr, FrameType::Pong, &[&p]).await?,
+                Some(p) = ping_rx.recv() => super::write_frame(&mut wr, FrameType::Ping, &[&p]).await?,
             }
         }
     };
@@ -257,3 +262,34 @@ async fn serve(
         r = writer => r,
     }
 }
+
+/// Reads the next frame. A relay that's quiet for [`PING_AFTER_IDLE`]
+/// gets a ping, sent through `ping`, and one that stays quiet for
+/// [`PING_TIMEOUT`] after is taken for gone: the connection may have
+/// stopped carrying anything, with nothing but the silence to say so.
+/// Any frame will do as an answer.
+async fn read_frame_or_ping<R: AsyncRead + Unpin>(rd: &mut R, ping: &mpsc::Sender<[u8; 8]>) -> Result<(u8, Vec<u8>)> {
+    // The read isn't cancelled while it waits, which could lose part of
+    // a frame.
+    let mut read = std::pin::pin!(super::read_frame(rd, MAX_FRAME_SIZE));
+    let mut deadline = tokio::time::Instant::now() + PING_AFTER_IDLE;
+    let mut pinged = false;
+    loop {
+        tokio::select! {
+            r = &mut read => return Ok(r?),
+            _ = tokio::time::sleep_until(deadline) => {
+                if pinged {
+                    return Err(Error::Derp(format!("no answer to a ping in {PING_TIMEOUT:?}")));
+                }
+                // The writer may be stuck behind a full socket, but the
+                // deadline holds either way.
+                let _ = ping.try_send(rand::random());
+                pinged = true;
+                deadline += PING_TIMEOUT;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_tests;
