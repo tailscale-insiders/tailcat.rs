@@ -6,6 +6,8 @@
 //! client was disconnected while it was asked, and not one that comes
 //! while an earlier meow of the client's is still being asked about. A
 //! cancelled meow must leave the client free to be asked about again.
+//! Idle clients expire, and come back (without the hook) when they send
+//! again or meow, unless they were disconnected since.
 
 use std::sync::Condvar;
 
@@ -136,6 +138,8 @@ struct Admission {
     keys: [NodePublic; KEYS],
     allowed: [bool; KEYS],
     clients: [bool; KEYS],
+    /// Expired for being idle, so let back in when they send.
+    expired: [bool; KEYS],
     held: [Option<Held>; KEYS],
     /// Calls to `disconnect_client`, for any key.
     disconnects: u64,
@@ -149,6 +153,7 @@ impl Admission {
             keys: [(); KEYS].map(|_| NodePrivate::generate().public()),
             allowed: [false; KEYS],
             clients: [false; KEYS],
+            expired: [false; KEYS],
             held: [(); KEYS].map(|_| None),
             disconnects: 0,
         }
@@ -167,6 +172,7 @@ impl Admission {
     fn disconnect_key(&mut self, k: usize) {
         assert_eq!(self.w.server.disconnect_client(&self.keys[k]), self.clients[k], "key {k}: disconnect");
         self.clients[k] = false;
+        self.expired[k] = false;
         self.disconnects += 1;
     }
 
@@ -191,9 +197,11 @@ impl Admission {
     fn meow(&mut self, tc: TestCase) {
         let k = Self::key(&tc);
         let acked = self.w.rt.block_on(self.w.server.meow(self.keys[k]));
-        let expected = self.clients[k] || self.held[k].is_none() && self.allowed[k];
+        let known = self.clients[k] || self.expired[k];
+        let expected = known || self.held[k].is_none() && self.allowed[k];
         assert_eq!(acked, expected, "key {k}: meow acked");
         self.clients[k] |= acked;
+        self.expired[k] &= !acked;
     }
 
     /// A new client meows, and its meow is held while the hook is
@@ -201,7 +209,7 @@ impl Admission {
     #[rule]
     fn hold(&mut self, tc: TestCase) {
         let k = Self::key(&tc);
-        if self.clients[k] || self.held[k].is_some() {
+        if self.clients[k] || self.expired[k] || self.held[k].is_some() {
             return;
         }
         let gate = Arc::new(Gate::default());
@@ -228,6 +236,28 @@ impl Admission {
     fn cancel(&mut self, tc: TestCase) {
         let Some(k) = self.holding(&tc) else { return };
         self.held[k].take().unwrap().cancel(self.w);
+    }
+
+    /// Every client goes idle long enough to expire.
+    #[rule]
+    fn expire(&mut self, _: TestCase) {
+        std::thread::sleep(Duration::from_millis(1));
+        self.w.server.expire_idle_clients(Duration::ZERO);
+        for k in 0..KEYS {
+            self.expired[k] |= self.clients[k];
+            self.clients[k] = false;
+        }
+    }
+
+    /// A key sends WireGuard traffic: an expired client is let back in,
+    /// without asking the hook, and anyone else isn't.
+    #[rule]
+    fn come_back(&mut self, tc: TestCase) {
+        let k = Self::key(&tc);
+        let back = self.w.server.readmit(&self.keys[k]).is_some();
+        assert_eq!(back, self.expired[k], "key {k}: let back in");
+        self.clients[k] |= back;
+        self.expired[k] = false;
     }
 
     #[rule]
@@ -260,6 +290,14 @@ impl Admission {
             let expected = [self.clients[k]; 3];
             assert_eq!(self.membership(key), expected, "key {k}: client, WireGuard peer, magicsock peer");
         }
+    }
+
+    #[invariant(always_run)]
+    fn expired_clients_are_remembered(&self, _: TestCase) {
+        let clients = self.w.server.inner.clients.lock().unwrap();
+        let expired = self.keys.map(|key| clients.expired.contains_key(&key));
+        drop(clients);
+        assert_eq!(expired, self.expired, "expired");
     }
 
     #[invariant(always_run)]

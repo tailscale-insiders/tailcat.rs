@@ -359,6 +359,32 @@ async fn served_ports_refuse_the_rest() {
     server.close();
 }
 
+/// A client with nothing open that goes quiet is forgotten, and let back
+/// in when it next dials.
+#[tokio::test]
+async fn idle_clients_expire_and_come_back() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let server = echo(builder(&dev)).idle_client_timeout(Duration::from_secs(1)).start().await.unwrap();
+    let client = Client::new(server.tailcat_addr());
+    assert_eq!(request(within(20, client.dial_tcp_port(80)).await.unwrap(), b"hi").await, "port 80: hi");
+    assert!(client.drain_tcp(Duration::from_secs(5)).await);
+
+    within(20, async {
+        while !server.status().peers.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    let start = std::time::Instant::now();
+    let c = within(20, client.dial_tcp_port(80)).await.unwrap();
+    assert_eq!(request(c, b"again").await, "port 80: again");
+    tracing::info!("back in after {:?}", start.elapsed());
+    assert_eq!(server.status().peers.len(), 1);
+    server.close();
+}
+
 /// A connector prepares before the client's handshake completes: what it
 /// prepared serves the connection, and its failure refuses the client.
 #[tokio::test]

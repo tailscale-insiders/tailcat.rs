@@ -8,7 +8,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -26,6 +26,26 @@ use crate::{Error, Result, meow};
 
 /// How long an idle inbound UDP flow stays open by default.
 pub const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a client with nothing open may go without sending anything
+/// before the server forgets it, by default.
+pub const DEFAULT_IDLE_CLIENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How many expired clients the server remembers, to let them back in
+/// as soon as they send again.
+const MAX_EXPIRED_CLIENTS: usize = 4096;
+
+/// The first byte of a WireGuard handshake initiation.
+const WG_HANDSHAKE_INITIATION: u8 = 1;
+
+/// Whether `pkt` says its sender has something for us: it's WireGuard,
+/// but not a keepalive (a data message, type 4, with nothing in it but
+/// its 16-byte header and 16-byte tag), which a peer sends when it has
+/// nothing to say. A disco ping only says its sender sent something
+/// lately.
+fn wants_in(pkt: &[u8]) -> bool {
+    !crate::disco::looks_like_disco(pkt) && !(pkt.len() == 32 && pkt[0] == 4)
+}
 
 /// A TCP connection handler.
 pub type TcpHandler = Arc<dyn Fn(TcpStream) -> BoxFuture<()> + Send + Sync>;
@@ -261,6 +281,17 @@ impl ServerBuilder {
         self
     }
 
+    /// How long a client with no connections or flows open may go
+    /// without sending anything before the server forgets it, freeing
+    /// its WireGuard session and path state ([`DEFAULT_IDLE_CLIENT_TIMEOUT`]
+    /// if unset; [`Duration::MAX`] never forgets). A forgotten client is
+    /// let back in, without asking the allow hook again, as soon as it
+    /// sends anything: the server remembers the last few thousand.
+    pub fn idle_client_timeout(mut self, d: Duration) -> Self {
+        self.cfg.idle_client_timeout = Some(d);
+        self
+    }
+
     /// The UDP port for direct connections (0 picks one).
     pub fn listen_port(mut self, p: u16) -> Self {
         self.listen_port = p;
@@ -345,6 +376,34 @@ struct Clients {
     /// Counts calls to [`Server::disconnect_client`], so a join whose
     /// allow hook answered before a revocation can't complete after it.
     disconnects: u64,
+    /// When each client was admitted, or last refreshed by a meow.
+    admitted: HashMap<NodePublic, Instant>,
+    /// Clients forgotten for being idle.
+    expired: HashMap<NodePublic, Expired>,
+    /// The expired clients by the direct address they last used.
+    expired_at: HashMap<SocketAddr, NodePublic>,
+}
+
+/// What the server remembers of a client it forgot for being idle.
+#[derive(Clone, Copy)]
+struct Expired {
+    disco: DiscoPublic,
+    /// The direct path it last used, if any.
+    addr: Option<SocketAddr>,
+    when: Instant,
+}
+
+impl Clients {
+    /// Forgets that client `k` expired, if it did.
+    fn unexpire(&mut self, k: &NodePublic) -> Option<Expired> {
+        let e = self.expired.remove(k)?;
+        if let Some(a) = e.addr
+            && self.expired_at.get(&a) == Some(k)
+        {
+            self.expired_at.remove(&a);
+        }
+        Some(e)
+    }
 }
 
 /// The clients the allow hook is being asked about, so a client's
@@ -386,6 +445,7 @@ struct Handlers {
     served_tcp_ports: Option<Vec<PortRange>>,
     served_udp_ports: Option<Vec<PortRange>>,
     udp_idle_timeout: Option<Duration>,
+    idle_client_timeout: Option<Duration>,
 }
 
 /// Reports whether an optional port filter admits `port`.
@@ -418,6 +478,19 @@ pub struct ServerStatus {
     pub region_id: i32,
     pub endpoints: Vec<SocketAddr>,
     pub peers: Vec<PeerStatus>,
+}
+
+/// Expires idle clients every so often, while the server is up.
+async fn expire_idle_clients(inner: Weak<Inner>, timeout: Duration) {
+    let every = (timeout / 4).clamp(Duration::from_millis(100), Duration::from_secs(30));
+    loop {
+        tokio::time::sleep(every).await;
+        let Some(inner) = inner.upgrade() else { return };
+        if inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        Server { inner }.expire_idle_clients(timeout);
+    }
 }
 
 /// The NAT64 prefix `64:ff9b::/96`.
@@ -484,8 +557,19 @@ impl Server {
             move || me.get().and_then(Weak::upgrade).map(|inner| Server { inner })
         };
         let hook_server = server.clone();
+        let udp_server = server.clone();
         let hook: magicsock::DerpRecvHook = Arc::new(move |region_id, src, pkt| {
             if !meow::is_meow(pkt) {
+                // The relay vouches for the sender, so an expired client is
+                // let back in at once, and since it may be sending on a
+                // session we dropped, we start a new one.
+                if wants_in(pkt)
+                    && let Some(s) = hook_server()
+                    && s.readmit(&src).is_some()
+                    && pkt.first() != Some(&WG_HANDSHAKE_INITIATION)
+                {
+                    s.inner.engine.initiate_handshake(&src);
+                }
                 return false;
             }
             if meow::is_meowed(pkt) {
@@ -507,12 +591,21 @@ impl Server {
             derp_app_name: crate::derp::AppName::Server,
             listen_port: b.listen_port,
             on_derp_recv: Some(hook),
-            on_unknown_udp: None,
+            on_unknown_udp: Some(Arc::new(move |a, pkt| {
+                if wants_in(pkt)
+                    && let Some(s) = udp_server()
+                {
+                    s.readmit_at(a, pkt);
+                }
+            })),
             endpoint_filter: None,
             enable_udp: true,
         })
         .await?;
-        let (engine, mut inbound) = Engine::start(&key, ms.clone(), wg_rx, None, None);
+        // An expired client's handshake lets it back in.
+        let wg_server = server.clone();
+        let peer_config: wg::PeerConfigFn = Arc::new(move |k| wg_server()?.readmit(k));
+        let (engine, mut inbound) = Engine::start(&key, ms.clone(), wg_rx, Some(peer_config), None);
 
         let any_ip = b.cfg.on_tcp_forward.is_some() || b.cfg.on_udp_forward.is_some();
         let tcp_server = server.clone();
@@ -546,7 +639,14 @@ impl Server {
             ms,
             engine,
             stack,
-            clients: Mutex::new(Clients { ids: HashMap::new(), next_id: 2, disconnects: 0 }),
+            clients: Mutex::new(Clients {
+                ids: HashMap::new(),
+                next_id: 2,
+                disconnects: 0,
+                admitted: HashMap::new(),
+                expired: HashMap::new(),
+                expired_at: HashMap::new(),
+            }),
             pending_allow: PendingAllow::default(),
             listeners: Mutex::default(),
             cfg: b.cfg,
@@ -554,6 +654,10 @@ impl Server {
             closed: AtomicBool::new(false),
         });
         let _ = me.set(Arc::downgrade(&inner));
+        let timeout = inner.cfg.idle_client_timeout.unwrap_or(DEFAULT_IDLE_CLIENT_TIMEOUT);
+        if timeout != Duration::MAX {
+            tokio::spawn(expire_idle_clients(Arc::downgrade(&inner), timeout));
+        }
 
         // Don't hand out an address clients can't use yet: wait (briefly)
         // for the relay connection.
@@ -615,6 +719,9 @@ impl Server {
     pub fn disconnect_client(&self, k: &NodePublic) -> bool {
         let mut clients = self.inner.clients.lock().unwrap();
         clients.disconnects += 1;
+        // An expired client isn't let back in on its own any more.
+        clients.unexpire(k);
+        clients.admitted.remove(k);
         let Some(id) = clients.ids.remove(k) else { return false };
         debug!("tailcat: disconnecting client {} (peer {id})", k.short_string());
         self.inner.engine.remove_peer(k);
@@ -735,10 +842,85 @@ impl Server {
     /// so far, for [`Server::admit`].
     fn client_state(&self, src: &NodePublic) -> (bool, u64) {
         let clients = self.inner.clients.lock().unwrap();
-        let known = clients.ids.contains_key(src);
+        // An expired client was let in before, and is still welcome.
+        let known = clients.ids.contains_key(src) || clients.expired.contains_key(src);
         let disconnects = clients.disconnects;
         drop(clients);
         (known, disconnects)
+    }
+
+    /// Lets `k` back in if it's a client that expired for being idle,
+    /// returning its WireGuard configuration if so.
+    fn readmit(&self, k: &NodePublic) -> Option<wg::PeerConfig> {
+        let clients = self.inner.clients.lock().unwrap();
+        let disco = clients.expired.get(k)?.disco;
+        let disconnects = clients.disconnects;
+        drop(clients);
+        // Admitting it forgets that it expired; if another client was
+        // disconnected meanwhile, it isn't admitted, and stays expired
+        // for its next try.
+        if !self.admit(*k, disco, disconnects) {
+            return None;
+        }
+        debug!("tailcat: expired client {} is back", k.short_string());
+        Some(self.wg_config(k))
+    }
+
+    /// Lets the expired client that last used the direct path from `a`
+    /// back in, starting a new session with it: it's sending again, and
+    /// on the session we dropped. Anyone can send from any address, but
+    /// all this can do is let back in a client let in before.
+    fn readmit_at(&self, a: SocketAddr, pkt: &[u8]) {
+        let k = self.inner.clients.lock().unwrap().expired_at.get(&a).copied();
+        if let Some(k) = k
+            && self.readmit(&k).is_some()
+            && pkt.first() != Some(&WG_HANDSHAKE_INITIATION)
+        {
+            self.inner.engine.initiate_handshake(&k);
+        }
+    }
+
+    /// The WireGuard configuration of client `k`.
+    fn wg_config(&self, k: &NodePublic) -> wg::PeerConfig {
+        wg::PeerConfig {
+            allowed_ips: vec![IpNet::host(IpAddr::V6(k.tailcat_ip()))],
+            preshared_key: self.inner.psk,
+            persistent_keepalive: None,
+        }
+    }
+
+    /// Forgets the clients that have nothing open and haven't sent
+    /// anything for `timeout`, remembering enough to let them back in.
+    fn expire_idle_clients(&self, timeout: Duration) {
+        let now = Instant::now();
+        let mut clients = self.inner.clients.lock().unwrap();
+        let idle: Vec<(NodePublic, Expired)> = clients
+            .ids
+            .keys()
+            .filter_map(|k| {
+                let path = self.inner.ms.peer_path(k)?;
+                let last = clients.admitted.get(k).copied().into_iter().chain(path.last_recv).max()?;
+                let busy = self.inner.stack.has_flows(IpAddr::V6(k.tailcat_ip()));
+                let addr = path.best.map(|b| b.0);
+                (now - last > timeout && !busy).then_some((*k, Expired { disco: path.disco_key, addr, when: now }))
+            })
+            .collect();
+        for (k, e) in idle {
+            let id = clients.ids.remove(&k);
+            clients.admitted.remove(&k);
+            debug!("tailcat: client {} (peer {id:?}) expired after {timeout:?} idle", k.short_string());
+            self.inner.engine.remove_peer(&k);
+            self.inner.ms.remove_peer(&k);
+            if clients.expired.len() >= MAX_EXPIRED_CLIENTS
+                && let Some(oldest) = clients.expired.iter().min_by_key(|(_, e)| e.when).map(|(k, _)| *k)
+            {
+                clients.unexpire(&oldest);
+            }
+            if let Some(a) = e.addr {
+                clients.expired_at.insert(a, k);
+            }
+            clients.expired.insert(k, e);
+        }
     }
 
     /// Adds `src` as a client, or refreshes it, unless a client was
@@ -756,6 +938,8 @@ impl Server {
             clients.next_id += 1;
             debug!("tailcat: client {} added as peer {id}", src.short_string());
         }
+        clients.admitted.insert(src, Instant::now());
+        clients.unexpire(&src);
         // A known client is refreshed, since it may have restarted with a
         // new disco key; neither upsert disturbs a working session.
         self.inner.ms.upsert_peer(magicsock::PeerConfig {
@@ -764,14 +948,7 @@ impl Server {
             home_region: self.inner.region.region_id,
             endpoints: Vec::new(),
         });
-        self.inner.engine.upsert_peer(
-            src,
-            wg::PeerConfig {
-                allowed_ips: vec![IpNet::host(IpAddr::V6(src.tailcat_ip()))],
-                preshared_key: self.inner.psk,
-                persistent_keepalive: None,
-            },
-        );
+        self.inner.engine.upsert_peer(src, self.wg_config(&src));
         drop(clients);
         true
     }
