@@ -20,7 +20,7 @@ use std::{fmt, iter, mem};
 
 use rand::Rng;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, trace};
 
 use crate::derp::client::DerpClient;
@@ -43,6 +43,9 @@ const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to look for a better path while one is working.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
+/// The minimum time between STUN rounds started early, when a path
+/// changes, rather than on the timer.
+const MIN_RESTUN_INTERVAL: Duration = Duration::from_secs(2);
 /// Latency below which we stop looking for better paths.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(5);
 
@@ -173,6 +176,9 @@ struct Peer {
     derp_seen: Option<i32>,
     /// The direct path last logged as the one in use; `None` for DERP.
     logged_path: Option<SocketAddr>,
+    /// Our address as the peer last saw it, from a pong on the path in
+    /// use.
+    seen_as: Option<SocketAddr>,
 }
 
 impl Peer {
@@ -191,6 +197,7 @@ impl Peer {
             last_upgrade: None,
             derp_seen: None,
             logged_path: None,
+            seen_as: None,
         }
     }
 
@@ -198,11 +205,12 @@ impl Peer {
         self.best.is_some() && self.trust_until.is_some_and(|t| now < t)
     }
 
-    /// Logs a change of the path in use, direct or over DERP.
-    fn log_path_change(&mut self, key: &NodePublic, now: Instant) {
+    /// Logs a change of the path in use, direct or over DERP, and says
+    /// whether it was the loss of a direct path.
+    fn log_path_change(&mut self, key: &NodePublic, now: Instant) -> bool {
         let path = self.best.filter(|_| self.trusted(now));
         if path.map(|b| b.0) == self.logged_path {
-            return;
+            return false;
         }
         let peer = key.short_string();
         match (self.logged_path, path) {
@@ -211,7 +219,9 @@ impl Peer {
             (Some(from), None) => info!(peer, "magicsock: direct path {from} lost; now over DERP"),
             (None, None) => {}
         }
+        let lost = path.is_none();
         self.logged_path = path.map(|b| b.0);
+        lost
     }
 
     fn derp_region(&self) -> i32 {
@@ -293,6 +303,8 @@ pub struct MagicSock {
     inner: Mutex<Inner>,
     wg_tx: mpsc::Sender<WireguardPacket>,
     derp_tx: mpsc::Sender<ReceivedPacket>,
+    /// Wakes the endpoint loop for a STUN round ahead of its timer.
+    restun: Arc<Notify>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -332,6 +344,7 @@ impl MagicSock {
             inner: Mutex::new(Inner { derp_map: cfg.derp_map, ..Default::default() }),
             wg_tx,
             derp_tx,
+            restun: Arc::default(),
             tasks: Mutex::default(),
         });
         ms.ensure_derp(ms.home_region);
@@ -698,7 +711,7 @@ impl MagicSock {
                 };
                 self.send_disco(&mut inner, &peer_key, src, &Message::Pong { tx_id, src: pong_src });
             }
-            Message::Pong { tx_id, .. } => {
+            Message::Pong { tx_id, src: seen_as } => {
                 let pp = match inner.pending.entry(tx_id) {
                     Entry::Occupied(e) if e.get().peer == peer_key => e.remove(),
                     _ => return,
@@ -713,14 +726,27 @@ impl MagicSock {
                     // A pong confirms the path in use, renewing its trust,
                     // or replaces it if that's untrusted or worse.
                     let current = p.best.map(|b| b.0);
+                    // On the path in use, a change in how the peer sees us
+                    // means our NAT mapped us anew: find out how it maps
+                    // us to everyone, and tell the peers.
+                    let mut moved = false;
+                    if current == Some(to) {
+                        moved = p.seen_as.is_some_and(|a| a != seen_as);
+                        p.seen_as = Some(seen_as);
+                    }
                     if current == Some(to) || !p.trusted(now) || better_addr((to, latency), p.best) {
                         if current != Some(to) {
                             debug!(peer = %peer_key.short_string(), "magicsock: now using {to} ({latency:?})");
+                            p.seen_as = Some(seen_as);
                         }
                         p.best = Some((to, latency));
                         p.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
                     }
                     p.log_path_change(&peer_key, now);
+                    if moved {
+                        debug!(peer = %peer_key.short_string(), "magicsock: peer now sees us as {seen_as}");
+                        self.restun.notify_one();
+                    }
                 }
             }
             Message::CallMeMaybe { mut endpoints } => {
@@ -881,7 +907,9 @@ impl MagicSock {
                 continue;
             }
             // Only while in use: an idle peer's path lapses quietly.
-            p.log_path_change(&k, now);
+            if p.log_path_change(&k, now) {
+                self.restun.notify_one();
+            }
             let p = &inner.peers[&k];
             if let Some((best, lat)) = p.best {
                 let needs_upgrade =
@@ -929,6 +957,7 @@ impl MagicSock {
             inner: Mutex::default(),
             wg_tx,
             derp_tx: mpsc::channel(1).0,
+            restun: Arc::default(),
             tasks: Mutex::default(),
         };
         (Arc::new(ms), wg_rx)
@@ -1005,14 +1034,21 @@ async fn timer_loop(ms: Weak<MagicSock>) {
 
 async fn endpoint_loop(ms: Weak<MagicSock>) {
     // STUN right away, twice more soon after (in case the first round
-    // was lost while the relay connection came up), then every 20–26s.
+    // was lost while the relay connection came up), then every 20–26s,
+    // or sooner when a path changes.
+    let Some(restun) = ms.upgrade().map(|ms| ms.restun.clone()) else { return };
     let later = iter::repeat_with(|| rand::thread_rng().gen_range(20_000..26_000));
     for delay_ms in [300, 2000].into_iter().chain(later) {
         {
             let Some(ms) = ms.upgrade() else { return };
             ms.refresh_endpoints().await;
         }
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let next = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+        tokio::time::sleep(MIN_RESTUN_INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep_until(next) => {}
+            _ = restun.notified() => debug!("magicsock: a path changed; re-STUNning"),
+        }
     }
 }
 

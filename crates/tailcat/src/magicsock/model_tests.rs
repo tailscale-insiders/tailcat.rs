@@ -3,9 +3,13 @@
 //! pongs and CallMeMaybes over UDP and DERP, some sealed with disco keys
 //! the table doesn't expect and some from peers sharing a disco key. The
 //! table's indexes are checked against the peers they describe, and each
-//! address-to-peer mapping against the evidence it needs.
+//! address-to-peer mapping against the evidence it needs. A pong saying
+//! the peer sees us at a new address on the path in use, a sign our NAT
+//! mapped us anew, must start a STUN round.
 
 use std::collections::HashSet;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -107,6 +111,12 @@ impl Table {
         }
     }
 
+    /// Whether a STUN round was asked for since the last call.
+    fn take_restun(&self) -> bool {
+        let notified = pin!(self.ms.restun.notified());
+        notified.poll(&mut Context::from_waker(Waker::noop())) == Poll::Ready(())
+    }
+
     /// The path peer `k` trusts, if it's one of its candidates.
     fn trusted_candidate(&self, k: &NodePublic) -> Option<SocketAddr> {
         let inner = self.ms.inner.lock().unwrap();
@@ -204,15 +214,34 @@ impl Table {
         let (tx_id, pinged, to) = pending[tc.draw_named("ping", gs::integers::<usize>().max_value(pending.len() - 1))];
         let from = self.draw_disco(&tc);
         let (src, derp_src) = self.draw_path(&tc);
+        // How the peer says it sees us.
+        let seen_as = Self::draw_addr(&tc);
+        let before = {
+            let inner = self.ms.inner.lock().unwrap();
+            let p = &inner.peers[&pinged];
+            (p.best.map(|b| b.0), p.seen_as, p.trusted(Instant::now()))
+        };
+        self.take_restun();
 
-        self.deliver(&from, &Message::Pong { tx_id, src: addrs()[0] }, src, derp_src);
+        self.deliver(&from, &Message::Pong { tx_id, src: seen_as }, src, derp_src);
 
         let genuine = self.holds(&pinged, &from.public()) && derp_src.is_none_or(|k| k == pinged);
+        let restun = self.take_restun();
         let inner = self.ms.inner.lock().unwrap();
         assert_eq!(!inner.pending.contains_key(&tx_id), genuine, "genuine pong: {genuine}");
-        if genuine && let (PathAddr::Udp(a), PathAddr::Udp(_)) = (src, to) {
+        if genuine && let (PathAddr::Udp(a), PathAddr::Udp(to)) = (src, to) {
             assert_eq!(inner.by_addr.get(&a), Some(&pinged));
             assert!(inner.peers[&pinged].trusted(Instant::now()));
+            let (best, seen_before, trusted) = before;
+            if best == Some(to) {
+                let moved = seen_before.is_some_and(|b| b != seen_as);
+                assert_eq!(inner.peers[&pinged].seen_as, Some(seen_as));
+                if moved {
+                    assert!(restun, "the peer sees us at {seen_as}, not {seen_before:?}, but no STUN round started");
+                } else if trusted {
+                    assert!(!restun, "a pong confirming the path in use started a STUN round");
+                }
+            }
         }
     }
 
