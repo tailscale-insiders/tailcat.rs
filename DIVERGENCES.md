@@ -23,3 +23,22 @@ netstack forwarder works the same way.
 
 Visible to Go clients: yes. A Go client sees a refusal where it used to
 see an empty connection.
+
+## SSH sessions get SSH_CLIENT, SSH_CONNECTION and SSH_TTY
+
+Go tailcat gives SSH sessions only SHELL, USER, HOME and a fixed PATH
+(plus TERM and the locale variables the client sends).
+
+tailcat.rs also sets the variables OpenSSH's sshd sets: `SSH_CLIENT`
+(`client-ip client-port server-port`), `SSH_CONNECTION`
+(`client-ip client-port server-ip server-port`), and, with a PTY,
+`SSH_TTY`. The addresses are the tunnel's (tailcat IPv6) addresses.
+Clients can't override them.
+
+Many scripts use these to detect a remote session. NixOS's
+`/etc/bashrc` also needs them: it sets up a non-interactive shell's PATH
+only when it sees `SSH_CLIENT`. Without them, `tailcat ssh host cat`
+against a NixOS server fails with "command not found", because the fixed
+PATH has no `/run/current-system/sw/bin`.
+
+Visible to Go clients: yes, in the session's environment.
