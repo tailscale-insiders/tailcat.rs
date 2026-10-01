@@ -963,6 +963,12 @@ mod tests {
         status.is_ok_and(|s| s.success())
     }
 
+    /// Where `cmd` is on this process's PATH.
+    fn which(cmd: &str) -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).map(|d| d.join(cmd)).find(|p| p.is_file()).map(|p| p.display().to_string())
+    }
+
     fn pubkey_line(k: &PrivateKey) -> String {
         k.public_key().to_openssh().unwrap()
     }
@@ -991,7 +997,9 @@ mod tests {
         ch.set_env(true, "LC_TEST", "yes").await.unwrap();
         ch.set_env(true, "EVIL", "no").await.unwrap();
 
-        let script = "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; cat; echo oops >&2; exit 3";
+        // Builtins only: sessions get a fixed PATH, which on some systems
+        // (NixOS, a build sandbox) holds no coreutils.
+        let script = "echo \"$TAILCAT_PEER_KEY $LC_TEST [$EVIL]\"; read -r l; echo \"$l\"; echo oops >&2; exit 3";
         let o = run(ch, script, b"in\n").await;
 
         assert_eq!(o.out, format!("{} yes []\nin\n", peer_key()));
@@ -1015,7 +1023,11 @@ mod tests {
         // A resize before the session starts replaces the requested size.
         ch.window_change(100, 50, 0, 0).await.unwrap();
 
-        let o = run(ch, "stty size; echo $TERM; tty -s && echo tty", b"").await;
+        // By absolute path, for the same reason.
+        let (Some(stty), Some(tty)) = (which("stty"), which("tty")) else {
+            return;
+        };
+        let o = run(ch, &format!("{stty} size; echo $TERM; {tty} -s && echo tty"), b"").await;
 
         if o.err.starts_with("pty open:") || o.err.starts_with("start:") {
             return; // No PTYs in this sandbox.
