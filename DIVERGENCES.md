@@ -94,6 +94,45 @@ connection. Relays already answer these pings, Go's included.
 Visible to Go peers: no. Visible to relays: one ping frame per idle
 period.
 
+## A relay that keeps closing connections is redialed less often
+
+Go tailcat (through Tailscale's magicsock) resets its wait before
+redialing a relay whenever a frame arrives, including the server info
+that ends a login. A relay that takes logins and then closes the
+connection, for example while overloaded or behind a misbehaving load
+balancer, is redialed after about 10 ms each time, as fast as TLS
+handshakes complete.
+
+tailcat.rs resets the wait only when a connection that lasted at least
+10 s ends. After a failed dial, or a connection that ended sooner, the
+wait doubles from 100 ms up to 5 s. Such a relay is then dialed once
+every 5 s. A login also counts as connected only once the relay's
+server info arrives, so a rejected login backs off the same way, as
+Go's does.
+
+Visible to Go peers: no. Visible to relays: fewer reconnects.
+
+## The development relay lets go of clients that vanished
+
+Go tailcat's local development relay (`TS_DEBUG_TAILCAT_LOCAL_DERP`)
+listens with Go's default socket options. A client whose connection
+stops carrying anything without a reset, because its NAT forgot the
+connection or its machine went away, stays registered as long as TCP
+keeps retransmitting the relay's keepalives. Packets sent to that client
+are dropped without a "peer gone" answer.
+
+tailcat.rs's relay (`TS_DEBUG_TAILCAT_LOCAL_DERP` and `tailcat
+dev-derp`) sets `TCP_USER_TIMEOUT` to 15 s on each connection, as
+Tailscale's derper does. A keepalive that goes unacknowledged that long
+closes the connection. It doesn't use a read timeout, because idle
+clients (Go's in particular) send nothing. In the NAT VM test, the relay
+lets go of such a client 75 s after its connection went silent, at most
+one keepalive interval plus the timeout. Without the option it took
+about 1020 s.
+
+Visible to Go peers: only to clients of a tailcat.rs relay, which hear
+sooner that a vanished peer is gone.
+
 ## Idle clients are forgotten, and let back in
 
 A Go tailcat server keeps every client that ever joined as a WireGuard
