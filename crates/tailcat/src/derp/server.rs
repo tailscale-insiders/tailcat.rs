@@ -13,7 +13,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
 };
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, trace};
 
@@ -38,18 +38,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else {
 /// The most bytes of request line and headers we read.
 const MAX_REQUEST_SIZE: u64 = 16 << 10;
 
-/// A connected client.
-struct Client {
-    /// Its send queue.
-    tx: mpsc::Sender<Vec<u8>>,
-    /// Closes its connection, when a newer one replaces it.
-    close: Arc<Notify>,
-}
+/// A key's connections, by their send queues, in the order they last
+/// connected or sent anything. Packets for the key go to the last one,
+/// as Tailscale's derper does it. A key has more than one when two
+/// processes share it, or while a client that redialed still has an old
+/// connection the relay hasn't seen die. Closing the older ones instead
+/// would have two processes sharing a key knock each other off, and
+/// redial, back and forth.
+type Conns = Vec<mpsc::Sender<Vec<u8>>>;
 
 /// The relay's state: its key and the connected clients.
 pub struct Server {
     key: NodePrivate,
-    clients: Mutex<HashMap<NodePublic, Client>>,
+    clients: Mutex<HashMap<NodePublic, Conns>>,
 }
 
 impl Server {
@@ -141,19 +142,19 @@ impl Server {
         super::write_frame(br.get_mut(), FrameType::ServerInfo, &[&self.key.seal_to(&client, &si)]).await?;
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CLIENT_QUEUE);
-        let close = Arc::new(Notify::new());
         debug!("derp server: {remote} connected as {}", client.short_string());
-        let _registered = self.register(client, &tx, &close);
+        let _registered = self.register(client, &tx);
 
         let (mut rd, wr) = tokio::io::split(br);
         let mut wr = BufWriter::new(wr);
         let reader = async {
             loop {
                 let (t, payload) = super::read_frame(&mut rd, MAX_FRAME_SIZE).await?;
+                self.note_active(&client, &tx);
                 match FrameType::from_u8(t) {
                     Some(FrameType::SendPacket) => {
                         let Some((dst, pkt)) = split_key(&payload) else { continue };
-                        let to = self.clients.lock().unwrap().get(&dst).map(|d| d.tx.clone());
+                        let to = self.clients.lock().unwrap().get(&dst).and_then(|c| c.last()).cloned();
                         // Frames are dropped if the recipient is slow.
                         let _ = match to {
                             Some(to) => to.try_send(frame(FrameType::RecvPacket, &[client.as_bytes(), pkt])),
@@ -183,32 +184,42 @@ impl Server {
                 }
             }
         };
-        let res = tokio::select! {
+        tokio::select! {
             r = reader => r,
             r = writer => r,
-            _ = close.notified() => Err(Error::Derp("replaced by a newer connection".into())),
-        };
-        res
+        }
     }
 
-    /// Registers a connection from `client` with queue `tx`, replacing
-    /// and closing any older one with its key, until the returned
-    /// [`Registered`] drops.
+    /// Registers a connection from `client` with queue `tx`, as the one
+    /// its packets go to, until the returned [`Registered`] drops.
     #[must_use = "dropping the Registered at once unregisters the client"]
-    fn register(&self, client: NodePublic, tx: &mpsc::Sender<Vec<u8>>, close: &Arc<Notify>) -> Registered<'_> {
-        let old = self.clients.lock().unwrap().insert(client, Client { tx: tx.clone(), close: close.clone() });
-        if let Some(old) = old {
-            debug!("derp server: closing {}'s older connection", client.short_string());
-            old.close.notify_one();
+    fn register(&self, client: NodePublic, tx: &mpsc::Sender<Vec<u8>>) -> Registered<'_> {
+        let mut clients = self.clients.lock().unwrap();
+        let conns = clients.entry(client).or_default();
+        conns.push(tx.clone());
+        if conns.len() > 1 {
+            debug!("derp server: {} has {} connections", client.short_string(), conns.len());
         }
         Registered { server: self, client, tx: tx.clone() }
+    }
+
+    /// Makes `client`'s connection with queue `tx` the one its packets go
+    /// to, as the one that spoke last.
+    fn note_active(&self, client: &NodePublic, tx: &mpsc::Sender<Vec<u8>>) {
+        let mut clients = self.clients.lock().unwrap();
+        let Some(conns) = clients.get_mut(client) else { return };
+        if let Some(i) = conns.iter().position(|c| c.same_channel(tx))
+            && i + 1 < conns.len()
+        {
+            let c = conns.remove(i);
+            conns.push(c);
+        }
     }
 }
 
 /// A client's connection in the relay's table. Dropping it removes the
-/// client, unless a newer connection with its key, which has another
-/// queue, replaced it, however the connection ends: closed, failed or
-/// cancelled.
+/// connection, and the client once it has no other, however the
+/// connection ends: closed, failed or cancelled.
 struct Registered<'a> {
     server: &'a Server,
     client: NodePublic,
@@ -218,8 +229,11 @@ struct Registered<'a> {
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
         let mut clients = self.server.clients.lock().unwrap();
-        if clients.get(&self.client).is_some_and(|c| c.tx.same_channel(&self.tx)) {
-            clients.remove(&self.client);
+        if let Some(conns) = clients.get_mut(&self.client) {
+            conns.retain(|c| !c.same_channel(&self.tx));
+            if conns.is_empty() {
+                clients.remove(&self.client);
+            }
         }
         drop(clients);
         debug!("derp server: {} disconnected", self.client.short_string());
@@ -527,6 +541,48 @@ mod tests {
 
         // Hanging up unregisters the client.
         drop(c);
+        wait_until_gone(&server, &key.public()).await;
+    }
+
+    /// Logs in on a new connection to `server` as `key`.
+    async fn logged_in(server: &Arc<Server>, key: &NodePrivate) -> Conn {
+        let mut c = connect(server, "").await;
+        login(&mut c, "T", key, &"test".into()).await.unwrap();
+        accepted(&mut c).await.unwrap();
+        c
+    }
+
+    /// Two connections with one key, as from two processes sharing it,
+    /// both stay up. Packets for the key go to whichever spoke last, so
+    /// neither knocks the other off and redials, back and forth.
+    #[tokio::test]
+    async fn keeps_both_connections_with_one_key() {
+        let server = Server::new();
+        let (key, sender) = (NodePrivate::generate(), NodePrivate::generate());
+        let mut first = logged_in(&server, &key).await;
+        let mut second = logged_in(&server, &key).await;
+        let mut s = logged_in(&server, &sender).await;
+        let to_key = |pkt: &[u8]| frame(FrameType::SendPacket, &[key.public().as_bytes(), pkt]);
+        let from_sender = |pkt: &[u8]| (FrameType::RecvPacket as u8, [sender.public().as_bytes(), pkt].concat());
+
+        // The newest connection gets packets at first.
+        write(&mut s, &to_key(b"one")).await;
+        assert_eq!(next_frame(&mut second).await, from_sender(b"one"));
+
+        // The first is still up: it answers a ping, and having spoken, it
+        // gets the packets now.
+        write(&mut first, &frame(FrameType::Ping, &[PING])).await;
+        assert_eq!(next_frame(&mut first).await, (FrameType::Pong as u8, PING.to_vec()));
+        write(&mut s, &to_key(b"two")).await;
+        assert_eq!(next_frame(&mut first).await, from_sender(b"two"));
+
+        // When it hangs up, the other one gets them again.
+        drop(first);
+        sleep(Duration::from_millis(100)).await;
+        write(&mut s, &to_key(b"three")).await;
+        assert_eq!(next_frame(&mut second).await, from_sender(b"three"));
+        assert!(server.is_client_connected(&key.public()));
+        drop(second);
         wait_until_gone(&server, &key.public()).await;
     }
 
