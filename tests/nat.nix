@@ -11,9 +11,10 @@
 # how at runtime: an endpoint-independent mapping (the common home
 # router), an endpoint-dependent one (a "hard", symmetric NAT), UDP
 # blocked entirely, a fresh port range (the NAT forgetting its
-# mappings, like a router reboot), or a firewall letting everything in.
-# Nothing routes between the LANs except through the NATs, so a direct
-# path exists only if NAT traversal punches one.
+# mappings, like a router reboot), a firewall letting everything in, or
+# a DMZ host that unsolicited packets are forwarded to. Nothing routes
+# between the LANs except through the NATs, so a direct path exists only
+# if NAT traversal punches one.
 #
 #   nix build .#checks.x86_64-linux.nat -L
 #   nix run .#checks.x86_64-linux.nat.driverInteractive   # to poke at it
@@ -24,14 +25,14 @@ let
   relayIp = "203.0.113.10";
   derpmapUrl = "http://${relayIp}/derpmap.json";
 
-  # nat-mode <easy|hard|block-udp|rebind|permissive>: replaces the
-  # router's NAT rules and forgets every existing mapping.
+  # nat-mode <easy|hard|block-udp|rebind|permissive|dmz HOST>: replaces
+  # the router's NAT rules and forgets every existing mapping.
   natMode = pkgs.writeShellApplication {
     name = "nat-mode";
     runtimeInputs = [ pkgs.nftables pkgs.conntrack-tools ];
     text = ''
-      masq="oifname \"eth1\" masquerade" drop_udp="" wan_in="iifname \"eth1\" drop"
-      case "''${1:?usage: nat-mode <easy|hard|block-udp|rebind|permissive>}" in
+      masq="oifname \"eth1\" masquerade" drop_udp="" dnat="" wan_in="iifname \"eth1\" drop"
+      case "''${1:?usage: nat-mode <easy|hard|block-udp|rebind|permissive|dmz HOST>}" in
         # Linux keeps the source port when it can: one public port per
         # private socket, whatever the destination.
         easy) ;;
@@ -49,12 +50,20 @@ let
         # to another port, one the pinger never learns: an easy NAT
         # turned hard, for whichever peer pings first.
         permissive) wan_in="" ;;
+        # Endpoint-independent filtering for one LAN host (a router's
+        # "DMZ host"): unsolicited UDP from the internet goes to HOST, at
+        # the port it was sent to.
+        dmz) dnat="iifname \"eth1\" meta l4proto udp dnat to ''${2:?usage: nat-mode dmz HOST}" ;;
         *) echo "unknown mode $1" >&2; exit 2 ;;
       esac
       nft -f - <<EOF
       table ip tcnat
       delete table ip tcnat
       table ip tcnat {
+        chain prerouting {
+          type nat hook prerouting priority dstnat; policy accept;
+          $dnat
+        }
         chain postrouting {
           type nat hook postrouting priority srcnat; policy accept;
           $masq
@@ -63,8 +72,9 @@ let
           type filter hook forward priority filter; policy accept;
           $drop_udp
           # Nothing from the internet gets in unless it answers a flow
-          # from the LAN.
+          # from the LAN, or is for the DMZ host.
           iifname "eth1" ct state established,related accept
+          iifname "eth1" ct status dnat accept
           $wan_in
         }
         # Nor into the router itself (see permissive above).
@@ -376,6 +386,15 @@ pkgs.testers.runNixOSTest {
         s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
         via = ping_direct(alice, s)
         assert via.startswith("203.0.113.3:"), via
+        s.stop()
+
+    with subtest("a DMZ host, with endpoint-independent filtering: hole punching finds a direct path"):
+        nat(router_a, "easy")
+        nat(router_b, "dmz 192.168.2.10")
+        s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
+        via = ping_direct(alice, s)
+        assert via.startswith("203.0.113.3:"), via
+        shout(alice, s)
         s.stop()
 
     with subtest("UDP blocked at alice's router: DERP over TCP carries everything"):
