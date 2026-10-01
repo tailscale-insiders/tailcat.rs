@@ -101,6 +101,20 @@ else
 	fail "one-shot: the first connection is served: client exit=$code, server got '$(cat "$work/oneshot.out")'"
 fi
 
+# A proxied port with nothing listening on it refuses the client.
+start refused "$rust" serve 1
+for c in "${impls[@]}"; do
+	name="serve: $c client -> rust server with nothing on the port is refused"
+	if echo x | timeout 30 "${!c}" "$addr" 1 >/dev/null 2>"$work/client.log"; then
+		fail "$name: the client succeeded"
+	elif grep -qi "refused" "$work/client.log"; then
+		pass "$name"
+	else
+		fail "$name: $(tail -3 "$work/client.log")"
+	fi
+done
+stop
+
 # SIGTERM stops a server as cleanly as Ctrl-C.
 start term "$rust" serve 1
 kill -TERM "$server_pid"

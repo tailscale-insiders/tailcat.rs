@@ -10,8 +10,8 @@ use std::{env, io, iter, process};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
-    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpHandler, TcpStream,
-    UdpConn, handler, udp_handler,
+    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpConnector,
+    TcpHandler, TcpRoute, TcpStream, UdpConn, connector, handler, udp_handler,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -207,14 +207,20 @@ fn env_bool(name: &str) -> bool {
     matches!(env::var(name).as_deref(), Ok("1" | "true" | "TRUE" | "True" | "t"))
 }
 
-async fn proxy_to_local(target: String, c: TcpStream) {
-    match crate::util::dial_local(&target).await {
-        Ok(local) => {
+/// Proxies connections to `target`, dialing it before accepting each
+/// one, so that when it refuses (or can't be reached) the client is
+/// refused too.
+fn proxy_to_local(target: String) -> TcpConnector {
+    connector(move || {
+        let target = target.clone();
+        async move {
+            let local = crate::util::dial_local(&target).await.inspect_err(|e| {
+                eprintln!("# Refused a connection: can't reach {target}: {e}");
+            })?;
             let _ = local.set_nodelay(true);
-            crate::util::proxy_and_drain(c, local).await;
+            Ok(move |c| crate::util::proxy_and_drain(c, local))
         }
-        Err(e) => debug!("error proxying to {target}: {e}"),
-    }
+    })
 }
 
 async fn udp_forward_to(dst: SocketAddr, c: UdpConn) {
@@ -351,7 +357,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     }
     if exit_node {
         b = b
-            .on_tcp_forward(|dst| Some(handler(move |c| proxy_to_local(dst.to_string(), c))))
+            .on_tcp_forward(|dst| Some(proxy_to_local(dst.to_string())))
             .on_udp_forward(|dst| Some(udp_handler(move |c| udp_forward_to(dst, c))));
     }
 
@@ -413,23 +419,23 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
         let (me, exec_h) = (me.clone(), exec_h.clone());
         let route = move |port| {
             if port == 22 && ssh_handler.is_some() {
-                return ssh_handler.clone();
+                return ssh_handler.clone().map(TcpRoute::from);
             }
             if let Some(p) = perf_srv.as_ref().filter(|_| port == PERF_PORT) {
                 let p = p.clone();
-                return Some(handler(move |c| p.clone().handle_tcp(c)));
+                return Some(handler(move |c| p.clone().handle_tcp(c)).into());
             }
             if ps.contains(port) {
                 let t = ps.targets.get(&port).cloned().unwrap_or_else(|| format!("localhost:{port}"));
-                return Some(handler(move |c| proxy_to_local(t.clone(), c)));
+                return Some(proxy_to_local(t).into());
             }
             if serves_exec {
                 let exec_h = exec_h.clone();
-                return Some(Arc::new(move |c| exec_h.get().expect("exec handler set at start")(c)) as TcpHandler);
+                return Some(TcpRoute::Handle(Arc::new(move |c| exec_h.get().expect("exec handler set at start")(c))));
             }
             if exit_node {
                 // Being an exit node includes localhost's ports too.
-                return Some(handler(move |c| proxy_to_local(format!("localhost:{port}"), c)));
+                return Some(proxy_to_local(format!("localhost:{port}")).into());
             }
             if one_shot_stdout {
                 // Refuse the rest, so they fail instead of being lost.
@@ -437,7 +443,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
                     return None;
                 }
                 let (me, taken) = (me.clone(), one_shot_taken.clone());
-                return Some(handler(move |c| {
+                return Some(TcpRoute::Handle(handler(move |c| {
                     // Of connections that got this far at once, only the
                     // first to be established is served.
                     let first = !taken.swap(true, Ordering::Relaxed);
@@ -449,7 +455,7 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
                             c.abort();
                         }
                     }
-                }));
+                })));
             }
             None
         };
@@ -497,15 +503,24 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
 
 /// Holds `h` back until `ready`, when the cells handlers read the server
 /// from are filled in.
-fn after_start(ready: tokio::sync::watch::Receiver<bool>, h: TcpHandler) -> TcpHandler {
-    handler(move |c| {
-        let (mut ready, h) = (ready.clone(), h.clone());
-        async move {
-            if ready.wait_for(|r| *r).await.is_ok() {
-                h(c).await;
+fn after_start(ready: tokio::sync::watch::Receiver<bool>, route: TcpRoute) -> TcpRoute {
+    match route {
+        TcpRoute::Handle(h) => TcpRoute::Handle(handler(move |c| {
+            let (mut ready, h) = (ready.clone(), h.clone());
+            async move {
+                if ready.wait_for(|r| *r).await.is_ok() {
+                    h(c).await;
+                }
             }
-        }
-    })
+        })),
+        TcpRoute::Connect(prepare) => TcpRoute::Connect(Arc::new(move || {
+            let (mut ready, prepare) = (ready.clone(), prepare.clone());
+            Box::pin(async move {
+                ready.wait_for(|r| *r).await.map_err(|_| io::Error::other("server stopped"))?;
+                prepare().await
+            })
+        })),
+    }
 }
 
 async fn announce(g: &Global, key: &KeyArg, conn_str: &Addr) -> Result<()> {
@@ -666,7 +681,7 @@ mod tests {
         let dev = DevDerp::start_local().await.unwrap();
         let (ready_tx, ready) = watch::channel(false);
         let ran = Arc::new(AtomicBool::new(false));
-        let h = after_start(ready, answer_ok(ran.clone()));
+        let h = after_start(ready, answer_ok(ran.clone()).into());
         let s = Server::builder().region(dev.region.clone()).on_tcp(move |_| Some(h.clone())).start().await.unwrap();
         let cl = Client::new(s.tailcat_addr());
         let mut c = timeout(Duration::from_secs(15), cl.dial_tcp_port(1)).await.expect("dial timed out").unwrap();
