@@ -26,6 +26,13 @@ use crate::{Error, Result};
 
 const CLIENT_QUEUE: usize = 1024;
 const KEEPALIVE: Duration = Duration::from_secs(60);
+/// How long what the relay sends may go unacknowledged before the
+/// kernel gives up on the connection, as Tailscale's derper has it. An
+/// idle client sends nothing (Go's don't ping), so the keepalives are
+/// what find out it's gone, when its NAT forgot it or its machine went
+/// away without a reset. Without this, the connection would last as
+/// long as TCP keeps retransmitting them, about 17 minutes.
+const USER_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a client may take to send its HTTP request line and headers.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 /// The most bytes of request line and headers we read.
@@ -69,6 +76,7 @@ impl Server {
         while let Ok((tcp, remote)) = ln.accept().await {
             while conns.try_join_next().is_some() {}
             let _ = tcp.set_nodelay(true);
+            set_user_timeout(&tcp);
             let s = self.clone();
             let accept = acceptor.accept(tcp);
             conns.spawn(async move {
@@ -217,6 +225,18 @@ impl Drop for Registered<'_> {
         debug!("derp server: {} disconnected", self.client.short_string());
     }
 }
+
+/// Has the kernel close `tcp` once what's sent on it goes unacknowledged
+/// for [`USER_TIMEOUT`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_user_timeout(tcp: &tokio::net::TcpStream) {
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_user_timeout(Some(USER_TIMEOUT)) {
+        debug!("derp server: setting TCP_USER_TIMEOUT: {e}");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_user_timeout(_: &tokio::net::TcpStream) {}
 
 /// Reads an HTTP request line and headers, returning the request's path
 /// and whether it asks to upgrade to DERP, and to skip the upgrade

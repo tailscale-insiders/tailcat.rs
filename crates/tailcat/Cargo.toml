@@ -46,6 +46,9 @@ cap-fs-ext = { version = "3", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+socket2.workspace = true
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 # Property-based and model-based tests. The static engine builds as an
