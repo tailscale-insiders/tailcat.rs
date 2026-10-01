@@ -131,7 +131,7 @@ impl Running {
             tokio::select! {
                 _ = resend.tick() => {
                     if !self.ms.send_derp(&server, region, &pkt) {
-                        debug!("tailcat: meow not sent (relay not connected yet)");
+                        debug!("tailcat: meow not sent (relay not connected, or backed up)");
                     }
                 }
                 res = meowed.changed() => {
