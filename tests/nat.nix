@@ -10,10 +10,10 @@
 # The routers NAT their LANs onto the internet, and `nat-mode` switches
 # how at runtime: an endpoint-independent mapping (the common home
 # router), an endpoint-dependent one (a "hard", symmetric NAT), UDP
-# blocked entirely, or a fresh port range (the NAT forgetting its
-# mappings, like a router reboot). Nothing routes between the LANs
-# except through the NATs, so a direct path exists only if NAT traversal
-# punches one.
+# blocked entirely, a fresh port range (the NAT forgetting its
+# mappings, like a router reboot), or a firewall letting everything in.
+# Nothing routes between the LANs except through the NATs, so a direct
+# path exists only if NAT traversal punches one.
 #
 #   nix build .#checks.x86_64-linux.nat -L
 #   nix run .#checks.x86_64-linux.nat.driverInteractive   # to poke at it
@@ -24,14 +24,14 @@ let
   relayIp = "203.0.113.10";
   derpmapUrl = "http://${relayIp}/derpmap.json";
 
-  # nat-mode <easy|hard|block-udp|rebind>: replaces the router's NAT
-  # rules and forgets every existing mapping.
+  # nat-mode <easy|hard|block-udp|rebind|permissive>: replaces the
+  # router's NAT rules and forgets every existing mapping.
   natMode = pkgs.writeShellApplication {
     name = "nat-mode";
     runtimeInputs = [ pkgs.nftables pkgs.conntrack-tools ];
     text = ''
-      masq="oifname \"eth1\" masquerade" drop_udp=
-      case "''${1:?usage: nat-mode <easy|hard|block-udp|rebind>}" in
+      masq="oifname \"eth1\" masquerade" drop_udp="" wan_in="iifname \"eth1\" drop"
+      case "''${1:?usage: nat-mode <easy|hard|block-udp|rebind|permissive>}" in
         # Linux keeps the source port when it can: one public port per
         # private socket, whatever the destination.
         easy) ;;
@@ -40,6 +40,15 @@ let
         block-udp) drop_udp="meta l4proto udp drop" ;;
         # Mappings from a different port range than before.
         rebind) masq="oifname \"eth1\" meta l4proto { tcp, udp } masquerade to :40000-40999" ;;
+        # An easy NAT whose firewall lets in what the LAN didn't ask for.
+        # That isn't endpoint-independent filtering: Linux has no mapping
+        # to forward an unsolicited packet along, so it delivers it to
+        # the router itself, and conntrack keeps its 4-tuple. A
+        # hole-punching ping that arrives before the LAN host's own ping
+        # has gone out then pushes that host's mapping toward the pinger
+        # to another port, one the pinger never learns: an easy NAT
+        # turned hard, for whichever peer pings first.
+        permissive) wan_in="" ;;
         *) echo "unknown mode $1" >&2; exit 2 ;;
       esac
       nft -f - <<EOF
@@ -56,22 +65,18 @@ let
           # Nothing from the internet gets in unless it answers a flow
           # from the LAN.
           iifname "eth1" ct state established,related accept
-          iifname "eth1" drop
+          $wan_in
         }
-        # Nor into the router itself. Accepting unsolicited packets here
-        # would make conntrack keep their 4-tuples, and a hole-punching
-        # ping that arrives before the LAN host's own ping has gone out
-        # would then push that host's mapping to another port: an easy
-        # NAT turned hard.
+        # Nor into the router itself (see permissive above).
         chain input {
           type filter hook input priority filter; policy accept;
           iifname "eth1" ct state established,related accept
-          iifname "eth1" drop
+          $wan_in
         }
       }
       EOF
       conntrack -F 2>/dev/null || true
-      echo "NAT mode: $1"
+      echo "NAT mode: $*"
     '';
   };
 
@@ -340,6 +345,37 @@ pkgs.testers.runNixOSTest {
         shout(alice, s)
         rc, out = alice.execute(f"{ENV_PREFIX} timeout 40 {RUST} ping --until-direct --timeout=25s {s.addr}")
         alice.log(f"hard NAT behind alice, easy NAT behind bob: ping exit {rc}: {out.strip()}")
+        s.stop()
+
+    with subtest("a router letting in unsolicited packets is hard to the peer that pings it first"):
+        nat(router_a, "easy")
+        nat(router_b, "permissive")
+        s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
+        shout(alice, s)
+        # The server's CallMeMaybe reaches alice before the meowed ack,
+        # so alice pings bob before bob (who learns her endpoints only
+        # from her CallMeMaybe, after the ack) pings her. A Go server
+        # sends its CallMeMaybe later, from a goroutine, so with Go on
+        # both sides bob's ping usually wins the race and the path is
+        # found; with either side Rust, alice's wins. With both routers
+        # permissive, whoever pings first loses, in Go too.
+        no_direct(alice, s)
+        # alice's first ping to bob landed on bob's router and stayed in
+        # its conntrack table, so bob's flow to alice left from another
+        # port than the one STUN saw, and alice's router dropped it.
+        flows = router_b.succeed("conntrack -L -p udp -s 192.168.2.10 -d 203.0.113.2 2>/dev/null")
+        router_b.log(flows)
+        ports = re.findall(r"sport=(\d+) dport=\d+ .*src=203\.0\.113\.2 dst=203\.0\.113\.3 sport=\d+ dport=(\d+)", flows)
+        assert ports and all(a != b for a, b in ports), f"expected bob's flow to alice remapped: {flows}"
+        s.stop()
+
+        # alice's own permissive router does no harm: her first ping
+        # opened her mapping toward bob before his arrived.
+        nat(router_a, "permissive")
+        nat(router_b, "easy")
+        s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
+        via = ping_direct(alice, s)
+        assert via.startswith("203.0.113.3:"), via
         s.stop()
 
     with subtest("UDP blocked at alice's router: DERP over TCP carries everything"):
