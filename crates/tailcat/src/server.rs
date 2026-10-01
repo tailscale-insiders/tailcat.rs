@@ -4,6 +4,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -17,7 +18,9 @@ use crate::client::Via;
 use crate::derpmap::{DerpMap, DerpMapCache, DerpRegion, FetchMode, FetchOptions};
 use crate::key::{DiscoPublic, NodePrivate, NodePublic, PresharedKey};
 use crate::magicsock::{self, MagicSock, PeerPath};
-use crate::netstack::{BoxFuture, Stack, StackConfig, TcpDecision, TcpPolicy, TcpStream, UdpConn, UdpPolicy};
+use crate::netstack::{
+    BoxFuture, Stack, StackConfig, TcpAccept, TcpDecision, TcpPolicy, TcpStream, UdpConn, UdpPolicy,
+};
 use crate::wg::{self, Engine, IpNet};
 use crate::{Error, Result, meow};
 
@@ -37,6 +40,51 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     Arc::new(move |c| Box::pin(f(c)))
+}
+
+/// Takes a connection a [`TcpConnector`] prepared for.
+pub type TcpHandoff = Box<dyn FnOnce(TcpStream) -> BoxFuture<()> + Send>;
+
+/// Prepares for a TCP connection before accepting it, typically by
+/// dialing a backend. It runs when the client's SYN arrives, which gets
+/// no answer meanwhile; if it fails, the client is refused with a RST.
+pub type TcpConnector = Arc<dyn Fn() -> BoxFuture<io::Result<TcpHandoff>> + Send + Sync>;
+
+/// How to serve a TCP connection: accept it at once, or prepare first.
+#[derive(Clone)]
+pub enum TcpRoute {
+    Handle(TcpHandler),
+    Connect(TcpConnector),
+}
+
+impl From<TcpHandler> for TcpRoute {
+    fn from(h: TcpHandler) -> Self {
+        TcpRoute::Handle(h)
+    }
+}
+
+impl From<TcpConnector> for TcpRoute {
+    fn from(c: TcpConnector) -> Self {
+        TcpRoute::Connect(c)
+    }
+}
+
+/// Wraps an async function as a [`TcpConnector`]: `f` prepares, and the
+/// function it returns takes the accepted connection.
+pub fn connector<F, Fut, H, HFut>(f: F) -> TcpConnector
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = io::Result<H>> + Send + 'static,
+    H: FnOnce(TcpStream) -> HFut + Send + 'static,
+    HFut: Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move || {
+        let prepared = f();
+        Box::pin(async move {
+            let h = prepared.await?;
+            Ok(Box::new(move |c| Box::pin(h(c)) as BoxFuture<()>) as TcpHandoff)
+        })
+    })
 }
 
 /// Wraps an async function as a [`UdpHandler`].
@@ -85,8 +133,8 @@ impl PortRange {
 }
 
 type AllowFn = Arc<dyn Fn(NodePublic) -> bool + Send + Sync>;
-type OnTcp = Arc<dyn Fn(u16) -> Option<TcpHandler> + Send + Sync>;
-type OnTcpForward = Arc<dyn Fn(SocketAddr) -> Option<TcpHandler> + Send + Sync>;
+type OnTcp = Arc<dyn Fn(u16) -> Option<TcpRoute> + Send + Sync>;
+type OnTcpForward = Arc<dyn Fn(SocketAddr) -> Option<TcpRoute> + Send + Sync>;
 type OnUdp = Arc<dyn Fn(u16) -> Option<UdpHandler> + Send + Sync>;
 type OnUdpForward = Arc<dyn Fn(SocketAddr) -> Option<UdpHandler> + Send + Sync>;
 
@@ -161,19 +209,22 @@ impl ServerBuilder {
         self
     }
 
-    /// Returns the handler for connections to a port on the server's own
-    /// address; `None` answers with a RST.
-    pub fn on_tcp(mut self, f: impl Fn(u16) -> Option<TcpHandler> + Send + Sync + 'static) -> Self {
-        self.cfg.on_tcp = Some(Arc::new(f));
+    /// Returns the handler (or [`TcpConnector`]) for connections to a
+    /// port on the server's own address; `None` answers with a RST.
+    pub fn on_tcp<R: Into<TcpRoute>>(mut self, f: impl Fn(u16) -> Option<R> + Send + Sync + 'static) -> Self {
+        self.cfg.on_tcp = Some(Arc::new(move |port| f(port).map(Into::into)));
         self
     }
 
-    /// Returns the handler for connections relayed through the server to
-    /// another address (exit node mode). IPv4 destinations arrive
-    /// unmapped from the NAT64 prefix. Setting it widens the packet
-    /// filter to admit any destination.
-    pub fn on_tcp_forward(mut self, f: impl Fn(SocketAddr) -> Option<TcpHandler> + Send + Sync + 'static) -> Self {
-        self.cfg.on_tcp_forward = Some(Arc::new(f));
+    /// Returns the handler (or [`TcpConnector`]) for connections relayed
+    /// through the server to another address (exit node mode). IPv4
+    /// destinations arrive unmapped from the NAT64 prefix. Setting it
+    /// widens the packet filter to admit any destination.
+    pub fn on_tcp_forward<R: Into<TcpRoute>>(
+        mut self,
+        f: impl Fn(SocketAddr) -> Option<R> + Send + Sync + 'static,
+    ) -> Self {
+        self.cfg.on_tcp_forward = Some(Arc::new(move |dst| f(dst).map(Into::into)));
         self
     }
 
@@ -760,9 +811,23 @@ impl Server {
             fwd(unmap_nat64(dst))
         };
         match h {
-            Some(h) => TcpDecision::Accept(self.for_client(src, move |s| {
+            Some(TcpRoute::Handle(h)) => TcpDecision::Accept(self.for_client(src, move |s| {
                 tokio::spawn(h(s));
             })),
+            Some(TcpRoute::Connect(c)) => {
+                let accept = self.for_client(src, |(h, s): (TcpHandoff, TcpStream)| {
+                    tokio::spawn(h(s));
+                });
+                TcpDecision::Defer(Box::pin(async move {
+                    match c().await {
+                        Ok(h) => Some(Box::new(move |s| accept((h, s))) as TcpAccept),
+                        Err(e) => {
+                            debug!("tailcat: refusing {src} -> {dst}: {e}");
+                            None
+                        }
+                    }
+                }))
+            }
             None => TcpDecision::Reset,
         }
     }

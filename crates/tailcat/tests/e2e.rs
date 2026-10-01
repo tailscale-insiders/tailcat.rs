@@ -1,14 +1,14 @@
 //! End-to-end tests: a server and clients in one process, meeting through
 //! a local DERP relay.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tailcat::derp::server::DevDerp;
 use tailcat::{
     Client, ClientOptions, KeySet, NodePrivate, PortRange, PresharedKey, Server, ServerBuilder, TcpHandler, TcpStream,
-    UdpConn, handler, udp_handler,
+    UdpConn, connector, handler, udp_handler,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -355,6 +355,34 @@ async fn served_ports_filter_silently() {
     // A filtered port neither answers nor refuses.
     let filtered = timeout(Duration::from_secs(1), client.dial_tcp_port(81)).await;
     assert!(filtered.is_err(), "filtered port answered: {filtered:?}");
+    server.close();
+}
+
+/// A connector prepares before the client's handshake completes: what it
+/// prepared serves the connection, and its failure refuses the client.
+#[tokio::test]
+async fn connectors_prepare_before_accepting() {
+    init();
+    let dev = DevDerp::start_local().await.unwrap();
+    let server = builder(&dev)
+        .on_tcp(|port| {
+            Some(connector(move || async move {
+                if port == 81 {
+                    return Err(io::Error::from(ErrorKind::ConnectionRefused));
+                }
+                let greeting = format!("prepared for {port}");
+                Ok(move |mut c: TcpStream| async move {
+                    let _ = c.write_all(greeting.as_bytes()).await;
+                })
+            }))
+        })
+        .start()
+        .await
+        .unwrap();
+    let client = Client::new(server.tailcat_addr());
+    assert_eq!(request(within(20, client.dial_tcp_port(80)).await.unwrap(), b"").await, "prepared for 80");
+    let err = within(20, client.dial_tcp_port(81)).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
     server.close();
 }
 
