@@ -148,9 +148,13 @@ async fn tcp_and_udp_over_local_derp() {
     let u = client.dial_udp_port(53).await.unwrap();
     udp_round_trip(&u, b"hello udp").await;
 
+    // Relayed only where there's no interface but loopback (a build
+    // sandbox), and named as the address names the region: addresses
+    // leave out region codes, so the code is the ID.
     let dp = client.disco_ping(Duration::from_secs(5)).await.unwrap();
     if let tailcat::Via::Derp { region_id, region_code } = dp.via {
-        assert_eq!((region_id, region_code), (dev.region.region_id, dev.region.region_code.clone()));
+        let r = addr.parse().unwrap().region.swap_remove(0);
+        assert_eq!((region_id, region_code), (r.region_id, r.region_code));
     }
 
     let st = server.status();
