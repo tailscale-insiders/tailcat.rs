@@ -42,3 +42,22 @@ against a NixOS server fails with "command not found", because the fixed
 PATH has no `/run/current-system/sw/bin`.
 
 Visible to Go clients: yes, in the session's environment.
+
+## Path visibility: TAILCAT_STATUS_FILE and path-change logs
+
+Go tailcat reports paths only through `TAILCAT_STATUS_LOOP=1`, which
+prints its internal status struct every 5 seconds. tailcat.rs keeps that
+variable, printing its own debug representation, which isn't the same
+text as Go's.
+
+tailcat.rs adds:
+
+- `TAILCAT_STATUS_FILE=<path>` (server mode): the server's status as
+  JSON, rewritten atomically every 2 seconds. It includes each client's
+  direct path or DERP region, handshake age and byte counts, with the
+  same field names as `tailcat-device --status-file`.
+- Info-level logs (shown with `-v`) whenever the path to a peer in use
+  changes: a direct path found, moved to another address, or lost to
+  DERP. These appear on both clients and servers.
+
+Visible to Go peers: no.
