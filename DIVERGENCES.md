@@ -94,6 +94,55 @@ connection. Relays already answer these pings, Go's included.
 Visible to Go peers: no. Visible to relays: one ping frame per idle
 period.
 
+## Idle clients are forgotten, and let back in
+
+A Go tailcat server keeps every client that ever joined as a WireGuard
+and path-discovery peer until the server exits. So a long-running server
+that sees many client keys grows without bound.
+
+A tailcat.rs server forgets a client that has nothing open and has sent
+nothing for 10 minutes. `TAILCAT_IDLE_CLIENT_TIMEOUT` (or
+`ServerBuilder::idle_client_timeout`) changes the timeout, and `0` means
+never. The server keeps a small record of each forgotten client (up to
+4096): its keys and the last direct address it used. The client is let
+back in, without the allow hook being asked again, as soon as it sends:
+
+- a WireGuard handshake;
+- real traffic over DERP;
+- real traffic from that last address.
+
+The server then starts a new WireGuard session with it right away.
+Keepalives and disco pings don't count, since they mean the client has
+nothing to send. `disconnect_client` also clears that record.
+
+Go clients never re-announce themselves, so this is the only way they
+get back in. Their first connection after a long silence takes about a
+second longer, one TCP SYN retransmit. Rust clients get back in the same
+way.
+
+Visible to Go clients: only that one-second delay after a long idle
+period.
+
+## Faster path recovery
+
+Go tailcat re-STUNs only on its timer, and pings a peer back at most
+every 5 s per endpoint. tailcat.rs also:
+
+- re-STUNs at once (at most every 2 s) when a direct path in use is lost,
+  or when a pong shows the peer now sees us at a different address, so a
+  NAT that remaps us is noticed within a second or so instead of
+  20–26 s;
+- stops trusting a path to an endpoint the peer no longer advertises;
+- while no path is trusted, pings a peer back on its ping if we last
+  pinged that endpoint at least 1 s ago (rather than 5 s).
+
+In the NAT VM test, a rebinding NAT kept traffic on DERP for 9–11 s
+after the old path was declared dead. Now it's 0–0.6 s. Recovery after
+UDP is unblocked went from 0.1–6.9 s to 0.9 s.
+
+Visible to Go peers: a few more disco pings and CallMeMaybes around a
+path change.
+
 # Known differences that aren't deliberate
 
 ## Which side's hole-punching ping goes out first
@@ -111,7 +160,9 @@ arrives before the host behind that router has pinged out, the host's
 own flow toward the peer is remapped to a port the peer never learns,
 and the path stays on DERP. So against a server behind such a router,
 Go↔Go usually goes direct and Rust (either side) stays on DERP. Against
-a client behind one, Rust goes direct. When both routers are permissive,
-whoever pings first loses, in Go too. Any fixed order fixes one case and
+a client behind one, Rust goes direct. (These are tendencies: the
+order is still a race, and Rust occasionally goes direct against a
+permissive server.) When both routers are permissive, whoever pings
+first loses, in Go too. Any fixed order fixes one case and
 breaks the other. The `permissive` and `dmz` scenarios in
 `tests/nat.nix` cover this.
