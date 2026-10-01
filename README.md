@@ -471,8 +471,9 @@ The tests, from the inside out:
   punching through easy NATs and to a DMZ host, DERP fallback behind hard
   NATs, behind a router letting in unsolicited packets (which makes Linux
   NAT hard) and with UDP blocked, failover and recovery mid-transfer, NAT
-  rebinding, a relay outage, Go↔Rust direct paths, and a `tailcat-device`
-  mesh across the NATs. `nix run .#checks.x86_64-linux.nat.driverInteractive` boots it to
+  rebinding, a relay outage, a relay connection that silently stops
+  carrying anything, Go↔Rust direct paths, and a `tailcat-device` mesh
+  across the NATs. `nix run .#checks.x86_64-linux.nat.driverInteractive` boots it to
   poke at by hand.
 - **[`tests/live.sh`](tests/live.sh)** repeats the interop tests over
   Tailscale's public relays and waits for direct paths.

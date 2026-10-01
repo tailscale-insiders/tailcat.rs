@@ -181,6 +181,7 @@ pkgs.testers.runNixOSTest {
     import itertools
     import re
     import shlex
+    import time
     from datetime import timedelta
 
     RUST = "${tailcat}/bin/tailcat"
@@ -448,6 +449,32 @@ pkgs.testers.runNixOSTest {
         alice.wait_until_succeeds(
             f"echo again | {ENV_PREFIX} timeout 30 {RUST} {s.addr} 7 | grep -q .", timeout=timedelta(seconds=120)
         )
+        s.stop()
+
+    with subtest("a relay connection that silently stops carrying anything: the server redials"):
+        nat(router_a, "hard")
+        nat(router_b, "hard")
+        s = Server(bob, "serve", "exec", "--", "tr", "a-z", "A-Z")
+        shout(alice, s)
+        # Bob's router drops, without a reset, everything on his relay
+        # connection, as a NAT or firewall that forgot it would. Bob is
+        # idle, so only his relay client's pings can tell.
+        pid = bob.succeed(f"systemctl show -p MainPID --value {s.unit}").strip()
+        conn = bob.succeed(f"ss -Htnp state established dst ${relayIp}:443 | grep 'pid={pid},'")
+        port = conn.split()[2].rsplit(":", 1)[1]
+        router_b.succeed(
+            "nft add table inet blackhole"
+            " && nft add chain inet blackhole drops '{ type filter hook forward priority -5; policy accept; }'"
+            f" && nft add rule inet blackhole drops ip saddr 192.168.2.10 tcp sport {port} drop"
+            f" && nft add rule inet blackhole drops ip daddr 192.168.2.10 tcp dport {port} drop"
+        )
+        start = time.monotonic()
+        # Well before the 130s a read timeout alone would take.
+        alice.wait_until_succeeds(
+            f"echo again | {ENV_PREFIX} timeout 10 {RUST} {s.addr} 7 | grep -q AGAIN", timeout=timedelta(seconds=60)
+        )
+        alice.log(f"bob reachable again {time.monotonic() - start:.1f}s after his relay connection went silent")
+        router_b.succeed("nft delete table inet blackhole")
         s.stop()
 
     with subtest("Go and Rust tailcat find direct paths to each other across NATs"):
