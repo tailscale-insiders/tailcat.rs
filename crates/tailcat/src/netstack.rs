@@ -525,6 +525,8 @@ impl Stack {
                 if over {
                     st.sockets.get_mut::<tcp::Socket>(h).abort();
                     st.tuples.remove(&(d, s));
+                    // Its RST is due now, whatever becomes of the SYN.
+                    self.shared.wake.notify_one();
                 }
             }
             if st.deciding.contains(&(d, s)) {

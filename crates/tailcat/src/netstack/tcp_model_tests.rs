@@ -1324,6 +1324,27 @@ fn tuple_reused_after_time_wait() {
     assert_eq!(net.conns[second].received, b"hello");
 }
 
+/// A SYN that waits on a decision, on a 4-tuple whose socket is in
+/// TIME-WAIT, still has the stack send that socket's RST at once: the
+/// abort is due whatever becomes of the SYN.
+#[test]
+fn deferred_syn_on_a_tuple_in_time_wait_aborts_promptly() {
+    let mut net = Net::new();
+    let first = net.open(DEFERRED);
+    net.decide(first, true);
+    net.complete(first);
+    net.close_write(first);
+    net.remote_fin(first);
+    assert!(net.time_wait(first));
+
+    let second = net.open(DEFERRED);
+    net.check_nothing_overdue();
+    net.decide(second, true);
+    net.complete(second);
+    net.remote_data(second, b"hello");
+    assert_eq!(net.conns[second].received, b"hello");
+}
+
 /// A delayed duplicate of a connection's SYN, arriving while our side of
 /// it is in TIME-WAIT, is old: it starts below where the connection
 /// ended. Since a SYN on a finished connection's 4-tuple could take the
