@@ -183,8 +183,11 @@ $ tailcat readme                           # this document
 
 A DNS name whose `tailcat=` TXT record holds an address works anywhere an
 address does. `TAILCAT_ADDR_FILE` makes a server write its address to a
-file (or, with a `tcp:` prefix, send it to a TCP address), and
-`TAILCAT_DERPMAP_URL` sets the default `--derpmap-url`.
+file (or, with a `tcp:` prefix, send it to a TCP address),
+`TAILCAT_STATUS_FILE` makes it keep its status, with each client's path
+(direct or DERP), as JSON in a file, and `TAILCAT_DERPMAP_URL` sets the
+default `--derpmap-url`. With `-v`, clients and servers log each change
+of path at info level.
 
 ## Key management
 

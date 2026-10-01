@@ -10,8 +10,8 @@ use std::{env, io, iter, process};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tailcat::{
-    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, TcpConnector,
-    TcpHandler, TcpRoute, TcpStream, UdpConn, connector, handler, udp_handler,
+    Addr, ConnInfo, DerpRegion, FetchMode, KeySet, PortRange, PresharedKey, PrivateKey, Server, ServerStatus,
+    TcpConnector, TcpHandler, TcpRoute, TcpStream, UdpConn, Via, connector, handler, udp_handler,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -201,6 +201,36 @@ fn clear_unnecessary_region_fields(r: &mut DerpRegion) {
         n.can_port_80 = false;
         n.region_id = 0;
     }
+}
+
+/// The server's status as TAILCAT_STATUS_FILE has it, with the same
+/// field names as tailcat-device's --status-file where they overlap.
+fn status_json(st: &ServerStatus) -> serde_json::Value {
+    let peers: Vec<_> = st
+        .peers
+        .iter()
+        .map(|p| {
+            let (direct, derp_region) = match &p.via {
+                Via::Direct(a) => (Some(a.to_string()), None),
+                Via::Derp { region_id, .. } => (None, Some(*region_id)),
+            };
+            serde_json::json!({
+                "nodekey": p.key.to_string(),
+                "tailcat_ip": p.tailcat_ip.to_string(),
+                "direct": direct,
+                "derp_region": derp_region,
+                "handshake_age_secs": p.last_handshake.map(|d| d.as_secs()),
+                "tx_bytes": p.tx_bytes,
+                "rx_bytes": p.rx_bytes,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "nodekey": st.public_key.to_string(),
+        "region_id": st.region_id,
+        "endpoints": st.endpoints.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "peers": peers,
+    })
 }
 
 fn env_bool(name: &str) -> bool {
@@ -489,10 +519,22 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     announce(g, &key, &conn_str).await?;
 
     if env::var("TAILCAT_STATUS_LOOP").as_deref() == Ok("1") {
+        let s = s.clone();
         tokio::spawn(async move {
             loop {
                 eprintln!("status = {:?}", s.status());
                 tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+    if let Some(f) = env::var_os("TAILCAT_STATUS_FILE").filter(|f| !f.is_empty()) {
+        tokio::spawn(async move {
+            loop {
+                let j = serde_json::to_vec_pretty(&status_json(&s.status())).expect("status serializes");
+                if let Err(e) = crate::util::replace_private(&f, &j) {
+                    debug!("TAILCAT_STATUS_FILE: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
     }

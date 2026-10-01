@@ -132,6 +132,10 @@ Environment:
 
 	TAILCAT_DERPMAP_URL: the default value of the --derpmap-url flag.
 
+	TAILCAT_STATUS_FILE: in server mode, keep the server's status, with
+	each client's path (direct or DERP), as JSON in the given file,
+	rewritten every 2 seconds.
+
 	TS_DEBUG_TAILCAT_LOCAL_DERP: in server mode, run a local DERP relay
 	(with a self-signed certificate) and embed it in the address; for
 	tests and offline use."#;
@@ -197,7 +201,11 @@ Examples:
 Environment:
 
 	TAILCAT_ADDR_FILE: write the tailcat address to the given file
-	path or, with a "tcp:" prefix, send it to that TCP address."#;
+	path or, with a "tcp:" prefix, send it to that TCP address.
+
+	TAILCAT_STATUS_FILE: keep the server's status, with each client's
+	path (direct or DERP), as JSON in the given file, rewritten every
+	2 seconds."#;
 
 pub const RECV: &str = r#"Run a server that receives files into the given directory (default:
 the current directory), printing the tailcat address senders use. It's
