@@ -381,6 +381,10 @@ pub async fn server(g: &Global, flags: &ServeFlags, ps: PortSet, exec_args: Opti
     if serve_perf {
         b = b.served_udp_ports([PortRange::single(PERF_PORT)]);
     }
+    if let Some(v) = env::var("TAILCAT_IDLE_CLIENT_TIMEOUT").ok().filter(|v| !v.is_empty()) {
+        let d = tailcat_args::parse_duration(&v).map_err(|e| anyhow!("TAILCAT_IDLE_CLIENT_TIMEOUT: {e}"))?;
+        b = b.idle_client_timeout(if d.is_zero() { Duration::MAX } else { d });
+    }
     if let Some(allow) = &flags.allow {
         // An empty set allows no clients.
         b = b.allow_client(KeySet::from(allow.clone()).checker());

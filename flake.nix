@@ -81,7 +81,7 @@
           # build sandbox against nixpkgs' build of upstream tailcat.
           interop = pkgs.runCommand "tailcat-rs-interop"
             {
-              nativeBuildInputs = [ tailcat pkgs.tailcat pkgs.openssh pkgs.coreutils pkgs.bash pkgs.gnugrep ];
+              nativeBuildInputs = [ tailcat pkgs.tailcat pkgs.openssh pkgs.coreutils pkgs.bash pkgs.gnugrep pkgs.curl ];
               __darwinAllowLocalNetworking = true;
             } ''
             bash ${./tests}/interop.sh ${tailcat}/bin/tailcat ${pkgs.tailcat}/bin/tailcat

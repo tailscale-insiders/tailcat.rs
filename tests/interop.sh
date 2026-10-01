@@ -125,6 +125,26 @@ for c in "${impls[@]}"; do
 done
 stop
 
+# A server forgets a client that's idle, and lets it back in when it
+# sends again: a Go client too, though it never announces itself again.
+# Each client is one long-lived SOCKS proxy, used twice.
+start idle env TAILCAT_IDLE_CLIENT_TIMEOUT=2s RUST_LOG=tailcat=debug "$rust" serve exec -- echo hi
+for c in "${impls[@]}"; do
+	name="idle: $c client let back into a rust server after expiring"
+	marked=$(wc -l <"$work/idle.log")
+	twice='for i in 1 2; do curl -s --max-time 10 --http0.9 http://server.tailcat:7/; sleep 5; done'
+	out=$(timeout 60 "${!c}" socks "$addr" sh -c "$twice" 2>"$work/client.log" || true)
+	since=$(tail -n +"$((marked + 1))" "$work/idle.log")
+	if [ "$out" != "$(printf 'hi\nhi')" ]; then
+		fail "$name: got '$out' $(tail -3 "$work/client.log")"
+	elif ! grep -q "expired after" <<<"$since" || ! grep -q "is back" <<<"$since"; then
+		fail "$name: the client never expired and came back"
+	else
+		pass "$name"
+	fi
+done
+stop
+
 # SIGTERM stops a server as cleanly as Ctrl-C.
 start term "$rust" serve 1
 kill -TERM "$server_pid"

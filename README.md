@@ -187,7 +187,9 @@ file (or, with a `tcp:` prefix, send it to a TCP address),
 `TAILCAT_STATUS_FILE` makes it keep its status, with each client's path
 (direct or DERP), as JSON in a file, and `TAILCAT_DERPMAP_URL` sets the
 default `--derpmap-url`. With `-v`, clients and servers log each change
-of path at info level.
+of path at info level. A server forgets a client that has nothing open
+and has been silent for 10 minutes (`TAILCAT_IDLE_CLIENT_TIMEOUT`, `0`
+for never), and lets it back in as soon as it sends again.
 
 ## Key management
 

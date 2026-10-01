@@ -205,7 +205,11 @@ Environment:
 
 	TAILCAT_STATUS_FILE: keep the server's status, with each client's
 	path (direct or DERP), as JSON in the given file, rewritten every
-	2 seconds."#;
+	2 seconds.
+
+	TAILCAT_IDLE_CLIENT_TIMEOUT: how long a client with nothing open
+	may stay silent before the server forgets it (default 10m; 0 for
+	never). A forgotten client is let back in when it sends again."#;
 
 pub const RECV: &str = r#"Run a server that receives files into the given directory (default:
 the current directory), printing the tailcat address senders use. It's
