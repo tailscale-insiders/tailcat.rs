@@ -1273,10 +1273,14 @@ async fn wait_for_direct_path(cl: &tailcat::Client, timeout: Duration) -> Result
             }
             Ok(Err(e)) => return Err(e.into()),
         };
-        if p.direct() || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(500) {
+        // A relayed path is the answer unless the next probe has time to
+        // find a direct one; probing again with no time left would only
+        // time out.
+        let next = t0 + Duration::from_secs(1);
+        if p.direct() || deadline.saturating_duration_since(next) < Duration::from_millis(500) {
             return Ok(p);
         }
-        tokio::time::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed())).await;
+        tokio::time::sleep_until(next.into()).await;
     }
 }
 
