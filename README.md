@@ -29,6 +29,7 @@ across a matrix of GitHub Actions runners.
 - [tailcat-device: a mesh overlay](#tailcat-device-a-mesh-overlay)
 - [How it works](#how-it-works)
 - [Compatibility with Go tailcat](#compatibility-with-go-tailcat)
+- [Troubleshooting](#troubleshooting)
 - [Development and testing](#development-and-testing)
 - [Security](#security)
 
@@ -400,12 +401,15 @@ addresses as the Go one.
    over UDP proves a path, and simultaneous pings open stateful NATs.
    Traffic moves to the best direct path and falls back to DERP whenever
    pongs stop. The timing constants (3 s heartbeats, 6.5 s trust, 5 s
-   ping spacing) are Tailscale's.
+   ping spacing) are Tailscale's; a lost path also starts a STUN round at
+   once, so a NAT that remapped us is noticed in about a second (see
+   [DIVERGENCES.md](DIVERGENCES.md)).
 6. **Data.** Each side terminates TCP and UDP in a userspace IPv6 stack
    (smoltcp for TCP), addressed `fd7a:115c:a1e0::/48` plus the first 80
    bits of the node key, with a 1280-byte MTU. The server's packet filter
    admits only its served ports (and forwarded destinations for exit
-   nodes); the client accepts no inbound connections at all.
+   nodes), refusing a client's connection to any other; the client
+   accepts no inbound connections at all.
 
 ### Building blocks
 
@@ -442,6 +446,43 @@ The local development relay works the same way as upstream's:
 `TS_DEBUG_TAILCAT_LOCAL_DERP=1 tailcat` starts a relay on loopback and
 embeds it in the address (with `InsecureForTests`, since its certificate
 is self-signed). `tailcat dev-derp` runs one standalone.
+
+## Troubleshooting
+
+**Which path is in use?** `tailcat ping --until-direct <addr>` waits for
+a direct path and says which. With `-v`, clients and servers log each
+change of path ("path is now direct", "direct path ... lost; now over
+DERP"). A server started with `TAILCAT_STATUS_FILE=<path>` keeps each
+client's path in that file as JSON.
+
+**Stuck on DERP.** Traffic still flows through the relay, only slower.
+Hole punching can't find a direct path when:
+
+- *Either side is behind a hard NAT* (endpoint-dependent mapping, as in
+  many carrier-grade and corporate NATs): each destination gets its own
+  public port, and the one STUN reports isn't the one the peer would
+  have to use. Tailscale works around this with port-mapping protocols
+  (UPnP, NAT-PMP, PCP). tailcat doesn't, and neither does Go tailcat,
+  which is built without Tailscale's port mapper.
+- *A router accepts unsolicited packets from the internet without
+  forwarding them to a host.* That sounds more open, but on Linux-based
+  routers the first hole-punching packet from the peer lands on the
+  router itself. Conntrack then holds its 4-tuple, so the host's own
+  packets toward the peer leave from a different port, and the router
+  in effect becomes a hard NAT toward that peer. Whether the path forms
+  depends on which side pings first (see
+  [DIVERGENCES.md](DIVERGENCES.md)). A real DMZ or port forward to the
+  host avoids this.
+- *UDP is blocked.* DERP runs over TCP (HTTPS) and carries everything.
+
+**Connection refused.** A client gets "connection refused" when the
+server doesn't serve that port, or when the local service a proxied port
+points at isn't listening (the server says which on stderr).
+
+**After a long idle.** A server forgets clients that have nothing open
+and have been silent for 10 minutes (`TAILCAT_IDLE_CLIENT_TIMEOUT`). They
+get back in on their own as soon as they send, after about a second's
+delay.
 
 ## Development and testing
 
