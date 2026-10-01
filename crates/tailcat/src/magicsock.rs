@@ -37,6 +37,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const TRUST_UDP_ADDR_DURATION: Duration = Duration::from_millis(6500);
 /// The minimum time between discovery pings to one endpoint.
 const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
+/// The minimum time between pings back to an endpoint a peer pinged us
+/// from, while no path to it is trusted: its ping says the path may
+/// work now, even if ours a moment ago didn't get through.
+const PING_BACK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long after the last send a peer counts as active.
 const SESSION_ACTIVE_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long to wait for a pong.
@@ -697,7 +701,8 @@ impl MagicSock {
                     PathAddr::Udp(a) => {
                         inner.by_addr.insert(a, peer_key);
                         let p = inner.peers.get_mut(&peer_key).expect("known peer");
-                        if p.candidates.entry(a).or_default().is_none_or(|t| now - t >= DISCO_PING_INTERVAL) {
+                        let interval = if p.trusted(now) { DISCO_PING_INTERVAL } else { PING_BACK_INTERVAL };
+                        if p.candidates.entry(a).or_default().is_none_or(|t| now - t >= interval) {
                             // Ping back: it both verifies the path for our
                             // side and helps punch through the NAT.
                             self.send_ping_locked(&mut inner, &peer_key, PathAddr::Udp(a), now, None);
