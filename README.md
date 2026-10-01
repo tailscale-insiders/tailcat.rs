@@ -427,6 +427,9 @@ directions:
 | `perf` | The wire format follows upstream's (unreleased) `perf`; Rust↔Rust is tested. |
 | UDP through exit nodes | Supported; Go servers before 0.7.0 forward only TCP. |
 
+Deliberate behavioral differences are listed in
+[DIVERGENCES.md](DIVERGENCES.md).
+
 Not ported: the js/wasm browser demo, and Windows-specific pieces
 (PowerShell sessions, cmd.exe quoting is ported but untested).
 
