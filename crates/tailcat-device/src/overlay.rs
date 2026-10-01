@@ -141,6 +141,7 @@ impl Overlay {
             derp_app_name: tailcat::derp::AppName::Device,
             listen_port,
             on_derp_recv: None,
+            on_unknown_udp: None,
             endpoint_filter: Some(Arc::new(move |ip| !overlay_prefix.contains(&ip))),
             enable_udp,
         })

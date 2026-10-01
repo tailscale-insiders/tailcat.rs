@@ -594,6 +594,7 @@ mod tests {
             derp_app_name: "test".into(),
             listen_port: 0,
             on_derp_recv: None,
+            on_unknown_udp: None,
             endpoint_filter: None,
             enable_udp: false,
         };

@@ -99,6 +99,10 @@ impl WireguardPacket {
 /// it's treated as WireGuard. Returning true consumes the packet.
 pub type DerpRecvHook = Arc<dyn Fn(i32, NodePublic, &[u8]) -> bool + Send + Sync>;
 
+/// Called with a UDP packet (other than STUN) from an address no peer
+/// is known at, and its source, before the packet is handled.
+pub type UnknownUdpHook = Arc<dyn Fn(SocketAddr, &[u8]) + Send + Sync>;
+
 /// Decides which local IPs may be advertised as endpoints.
 pub type EndpointFilter = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 
@@ -114,6 +118,8 @@ pub struct Config {
     /// The UDP port to listen on (0 picks one).
     pub listen_port: u16,
     pub on_derp_recv: Option<DerpRecvHook>,
+    /// Sees UDP packets from addresses no peer is known at.
+    pub on_unknown_udp: Option<UnknownUdpHook>,
     /// Filters local interface addresses before advertising them, e.g.
     /// to leave out a TUN device's own overlay addresses.
     pub endpoint_filter: Option<EndpointFilter>,
@@ -302,6 +308,7 @@ pub struct MagicSock {
     enable_udp: bool,
     endpoint_filter: Option<EndpointFilter>,
     on_derp_recv: Option<DerpRecvHook>,
+    on_unknown_udp: Option<UnknownUdpHook>,
     udp4: Option<Arc<UdpSocket>>,
     udp6: Option<Arc<UdpSocket>>,
     inner: Mutex<Inner>,
@@ -343,6 +350,7 @@ impl MagicSock {
             enable_udp: cfg.enable_udp,
             endpoint_filter: cfg.endpoint_filter,
             on_derp_recv: cfg.on_derp_recv,
+            on_unknown_udp: cfg.on_unknown_udp,
             udp4,
             udp6,
             inner: Mutex::new(Inner { derp_map: cfg.derp_map, ..Default::default() }),
@@ -785,6 +793,11 @@ impl MagicSock {
             self.handle_stun(pkt);
             return;
         }
+        if let Some(h) = &self.on_unknown_udp
+            && !self.inner.lock().unwrap().by_addr.contains_key(&src)
+        {
+            h(src, pkt);
+        }
         if disco::looks_like_disco(pkt) {
             self.handle_disco(pkt, PathAddr::Udp(src), None);
             return;
@@ -957,6 +970,7 @@ impl MagicSock {
             enable_udp,
             endpoint_filter: None,
             on_derp_recv: None,
+            on_unknown_udp: None,
             udp4: None,
             udp6: None,
             inner: Mutex::default(),
@@ -1079,6 +1093,7 @@ mod tests {
             derp_app_name: "test".into(),
             listen_port: 0,
             on_derp_recv: None,
+            on_unknown_udp: None,
             endpoint_filter: None,
             enable_udp,
         };

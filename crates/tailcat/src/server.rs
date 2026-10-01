@@ -507,6 +507,7 @@ impl Server {
             derp_app_name: crate::derp::AppName::Server,
             listen_port: b.listen_port,
             on_derp_recv: Some(hook),
+            on_unknown_udp: None,
             endpoint_filter: None,
             enable_udp: true,
         })

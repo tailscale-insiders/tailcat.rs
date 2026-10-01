@@ -317,6 +317,7 @@ impl Client {
             derp_app_name: crate::derp::AppName::Client,
             listen_port: 0,
             on_derp_recv: Some(hook),
+            on_unknown_udp: None,
             endpoint_filter: None,
             enable_udp: true,
         })
