@@ -76,6 +76,24 @@ a client that already holds the server's address and keys.
 Visible to Go clients: yes. A Go client sees a refusal instead of a
 timeout.
 
+## A quiet relay connection gets pinged
+
+Go tailcat (like Tailscale's DERP client) notices a relay connection
+that stopped carrying anything only through its 120 s read deadline or
+TCP keepalive. That happens when a NAT or firewall starts dropping the
+connection without a reset. Go pings the relay only after a network
+change. Until then, an idle server behind such a NAT is unreachable for
+about two minutes, and a relayed session times out.
+
+tailcat.rs pings a relay it hasn't heard from in 20 s. If no frame of any
+kind arrives within 10 s more, it drops the connection and redials. In
+the NAT VM test this brings recovery from about 125–130 s down to about
+25–30 s. The cost is one small frame about every 20 s per idle relay
+connection. Relays already answer these pings, Go's included.
+
+Visible to Go peers: no. Visible to relays: one ping frame per idle
+period.
+
 # Known differences that aren't deliberate
 
 ## Which side's hole-punching ping goes out first
