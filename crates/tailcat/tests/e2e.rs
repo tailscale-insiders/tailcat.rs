@@ -345,16 +345,17 @@ async fn closing_resets_open_connections() {
 }
 
 #[tokio::test]
-async fn served_ports_filter_silently() {
+async fn served_ports_refuse_the_rest() {
     init();
     let dev = DevDerp::start_local().await.unwrap();
     let server = builder(&dev).served_tcp_ports([PortRange::single(80)]).on_tcp(|_| say(b"ok")).start().await.unwrap();
     let client = Client::new(server.tailcat_addr());
     assert_eq!(request(client.dial_tcp_port(80).await.unwrap(), b"").await, "ok");
 
-    // A filtered port neither answers nor refuses.
-    let filtered = timeout(Duration::from_secs(1), client.dial_tcp_port(81)).await;
-    assert!(filtered.is_err(), "filtered port answered: {filtered:?}");
+    // A filtered port refuses at once, rather than letting the dial time
+    // out.
+    let filtered = within(5, client.dial_tcp_port(81)).await;
+    assert_eq!(filtered.unwrap_err().kind(), ErrorKind::ConnectionRefused);
     server.close();
 }
 

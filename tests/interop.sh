@@ -112,6 +112,16 @@ for c in "${impls[@]}"; do
 	else
 		fail "$name: $(tail -3 "$work/client.log")"
 	fi
+	# A port the server doesn't serve refuses too, well before the
+	# client's 10s dial timeout.
+	name="serve: $c client -> rust server's unserved port is refused"
+	if echo x | timeout 8 "${!c}" "$addr" 2 >/dev/null 2>"$work/client.log"; then
+		fail "$name: the client succeeded"
+	elif grep -qi "refused" "$work/client.log"; then
+		pass "$name"
+	else
+		fail "$name: $(tail -3 "$work/client.log")"
+	fi
 done
 stop
 

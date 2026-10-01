@@ -242,7 +242,8 @@ impl ServerBuilder {
     }
 
     /// Restricts which TCP ports on the server's address the filter
-    /// admits, for defense in depth; filtered SYNs get no reply.
+    /// admits, for defense in depth; a client's SYN to another port is
+    /// refused with a RST, without asking `on_tcp`.
     pub fn served_tcp_ports(mut self, p: impl IntoIterator<Item = PortRange>) -> Self {
         self.cfg.served_tcp_ports = Some(p.into_iter().collect());
         self
@@ -802,8 +803,10 @@ impl Server {
                     tokio::spawn(async move { tx.send(s).await });
                 }));
             }
+            // The client is authenticated, so there's nothing to hide
+            // from it; a refusal beats a dial that hangs until it times out.
             if !admits(&cfg.served_tcp_ports, port) {
-                return TcpDecision::Drop;
+                return TcpDecision::Reset;
             }
             cfg.on_tcp.as_ref().and_then(|f| f(port))
         } else {
