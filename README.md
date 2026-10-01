@@ -468,10 +468,11 @@ The tests, from the inside out:
 - **[`tests/nat.nix`](tests/nat.nix)** is a NixOS VM test (a Nix check
   on Linux, needing KVM): a relay on a simulated internet and hosts behind
   two NAT routers whose behavior it switches at runtime. It checks hole
-  punching through easy NATs, DERP fallback behind hard NATs and with UDP
-  blocked, failover and recovery mid-transfer, NAT rebinding, a relay
-  outage, Go↔Rust direct paths, and a `tailcat-device` mesh across the
-  NATs. `nix run .#checks.x86_64-linux.nat.driverInteractive` boots it to
+  punching through easy NATs and to a DMZ host, DERP fallback behind hard
+  NATs, behind a router letting in unsolicited packets (which makes Linux
+  NAT hard) and with UDP blocked, failover and recovery mid-transfer, NAT
+  rebinding, a relay outage, Go↔Rust direct paths, and a `tailcat-device`
+  mesh across the NATs. `nix run .#checks.x86_64-linux.nat.driverInteractive` boots it to
   poke at by hand.
 - **[`tests/live.sh`](tests/live.sh)** repeats the interop tests over
   Tailscale's public relays and waits for direct paths.
