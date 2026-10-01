@@ -107,6 +107,24 @@ impl Table {
         }
     }
 
+    /// The path peer `k` trusts, if it's one of its candidates.
+    fn trusted_candidate(&self, k: &NodePublic) -> Option<SocketAddr> {
+        let inner = self.ms.inner.lock().unwrap();
+        let p = inner.peers.get(k)?;
+        p.best.map(|b| b.0).filter(|a| p.trusted(Instant::now()) && p.candidates.contains_key(a))
+    }
+
+    /// Checks that peer `k`'s trusted path `before`, if it's no longer a
+    /// candidate, lost its trust. (A pong for a ping sent earlier can
+    /// trust it again.)
+    fn check_forgotten_path_untrusted(&self, k: &NodePublic, before: Option<SocketAddr>) {
+        let inner = self.ms.inner.lock().unwrap();
+        let (Some(a), Some(p)) = (before, inner.peers.get(k)) else { return };
+        if !p.candidates.contains_key(&a) {
+            assert!(!p.trusted(Instant::now()), "{k:?} still trusts {a}, no longer a candidate");
+        }
+    }
+
     /// The peer UDP address `a` maps to.
     fn mapped(&self, a: &SocketAddr) -> Option<NodePublic> {
         self.ms.inner.lock().unwrap().by_addr.get(a).copied()
@@ -139,9 +157,11 @@ impl Table {
         let k = self.draw_node(&tc);
         let d = self.draw_disco(&tc).public();
         let endpoints = Self::draw_addrs(&tc);
+        let before = self.trusted_candidate(&k);
         self.ms.upsert_peer(PeerConfig { node_key: k, disco_key: d, home_region: 0, endpoints: endpoints.clone() });
         self.configs.insert(k, (d, endpoints));
         self.history.entry(k).or_default().insert(d);
+        self.check_forgotten_path_untrusted(&k, before);
     }
 
     #[rule]
@@ -203,9 +223,11 @@ impl Table {
         let from = self.draw_disco(&tc);
         let (src, derp_src) = self.draw_path(&tc);
         let endpoints = Self::draw_addrs(&tc);
+        let before = derp_src.and_then(|k| self.trusted_candidate(&k));
         self.deliver(&from, &Message::CallMeMaybe { endpoints: endpoints.clone() }, src, derp_src);
         if let Some(k) = derp_src.filter(|k| self.holds(k, &from.public())) {
             self.advertised.insert(k, endpoints);
+            self.check_forgotten_path_untrusted(&k, before);
         }
     }
 

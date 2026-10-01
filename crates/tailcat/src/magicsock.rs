@@ -219,10 +219,15 @@ impl Peer {
     }
 
     /// Drops candidate `a` unless the config lists it or the peer still
-    /// advertises it.
+    /// advertises it. A path to an endpoint dropped is likely gone (the
+    /// peer's NAT mapped it anew), so it loses its trust at once rather
+    /// than when it lapses.
     fn forget_candidate(&mut self, a: &SocketAddr) {
         if !self.cfg.endpoints.contains(a) && !self.advertised.contains(a) {
             self.candidates.remove(a);
+            if self.best.is_some_and(|b| b.0 == *a) {
+                self.trust_until = None;
+            }
         }
     }
 }
