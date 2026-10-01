@@ -62,6 +62,20 @@ tailcat.rs adds:
 
 Visible to Go peers: no.
 
+## Unserved ports refuse instead of hanging
+
+When a server serves only some ports (`serve 80`), Go tailcat's packet
+filter silently drops a client's SYN to any other port, so the client's
+dial waits out its 10 s timeout ("Dial: timed out").
+
+tailcat.rs answers such a SYN with a RST, so the client gets "connection
+refused" right away. Only authenticated clients get this far; SYNs from
+anyone else are still dropped silently. Silence would hide nothing from
+a client that already holds the server's address and keys.
+
+Visible to Go clients: yes. A Go client sees a refusal instead of a
+timeout.
+
 # Known differences that aren't deliberate
 
 ## Which side's hole-punching ping goes out first
