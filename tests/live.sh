@@ -26,7 +26,7 @@ for pair in "rust go" "go rust" "rust rust"; do
 	read -r s c <<<"$pair"
 	serve "pipe-$s" "${!s}"
 	msg="hello over the internet from $c"
-	if echo "$msg" | timeout 60 "${!c}" "$addr" 2>"$work/client.log" && sleep 0.5 && grep -qx "$msg" "$work/pipe-$s.out"; then
+	if echo "$msg" | timeout 60 "${!c}" "$addr" 2>"$work/client.log" && has_line "$work/pipe-$s.out" "$msg"; then
 		pass "pipe: $c client -> $s server"
 	else
 		fail "pipe: $c client -> $s server: $(tail -3 "$work/client.log")"

@@ -54,6 +54,16 @@ start() {
 	addr=$(cat "$work/addr")
 }
 
+# has_line <file> <line>: waits up to 5s for <file> to hold <line>, as a
+# server may write what it got a little after its client exits.
+has_line() {
+	for _ in $(seq 50); do
+		grep -qx "$2" "$1" && return
+		sleep 0.1
+	done
+	return 1
+}
+
 # stop: stops the last server started.
 stop() {
 	kill "$server_pid" 2>/dev/null || true

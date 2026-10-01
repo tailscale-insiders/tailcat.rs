@@ -122,10 +122,16 @@ got=$(cat "$work/received")
 echo "ok   4 MB TCP transfer node 0 -> node 1"
 
 # The namespaces share a LAN, so the nodes should find direct paths.
-sleep 6
-direct=$(python3 -c '
+count_direct() {
+	python3 -c '
 import json
-print(sum(p["direct"] is not None for i in range('"$N"') for p in json.load(open("'"$work"'/status%d.json" % i))))')
+print(sum(p["direct"] is not None for i in range('"$N"') for p in json.load(open("'"$work"'/status%d.json" % i))))'
+}
+for _ in $(seq 30); do
+	direct=$(count_direct)
+	[ "$direct" -ge 1 ] && break
+	sleep 1
+done
 echo "     $direct of $((N * (N - 1))) peer paths are direct"
 [ "$direct" -ge 1 ] || die "no direct paths formed"
 echo "ok   direct paths formed"

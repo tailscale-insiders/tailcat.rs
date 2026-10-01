@@ -32,7 +32,7 @@ for s in "${impls[@]}"; do
 		msg="hello from $c to $s"
 		if ! echo "$msg" | timeout 60 "${!c}" "$addr" >/dev/null 2>"$work/client.log"; then
 			fail "pipe: $c client -> $s server: client failed: $(tail -3 "$work/client.log")"
-		elif sleep 0.5 && grep -qx "$msg" "$work/pipe-$s.out"; then
+		elif has_line "$work/pipe-$s.out" "$msg"; then
 			pass "pipe: $c client -> $s server"
 		else
 			fail "pipe: $c client -> $s server: server got '$(cat "$work/pipe-$s.out")'"
@@ -152,7 +152,7 @@ for s in "${impls[@]}"; do
 	for c in "${impls[@]}"; do
 		start "allowed-$s" "${!s}" serve "$allow"
 		if echo "friend of $c" | timeout 60 "${!c}" --key="$work/allowed.private.json" "$addr" >/dev/null 2>"$work/client.log" &&
-			sleep 0.5 && grep -qx "friend of $c" "$work/allowed-$s.out"; then
+			has_line "$work/allowed-$s.out" "friend of $c"; then
 			pass "allow: $c allowed key admitted by $s server"
 		else
 			fail "allow: $c allowed key admitted by $s server: $(tail -3 "$work/client.log")"
