@@ -27,6 +27,13 @@ const PING_AFTER_IDLE: Duration = Duration::from_secs(20);
 /// the connection and dialing a new one.
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const OUT_QUEUE: usize = 512;
+/// How long we wait to redial after a dial fails or a connection ends,
+/// at first. It doubles each time, up to [`MAX_BACKOFF`].
+const MIN_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a connection must last for the wait to go back to
+/// [`MIN_BACKOFF`] when it ends.
+const STEADY: Duration = Duration::from_secs(10);
 
 /// Opens a TLS connection to a DERP node, trying its addresses in turn.
 pub async fn dial_tls(n: &DerpNode) -> Result<TlsStream<TcpStream>> {
@@ -160,30 +167,56 @@ async fn run(
     app_name: AppName,
     preferred: bool,
     recv: mpsc::Sender<ReceivedPacket>,
-    mut out: mpsc::Receiver<Vec<u8>>,
+    out: mpsc::Receiver<Vec<u8>>,
     connected: watch::Sender<bool>,
 ) {
-    let mut backoff = Duration::from_millis(100);
+    let connect = || connect_region(&region, &key, &app_name);
+    keep_connected(connect, region.region_id, preferred, recv, out, connected).await
+}
+
+/// Connects with `connect`, serves the connection until it ends, and
+/// does it again, waiting longer after each dial that fails or
+/// connection that ends within [`STEADY`]. It ends once the packet
+/// receiver is dropped.
+async fn keep_connected<S, F, Fut>(
+    mut connect: F,
+    region_id: i32,
+    preferred: bool,
+    recv: mpsc::Sender<ReceivedPacket>,
+    mut out: mpsc::Receiver<Vec<u8>>,
+    connected: watch::Sender<bool>,
+) where
+    S: AsyncRead + AsyncWrite,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(BufReader<S>, String)>>,
+{
+    let mut backoff = MIN_BACKOFF;
     loop {
-        match connect_region(&region, &key, &app_name).await {
+        match connect().await {
             Ok((stream, node)) => {
-                debug!(region = region.region_id, node = %node, "derp: connected");
-                backoff = Duration::from_millis(100);
+                debug!(region = region_id, node = %node, "derp: connected");
                 // Drop anything queued while we were disconnected.
                 while out.try_recv().is_ok() {}
                 connected.send_replace(true);
-                let res = serve(stream, region.region_id, preferred, &recv, &mut out).await;
+                let up = tokio::time::Instant::now();
+                let res = serve(stream, region_id, preferred, &recv, &mut out).await;
                 connected.send_replace(false);
                 let Err(e) = res else { return }; // the owner went away
-                debug!(region = region.region_id, "derp: connection lost: {e}");
+                debug!(region = region_id, "derp: connection lost: {e}");
+                // Only a connection that lasted says the relay works
+                // again. A relay that closes every connection it takes
+                // would otherwise be redialed at the shortest wait.
+                if up.elapsed() >= STEADY {
+                    backoff = MIN_BACKOFF;
+                }
             }
-            Err(e) => warn!(region = region.region_id, "derp: connect failed: {e}"),
+            Err(e) => warn!(region = region_id, "derp: connect failed: {e}"),
         }
         if recv.is_closed() {
             return;
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -305,3 +338,5 @@ async fn read_frame_or_ping<R: AsyncRead + Unpin>(rd: &mut R, ping: &mpsc::Sende
 
 #[cfg(test)]
 mod model_tests;
+#[cfg(test)]
+mod redial_model_tests;
