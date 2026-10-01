@@ -47,6 +47,16 @@ pub(crate) fn client_config_for_node(n: &DerpNode) -> Result<rustls::ClientConfi
         .with_no_client_auth())
 }
 
+/// A TLS client configuration verifying servers against the built-in
+/// web PKI roots.
+pub(crate) fn webpki_client_config() -> Result<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    Ok(rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// A self-signed certificate and TLS server configuration for a local
 /// development DERP relay.
 pub(crate) fn self_signed_server_config(names: &[&str]) -> Result<rustls::ServerConfig> {
