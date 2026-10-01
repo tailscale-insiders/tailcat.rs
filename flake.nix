@@ -87,6 +87,12 @@
             bash ${./tests}/interop.sh ${tailcat}/bin/tailcat ${pkgs.tailcat}/bin/tailcat
             touch $out
           '';
+        } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # NixOS VMs behind simulated NATs: hole punching, DERP fallback,
+          # failover, rebinding, a relay outage, Go interop, and a
+          # tailcat-device mesh. Needs KVM.
+          # The unit tests already run in the tailcat check.
+          nat = import ./tests/nat.nix { inherit pkgs; tailcat = tailcat.overrideAttrs { doCheck = false; }; };
         });
 
       devShells = forAllSystems (pkgs: {
