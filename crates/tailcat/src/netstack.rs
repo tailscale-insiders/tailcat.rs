@@ -691,6 +691,14 @@ impl Stack {
         self.shared.wake.notify_one();
     }
 
+    /// Whether the peer at `ip` has any TCP connection (or one waiting on
+    /// a decision) or UDP flow open.
+    pub fn has_flows(&self, ip: IpAddr) -> bool {
+        let st = self.shared.lock();
+        let from = |&(_, remote): &FlowKey| remote.ip() == ip;
+        st.tuples.keys().any(from) || st.udp.keys().any(from) || st.deciding.iter().any(from)
+    }
+
     /// Aborts every TCP connection with the peer at `ip`, and closes its
     /// UDP flows.
     pub fn abort_peer(&self, ip: IpAddr) {
